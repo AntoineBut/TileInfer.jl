@@ -1,5 +1,8 @@
 [deps]
+BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"
+BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 TileInfer = "88060c88-5af7-417f-86ab-5ff001da7709"
 cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"

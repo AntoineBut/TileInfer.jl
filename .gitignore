@@ -1,1 +1,4 @@
 LocalPreferences.toml
+bench/results/
+*.cov
+coverage/

@@ -12,8 +12,17 @@ Hot kernels are written in cuTile.jl. Clear, measurable code wins over feature b
 ```sh
 julia --project=test test/runtests.jl                 # full suite, ~90 s (cuTile examples, model loads)
 julia --project=test test/runtests.jl kernels graphs  # only files whose path contains an arg, ~10 s
-julia --project=bench bench/<name>.jl                 # benchmarks
+julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
+julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME]  # op + model benchmarks
 ```
+
+Benchmarks (bench/suite.jl): every op at Qwen3-0.6B shapes for decode (n = 1) and prefill
+(n = 512), plus end-to-end prefill and decode steps, for each backend that has a method
+(new `TileBackend` methods are picked up automatically). Report columns are per call, with
+GB/s and % of the 736 GB/s roofline. Op arguments rotate through copies totalling > 2× L2, so
+decode GEMMs read from DRAM as in the real model. Save a baseline before changing a kernel
+(`--save before`), then `--compare before`. Results live in bench/results/ (gitignored).
+Expect ~±10 % run-to-run noise from GPU clocks; use `--seconds 2` for decisions.
 
 If `julia` is not on PATH, use `~/.juliaup/bin/julia`.
 `test/` and `bench/` are workspace projects that share the root `Manifest.toml`. Add
