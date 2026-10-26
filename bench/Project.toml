@@ -1,0 +1,5 @@
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+TileInfer = "88060c88-5af7-417f-86ab-5ff001da7709"
+cuTile = "0dea8319-8c4a-4662-a73d-20234d115b9a"

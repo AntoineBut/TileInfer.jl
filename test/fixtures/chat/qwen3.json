@@ -1,0 +1,368 @@
+{
+ "cases": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nHi!<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nHi!<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nPick a number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nAnother one.<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nPick a number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nAnother one.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\nPick a number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nAnother one.<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\nPick a number.<|im_end|>\n<|im_start|>assistant\n7<|im_end|>\n<|im_start|>user\nAnother one.<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nBe nice.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\nshort\n</think>\n\nGoodbye!<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>system\nBe nice.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\nshort\n</think>\n\nGoodbye!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>system\nBe nice.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\nshort\n</think>\n\nGoodbye!<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>system\nBe nice.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\nHi there<|im_end|>\n<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\nshort\n</think>\n\nGoodbye!<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\na<|im_end|>\n<|im_start|>system\nlate system<|im_end|>\n<|im_start|>user\nb<|im_end|>\n<|im_start|>assistant\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\na<|im_end|>\n<|im_start|>system\nlate system<|im_end|>\n<|im_start|>user\nb<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<|im_start|>user\na<|im_end|>\n<|im_start|>system\nlate system<|im_end|>\n<|im_start|>user\nb<|im_end|>\n"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<|im_start|>user\na<|im_end|>\n<|im_start|>system\nlate system<|im_end|>\n<|im_start|>user\nb<|im_end|>\n"
+  }
+ ]
+}
