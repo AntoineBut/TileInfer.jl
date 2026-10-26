@@ -336,7 +336,7 @@ The engine's `step()` becomes: `propose → verify → accept → rollback → e
 tileinfer pull Qwen/Qwen3-4B [--revision main]   # *.safetensors, config, tokenizer
 tileinfer ls                                     # cached models (shared with Python HF cache)
 tileinfer rm Qwen/Qwen3-4B
-tileinfer run Qwen/Qwen3-4B -p "Hello" [--max-tokens 256 --temp 0.7 --top-p 0.9]
+tileinfer run Qwen/Qwen3-4B "Hello" [--max-tokens 256 --temperature 0.7 --top-k 20 --top-p 0.9 --seed 1 --thinking off --raw]
 tileinfer chat Qwen/Qwen3-4B [--draft Qwen/Qwen3-0.6B | --ngram 3] [--k 4]
 tileinfer bench Qwen/Qwen3-4B [--prompt-len 512 --gen 256] [--backend ref|tile]
 ```
@@ -376,7 +376,7 @@ Versions are as of 2026-10-26, checked against the repos.
 |-----------|-------------|-------------------|
 | M0 ✅ | Julia + CUDA.jl + cuTile.jl installed; run `examples/fmha.jl`, `matmul.jl` on the 4080S; CUDA-graph capture spike with a cuTile kernel | done 2026-10-26: `test/smoke/` 21/21 pass, `bench/m0_launch_overhead.jl` |
 | M1 ✅ | `pull/ls/rm`; config + safetensors loader; tokenizer (+ tests vs Python) | done 2026-10-26: own byte-level BPE matches HF `tokenizers` on the fixture corpus; Qwen3 chat template matches its Jinja template; weights load (fused qkv / gate_up, tied lm_head) in 0.17 s from page cache |
-| M2 | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | logits match HF within BF16 tolerance; `run` produces text |
+| M2 ✅ | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | done 2026-10-26: Float32 logits match HF to ~1e-4 with identical 24-token greedy continuations; BF16 within 0.625 (≈5 ulps), top-1 equal except one exact tie; `tileinfer run` streams text at ~27–29 tok/s decode (Qwen3-0.6B, reference path, ≈5 % of the roofline), first token after ~13 s in a fresh process (JIT) |
 | M3 | Paged KV + BlockManager; `chat` with multi-turn | same outputs as M2 |
 | M4 | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | each passes op tests; per-kernel bench vs cuBLAS / reference |
 | M5 | Paged flash-attention (prefill, decode split-KV, verify) | correctness + % of bandwidth/FLOP roofline |

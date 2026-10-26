@@ -12,6 +12,8 @@ end
     @test TileInfer.parse_args(["Qwen/Qwen3-0.6B", "--revision", "abc"]) ==
           (["Qwen/Qwen3-0.6B"], Dict("revision" => "abc"))
     @test_throws ArgumentError TileInfer.parse_args(["--revision"])
+    @test TileInfer.parse_args(["m", "--raw", "p", "--seed", "3"]; flags = ("raw",)) ==
+          (["m", "p"], Dict("raw" => "true", "seed" => "3"))
     @test TileInfer.format_bytes(0) == "0 B"
     @test TileInfer.format_bytes(1_503_000_000) == "1.5 GB"
 
@@ -25,4 +27,20 @@ end
     code, _, err = run_cli("ls", "--color", "red")
     @test code == 1 && occursin("unknown option --color", err)
     @test run_cli("ls")[1] == 0
+
+    code, _, err = run_cli("run", "only-a-model")
+    @test code == 1 && occursin("a model and a prompt", err)
+    code, _, err = run_cli("run", "nobody/not-pulled", "hi")
+    @test code == 1 && occursin("is not pulled", err)
+    if test_model_dir() !== nothing
+        code, _, err = run_cli("run", TEST_MODEL, "hi", "--top-p", "lots")
+        @test code == 1 && occursin("--top-p expects a number", err)
+        # Greedy raw completion; the same continuation as the float32 HF fixture would be
+        # too strict in bfloat16, so only check the text and the stats line.
+        code, out, err = run_cli("run", TEST_MODEL, "The capital of France is", "--raw",
+                                 "--temperature", "0", "--max-tokens", "4")
+        @test code == 0
+        @test occursin("Paris", out)
+        @test occursin("4 generated", err)
+    end
 end

@@ -22,6 +22,9 @@ const TESTS = [
     "hub/loader.jl",
     "tokenizer/bpe.jl",
     "tokenizer/chat_template.jl",
+    "model/reference_ops.jl",
+    "model/forward.jl",
+    "engine/sampler.jl",
     "cli.jl",
     "smoke/examples.jl",    # ~40 s: compiles all cuTile examples
 ]

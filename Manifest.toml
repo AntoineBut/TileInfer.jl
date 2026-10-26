@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "7617560c2d07d1500799bc17d53e39489015f0f0"
+project_hash = "9048cd4a5670f02aafbb6dcd5f719e70ef9328d8"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -770,7 +770,7 @@ uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 version = "1.11.0"
 
 [[deps.TileInfer]]
-deps = ["BFloat16s", "CUDA", "HuggingFaceApi", "JSON", "NVTX", "PrecompileTools", "SafeTensors", "Unicode", "cuTile"]
+deps = ["BFloat16s", "CUDA", "HuggingFaceApi", "JSON", "LinearAlgebra", "NVTX", "PrecompileTools", "Random", "SafeTensors", "Unicode", "cuTile"]
 path = "."
 uuid = "88060c88-5af7-417f-86ab-5ff001da7709"
 version = "0.1.0"
