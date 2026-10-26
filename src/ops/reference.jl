@@ -41,12 +41,34 @@ end
 
 silu(x) = x / (1 + exp(-x))
 
+# Scatter through a flat column view of the pools: the column of (offset o, head h, page p),
+# all 0-based, in (head_dim, page_size × kv_heads × num_pages) is o + P h + P H p + 1.
+function store_kv!(::RefBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+                   k::CuArray{T,3}, v::CuArray{T,3}, slots::CuVector{Int32}) where {T}
+    D, P, H, _ = size(k_pages)
+    n = length(slots)
+    page, offset = (slots .- 1) .÷ P, (slots .- 1) .% P
+    heads = CuArray(0:H-1)
+    cols = vec(reshape(offset, 1, n) .+ P .* heads .+ (P * H) .* reshape(page, 1, n) .+ 1)  # (h, t)
+    reshape(k_pages, D, :)[:, cols] = reshape(k, D, H * n)
+    reshape(v_pages, D, :)[:, cols] = reshape(v, D, H * n)
+    return nothing
+end
+
+# Keys (or values) of positions 1:len of one KV head, gathered from the sequence's pages
+# into a dense (head_dim, len) matrix.
+function gather_pages(pages::CuArray{T,4}, block_table::CuVector{Int32}, h::Integer, len::Integer) where {T}
+    D, P = size(pages, 1), size(pages, 2)
+    used = view(block_table, 1:cld(len, P))
+    return view(reshape(pages[:, :, h, used], D, :), :, 1:len)
+end
+
 # Eager attention, per KV head over its group of query heads at once:
 #   S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
-function attention(::RefBackend, q::CuArray{T,3}, k_cache::CuArray{T,3}, v_cache::CuArray{T,3},
-                   start::Integer, scale::Real) where {T}
+function attention(::RefBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+                   block_table::CuVector{Int32}, start::Integer, scale::Real) where {T}
     D, heads, n = size(q)
-    kv_heads = size(k_cache, 3)
+    kv_heads = size(k_pages, 3)
     group = heads ÷ kv_heads
     len = start + n
     q_by_head = permutedims(q, (1, 3, 2))                    # (D, n, heads)
@@ -55,8 +77,8 @@ function attention(::RefBackend, q::CuArray{T,3}, k_cache::CuArray{T,3}, v_cache
     visible = CuArray([i <= start + j for i in 1:len, j in 1:n])
     for h in 1:kv_heads
         heads_h = (h-1)*group+1:h*group
-        K = Float32.(view(k_cache, :, 1:len, h))             # (D, len)
-        V = Float32.(view(v_cache, :, 1:len, h))
+        K = Float32.(gather_pages(k_pages, block_table, h, len))   # (D, len)
+        V = Float32.(gather_pages(v_pages, block_table, h, len))
         Q = Float32.(reshape(q_by_head[:, :, heads_h], D, n * group))
         S = T.(T.(K' * Q) .* T(scale))                       # (len, n * group)
         S = ifelse.(reshape(visible, len, n, 1), Float32.(reshape(S, len, n, group)), -Inf32)

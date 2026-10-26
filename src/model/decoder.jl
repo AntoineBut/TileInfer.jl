@@ -31,25 +31,33 @@ end
 Base.eltype(::DecoderLM{T}) where {T} = T
 max_length(m::DecoderLM) = length(m.rope)
 
-"An empty KV cache for `model`, for sequences of up to `max_len` positions."
-KVCache(m::DecoderLM{T}, max_len::Integer = max_length(m)) where {T} =
-    KVCache{T}(m.config, min(max_len, max_length(m)))
+"""
+    PagedKVCache(model; max_tokens = max_length(model), page_size = $DEFAULT_PAGE_SIZE)
+
+An empty paged KV cache for `model` with room for `max_tokens` positions in total.
+"""
+PagedKVCache(m::DecoderLM{T}; max_tokens::Integer = max_length(m),
+             page_size::Integer = DEFAULT_PAGE_SIZE) where {T} =
+    PagedKVCache{T}(m.config, cld(max_tokens, page_size); page_size)
 
 """
-    forward!(model, cache, ids; all_logits = false) -> CuMatrix{Float32}
+    forward!(model, cache, seq, ids; all_logits = false) -> CuMatrix{Float32}
 
-Run the 0-based token `ids` through the model at the positions following those in `cache`,
-appending their keys and values to it. Returns the logits (vocab, n) of every token if
-`all_logits`, otherwise (vocab, 1) of the last token.
+Run the 0-based token `ids` through the model at the positions following those of `seq`,
+storing their keys and values in `cache` and appending them to `seq`. Returns the logits
+(vocab, n) of every token if `all_logits`, otherwise (vocab, 1) of the last token.
 """
-function forward!(model::DecoderLM{T}, cache::KVCache{T}, ids::AbstractVector{<:Integer};
-                  all_logits::Bool = false) where {T}
+function forward!(model::DecoderLM{T}, cache::PagedKVCache{T}, seq::Sequence,
+                  ids::AbstractVector{<:Integer}; all_logits::Bool = false) where {T}
     cfg, w, be = model.config, model.weights, model.backend
     n = length(ids)
     n > 0 || throw(ArgumentError("forward! needs at least one token"))
-    start = cache.length
-    start + n <= capacity(cache) ||
-        throw(ArgumentError("sequence of $(start + n) tokens exceeds the KV cache ($(capacity(cache)))"))
+    start = length(seq)
+    start + n <= max_length(model) ||
+        throw(ArgumentError("sequence of $(start + n) tokens exceeds the model's max length $(max_length(model))"))
+    reserve!(cache.blocks, seq, n)
+    slot_ids = CuArray(slots(cache.blocks, seq, start, n))
+    block_table = CuArray(seq.block_table)
     D, nq, nkv = cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
     positions = start+1:start+n
     cos, sin = model.rope.cos[:, positions], model.rope.sin[:, positions]
@@ -68,14 +76,14 @@ function forward!(model::DecoderLM{T}, cache::KVCache{T}, ids::AbstractVector{<:
         end
         q = rope(be, q, cos, sin)
         k = rope(be, k, cos, sin)
-        store_kv!(cache, l, start, k, v)
-        o = attention(be, q, cache.k[l], cache.v[l], start, scale)  # (D, nq, n)
+        store_kv!(be, cache.k[l], cache.v[l], k, v, slot_ids)
+        o = attention(be, q, cache.k[l], cache.v[l], block_table, start, scale)   # (D, nq, n)
         x = x .+ linear(be, layer.wo, reshape(o, D * nq, n))
 
         h = rmsnorm(be, x, layer.mlp_norm, cfg.rms_norm_eps)
         x = x .+ linear(be, layer.w_down, silu_mul(be, linear(be, layer.w_gate_up, h)))
     end
-    cache.length = start + n
+    append!(seq.tokens, ids)
 
     x = all_logits ? x : x[:, n:n]
     return Float32.(linear(be, w.lm_head, rmsnorm(be, x, w.norm, cfg.rms_norm_eps)))

@@ -30,6 +30,8 @@ end
 
     code, _, err = run_cli("run", "only-a-model")
     @test code == 1 && occursin("a model and a prompt", err)
+    code, _, err = run_cli("chat")
+    @test code == 1 && occursin("exactly one model", err)
     code, _, err = run_cli("run", "nobody/not-pulled", "hi")
     @test code == 1 && occursin("is not pulled", err)
     if test_model_dir() !== nothing

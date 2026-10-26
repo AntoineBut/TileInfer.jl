@@ -202,9 +202,13 @@ The checkpoint's separate `q_proj`, `k_proj`, `v_proj` and `gate_proj`, `up_proj
 - **Truncating is free.** Rolling back a sequence (rejected speculative
   tokens, or a regenerate in chat) only decrements `seq_len` and returns
   surplus pages. No data is moved.
-- Later: **prefix caching** (hash full pages of the token prefix, refcount pages).
-  This is useful with a single client too, since multi-turn chat re-sends the
-  whole history.
+- **Prefix reuse in chat (M3):** a `ChatSession` keeps one sequence alive, re-renders
+  the conversation each turn, truncates the sequence to the longest token prefix it
+  shares with the new prompt, and prefills only the rest. Templates that rewrite
+  history (Qwen3 drops earlier `<think>` blocks) shorten the reusable prefix to the
+  start of the previous reply; that is the model's training format, so it is followed.
+- Later: **prefix caching across sequences** (hash full pages of the token prefix,
+  refcount pages), once several sequences share the pool.
 
 Even with a single sequence, paging pays off: chat sessions can grow without
 reallocation, rollback is trivial, prefix caching becomes possible, and the
@@ -377,7 +381,7 @@ Versions are as of 2026-10-26, checked against the repos.
 | M0 ✅ | Julia + CUDA.jl + cuTile.jl installed; run `examples/fmha.jl`, `matmul.jl` on the 4080S; CUDA-graph capture spike with a cuTile kernel | done 2026-10-26: `test/smoke/` 21/21 pass, `bench/m0_launch_overhead.jl` |
 | M1 ✅ | `pull/ls/rm`; config + safetensors loader; tokenizer (+ tests vs Python) | done 2026-10-26: own byte-level BPE matches HF `tokenizers` on the fixture corpus; Qwen3 chat template matches its Jinja template; weights load (fused qkv / gate_up, tied lm_head) in 0.17 s from page cache |
 | M2 ✅ | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | done 2026-10-26: Float32 logits match HF to ~1e-4 with identical 24-token greedy continuations; BF16 within 0.625 (≈5 ulps), top-1 equal except one exact tie; `tileinfer run` streams text at ~27–29 tok/s decode (Qwen3-0.6B, reference path, ≈5 % of the roofline), first token after ~13 s in a fresh process (JIT) |
-| M3 | Paged KV + BlockManager; `chat` with multi-turn | same outputs as M2 |
+| M3 ✅ | Paged KV + BlockManager; `chat` with multi-turn | done 2026-10-26: paged reference path matches the HF Float32 fixtures (also with 4-position, fragmented pages); `tileinfer chat` reuses the cached common prefix across turns, and a reply with reuse equals a fresh run on the full prompt; decode ~20 tok/s (the reference attention gathers every page of the sequence at each step) |
 | M4 | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | each passes op tests; per-kernel bench vs cuBLAS / reference |
 | M5 | Paged flash-attention (prefill, decode split-KV, verify) | correctness + % of bandwidth/FLOP roofline |
 | M6 | CUDA graphs for decode; NVTX timeline | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B |

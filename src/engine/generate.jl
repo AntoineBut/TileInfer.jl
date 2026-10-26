@@ -1,34 +1,46 @@
-# Single-sequence generation loop on the reference path: prefill the prompt in one
+# Single-sequence generation loop on the reference path: prefill the new tokens in one
 # forward pass, then decode one token per step until a stop token or the token budget.
 
 """
-    generate(model, prompt_ids; max_new_tokens = 256, sampling = SamplingParams(),
-             stop_ids = model.config.eos_token_ids, rng = Random.default_rng(),
-             on_token = nothing) -> Vector{Int}
+    generate!(model, cache, seq, ids; max_new_tokens = 256, sampling = SamplingParams(),
+              stop_ids = model.config.eos_token_ids, rng = Random.default_rng(),
+              on_token = nothing) -> Vector{Int}
 
-Generate a continuation of the 0-based `prompt_ids`. Returns the new token ids, without
-the stop token. `on_token(id)` is called after each new token, for streaming.
+Continue `seq` with the 0-based token `ids` and generate up to `max_new_tokens` tokens.
+Returns the new token ids, without the stop token. `on_token(id)` is called after each
+new token, for streaming. Afterwards `seq` holds `ids` and every generated token except
+the last one, which was sampled but never run through the model.
 """
-function generate(model::DecoderLM, prompt_ids::AbstractVector{<:Integer};
-                  max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
-                  stop_ids = model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
-                  on_token = nothing)
-    isempty(prompt_ids) && throw(ArgumentError("empty prompt"))
-    total = length(prompt_ids) + max_new_tokens
-    total <= max_length(model) ||
-        throw(ArgumentError("prompt + max_new_tokens = $total exceeds the model's max length $(max_length(model))"))
-    cache = KVCache(model, total)
+function generate!(model::DecoderLM, cache::PagedKVCache, seq::Sequence, ids::AbstractVector{<:Integer};
+                   max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
+                   stop_ids = model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
+                   on_token = nothing)
+    isempty(ids) && throw(ArgumentError("no tokens to process"))
     generated = Int[]
-    logits = forward!(model, cache, prompt_ids)
+    logits = forward!(model, cache, seq, ids)
     for _ in 1:max_new_tokens
         id = sample(vec(logits), sampling, rng)
         id in stop_ids && break
         push!(generated, id)
         on_token === nothing || on_token(id)
         length(generated) == max_new_tokens && break
-        logits = forward!(model, cache, [id])
+        logits = forward!(model, cache, seq, [id])
     end
     return generated
+end
+
+"""
+    generate(model, prompt_ids; kwargs...) -> Vector{Int}
+
+One-shot [`generate!`](@ref) in a fresh cache sized for the prompt and `max_new_tokens`.
+"""
+function generate(model::DecoderLM, prompt_ids::AbstractVector{<:Integer};
+                  max_new_tokens::Integer = 256, kwargs...)
+    total = length(prompt_ids) + max_new_tokens
+    total <= max_length(model) ||
+        throw(ArgumentError("prompt + max_new_tokens = $total exceeds the model's max length $(max_length(model))"))
+    cache = PagedKVCache(model; max_tokens = total)
+    return generate!(model, cache, new_sequence(cache), prompt_ids; max_new_tokens, kwargs...)
 end
 
 """

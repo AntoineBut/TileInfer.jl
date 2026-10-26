@@ -3,7 +3,7 @@
 #
 # Layouts (column-major, PyTorch shapes reversed): hidden states (hidden, tokens), per-head
 # tensors (head_dim, heads, tokens), linear weights (in, out) applied as y = Wᵀx,
-# contiguous KV cache per layer (head_dim, max_len, kv_heads).
+# paged KV pools per layer (head_dim, page_size, kv_heads, num_pages).
 
 abstract type Backend end
 
@@ -52,11 +52,20 @@ SwiGLU activation `silu(gate) .* up`, where `gate_up` stacks gate rows over up r
 function silu_mul end
 
 """
-    attention(backend, q, k_cache, v_cache, start, scale) -> (head_dim, heads, tokens)
+    store_kv!(backend, k_pages, v_pages, k, v, slots)
+
+Write the keys and values (head_dim, kv_heads, n) of n tokens into the page pools
+(head_dim, page_size, kv_heads, num_pages) at the 1-based cache `slots` (a device vector,
+see [`slots`](@ref)): slot s is offset `(s - 1) % page_size` of page `(s - 1) ÷ page_size + 1`.
+"""
+function store_kv! end
+
+"""
+    attention(backend, q, k_pages, v_pages, block_table, start, scale) -> (head_dim, heads, n)
 
 Causal grouped-query attention of the queries `q` (head_dim, heads, n), at positions
-`start+1:start+n`, over the first `start + n` positions of the caches
-(head_dim, max_len, kv_heads).
+`start+1:start+n` of one sequence, over its first `start + n` cached positions. The
+sequence's keys and values are in the pages listed by `block_table` (a device vector).
 """
 function attention end
 

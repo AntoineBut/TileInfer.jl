@@ -44,13 +44,36 @@ using LinearAlgebra: dot
         @test Array(TileInfer.silu_mul(be, CuArray(gu))) ≈ g ./ (1 .+ exp.(-g)) .* u
     end
 
+    # Pages of a (head_dim, len, kv_heads) contiguous KV tensor, scattered over a pool in the
+    # order given by `table`, through store_kv!.
+    function paged(kv::Array{Float32,3}, table::Vector{Int32}, page_size::Integer, num_pages::Integer)
+        D, len, H = size(kv)
+        pool = CUDA.zeros(Float32, D, page_size, H, num_pages)
+        slot_ids = Int32[(table[p ÷ page_size + 1] - 1) * page_size + p % page_size + 1 for p in 0:len-1]
+        TileInfer.store_kv!(be, pool, CUDA.zeros(Float32, size(pool)), CuArray(permutedims(kv, (1, 3, 2))),
+                            CUDA.zeros(Float32, D, H, len), CuArray(slot_ids))
+        return pool
+    end
+
+    @testset "store_kv!" begin
+        kv = randn(Float32, 8, 10, 2)
+        table = Int32[5, 2, 4]                       # 3 pages of 4 positions, out of order
+        pool = Array(paged(kv, table, 4, 5))
+        for p in 0:9, h in 1:2
+            @test pool[:, p % 4 + 1, h, table[p ÷ 4 + 1]] == kv[:, p + 1, h]
+        end
+        @test all(iszero, pool[:, :, :, [1, 3]])      # pages not in the table are untouched
+    end
+
     @testset "attention (GQA, causal, start = $start)" for start in (0, 5)
-        D, H, KVH, n, maxlen = 16, 4, 2, 3, 12
+        D, H, KVH, n, P = 16, 4, 2, 3, 4
         len = start + n
         q = randn(Float32, D, H, n)
-        kc = randn(Float32, D, maxlen, KVH); vc = randn(Float32, D, maxlen, KVH)
+        kc = randn(Float32, D, len, KVH); vc = randn(Float32, D, len, KVH)
+        table = Int32[3, 1, 6][1:cld(len, P)]
+        k_pool, v_pool = paged(kc, table, P, 6), paged(vc, table, P, 6)
         scale = 1 / sqrt(D)
-        o = Array(TileInfer.attention(be, CuArray(q), CuArray(kc), CuArray(vc), start, scale))
+        o = Array(TileInfer.attention(be, CuArray(q), k_pool, v_pool, CuArray(table), start, scale))
         for h in 1:H, t in 1:n
             g = cld(h, H ÷ KVH)                        # query heads share KV heads in blocks
             keys = 1:start+t                           # causal: up to the query's own position
