@@ -56,14 +56,14 @@ inside that range, so compilation and warm-up launches stay out of the report.
 `model/decode_ctx1024/tile` and `model/prefill512/tile` profile every kernel of a step. `ncu`
 replays each kernel (8 passes with the default set, ~45 with `--set full`) and saves and
 restores device memory around each pass, about 0.65 s per kernel even when the kernel is
-tiny. While attention runs on the reference backend, a decode step launches ~5,700
-kernels (about 190 per layer from attention alone), which takes an hour. Profile only the
-cuTile kernels instead: 339 launches, about 11 minutes, because the kernels `-k` skips still
-run slower under `ncu`. Add `-c 13` to stop after the embedding and the first layer (about
-a minute):
+tiny. A decode step launches 543 kernels, about 6 minutes under `ncu`: per layer 14 cuTile
+kernels (4 GEMVs, 4 RMSNorms, 2 ropes, store_kv, silu_mul, attention decode + combine)
+plus 5 CUDA.jl copies and broadcasts (q/k/v slices of the fused projection, residual adds).
+Profile only the cuTile kernels with `-k`; add `-c 15` to stop after the embedding and the
+first layer (about a minute):
 
 ```sh
-ncu --profile-from-start off -k regex:'^(embed|rmsnorm|gemv|rope|store_kv|silu_mul)_kernel' \
+ncu --profile-from-start off -k regex:'^(embed|rmsnorm|gemv|rope|store_kv|silu_mul|attention_\w+)_kernel' \
     -o bench/results/decode julia --project=bench bench/profile.jl model/decode_ctx1024/tile
 python3 bench/ncu_summary.py bench/results/decode.ncu-repz
 ```
@@ -102,17 +102,19 @@ With up to 4 kernels in a report (or `--kernel REGEX` narrowing it), each kernel
 Reports with more than 4 kernels (or `--table`) get one line per launch and a total per
 kernel name, which is the place to start for a model step.
 
-## Snapshot: decode step, 2026-10-27
+## Snapshot: decode step, 2026-10-27 (M5)
 
 `model/decode_ctx1024/tile` (1,024 cached positions), default section set, all kernels:
 
 | Kernels | Launches | GPU time | Share |
 |---|---|---|---|
-| Reference attention: page gathers (`gpu_getindex_kernel`), softmax broadcasts and reductions, cuBLAS `gemmSN` | ~5,350 | ~24 ms | ~89 % |
-| cuTile `gemv_kernel` (4 per layer + lm_head) | 113 | 2.06 ms | 7.7 % |
-| cuTile rmsnorm, rope, silu_mul, store_kv, embed | 226 | 0.73 ms | 2.7 % |
+| cuTile `gemv_kernel` (4 per layer + lm_head) | 113 | 2.00 ms | 56.5 % |
+| cuTile rmsnorm, rope, store_kv, silu_mul, embed | 226 | 0.79 ms | 22.4 % |
+| cuTile `attention_decode_kernel` + `attention_combine_kernel` | 56 | 0.37 ms | 10.5 % |
+| CUDA.jl `gpu_getindex_kernel` (q/k/v slices, cos/sin) and residual-add broadcasts | 144 | 0.38 ms | 10.6 % |
 
 Times are at `ncu`'s locked clocks, without launch gaps, so only the shares are meaningful.
-The paged attention kernel (M5) is where decode time goes; the decode `gemv_kernel` already
-reaches ~79 % of DRAM bandwidth, limited by registers (86 per thread, 42 % theoretical
-occupancy) and 0.64 waves per SM.
+Before M5 the reference attention took ~89 % (~5,350 launches, ~24 ms). Now the GEMVs
+dominate, and the many tiny kernels (~3 µs each here) are the case for fusion and CUDA graphs
+(M6): in `bench/run.jl` the step takes 3.8 ms against 3.5 ms of kernel time, because two
+cuTile launches already cost ~15 µs of host time.

@@ -3,6 +3,8 @@
 # element-wise kernels round at the same points as the reference and must be
 # bit-identical; reductions may differ by accumulation order.
 
+using Random: randperm
+
 @testset "tile kernels" begin
     ref, tile = RefBackend(), TileBackend()
     host(x) = Float32.(Array(x))
@@ -68,8 +70,34 @@
             W, x, b = rnd(64, 32), rnd(64, 2), rnd(32)
             @test host(TileInfer.linear(tile, W, x, b)) ≈ host(TileInfer.linear(ref, W, x, b)) rtol = 1e-2
         end
+
+        # (head_dim, heads, kv_heads, page_size, start, n): decode and verify (split-KV, a
+        # step that crosses a page boundary so some splits see no key of a query), prefill
+        # with and without cached context, group 4, and a group of 3 (prefill kernel only).
+        @testset "attention $case" for case in ((128, 16, 8, 64, 0, 1), (128, 16, 8, 64, 1023, 1),
+                                                 (128, 16, 8, 64, 63, 2), (128, 16, 8, 64, 100, 8),
+                                                 (128, 16, 8, 64, 0, 37), (128, 16, 8, 64, 0, 512),
+                                                 (128, 16, 8, 64, 200, 300), (128, 32, 8, 64, 700, 3),
+                                                 (64, 12, 4, 16, 40, 5))
+            D, H, KVH, P, start, n = case
+            len = start + n
+            pages = cld(len, P) + 2
+            table = CuArray(Int32.(randperm(pages)[1:cld(len, P)]))   # fragmented, out of order
+            q, k_pages, v_pages = rnd(D, H, n), rnd(D, P, KVH, pages), rnd(D, P, KVH, pages)
+            y = TileInfer.attention(tile, q, k_pages, v_pages, table, start, 1 / sqrt(D))
+            @test size(y) == size(q)
+            # Exact attention of the same inputs. The reference rounds scores and
+            # probabilities to T as PyTorch's eager attention does (up to ~12 BFloat16 ulps
+            # from exact); the flash kernels keep them in Float32 until the PV product.
+            f32(x) = CuArray(host(x))
+            exact = TileInfer.attention(ref, f32(q), f32(k_pages), f32(v_pages), table, start, 1 / sqrt(D))
+            if T == BFloat16
+                @test ulps(exact, y, T) <= 5      # ≤ 3.5 over 30 seeds at n = 512
+            else
+                @test host(y) ≈ host(exact) rtol = 1e-5
+            end
+        end
     end
 
-    @test !TileInfer.has_kernel(tile, TileInfer.attention)        # reference fallback until M5
-    @test TileInfer.has_kernel(tile, TileInfer.linear)
+    @test TileInfer.has_kernel(tile, TileInfer.attention)
 end

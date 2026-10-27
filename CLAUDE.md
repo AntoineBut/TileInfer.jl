@@ -80,7 +80,12 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
 - `ct.load`/`ct.store` indices are in tile units; along a size-1 tile axis that is the
   element index. `order = (2, 1)` loads a transposed tile (index/shape in permuted order).
 - Kernels specialize on each array's shape divisibility and contiguity, not only on types:
-  a new token count can mean a new compile.
+  a new token count can mean a new compile. Pad arrays whose length grows during decode
+  (the block table is padded to a multiple of 16 pages in `forward!`).
+- Keep each launch under 32 kernel parameters. A `TileArray{T,N}` flattens to 1 + 2N (pointer,
+  sizes, strides), plus 1 for the RNG seed; from 32 on, CUDA.jl's `pack_arguments` takes
+  Base's untyped `map` path (~15 µs and ~430 allocations per launch). Pass 2-D views
+  (`reshape(pool, head_dim, :)`) instead of 4-D arrays.
 - Tiny kernels cost ~5.5 µs per launch (vs ~3.5 µs for a CUDA.jl broadcast); below that,
   only CUDA graphs help.
 - The GPU also drives the desktop (compositor, browsers, …) and idles at 210 MHz: time

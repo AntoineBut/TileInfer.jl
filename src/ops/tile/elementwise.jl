@@ -58,30 +58,30 @@ end
 silu_mul(be::TileBackend, gate_up::CuMatrix{T}) where {T} =
     silu_mul!(be, similar(gate_up, size(gate_up, 1) ÷ 2, size(gate_up, 2)), gate_up)
 
-# KV-cache write, one block per token: the token's keys for all KV heads form a
-# (head_dim, 1, kv_heads, 1) tile of the pool at (offset, page). Tile indices along the
-# size-1 axes are element indices.
-function store_kv_kernel(KP::ct.TileArray{T,4}, VP::ct.TileArray{T,4}, K::ct.TileArray{T,3},
-                         V::ct.TileArray{T,3}, Slots::ct.TileArray{Int32,1}, D::Int, HEADS::Int) where {T}
+# KV-cache write, one block per token. Arrays are 2-D views, which keeps the launch under
+# 32 kernel parameters: the pools as (head_dim, page_size × kv_heads × pages), whose column
+# for (offset, head h, page), all 1-based, is offset + P (h - 1) + P H (page - 1), and k/v
+# as (head_dim, kv_heads × n). Tile indices along the size-1 axis are element indices.
+function store_kv_kernel(KP::ct.TileArray{T,2}, VP::ct.TileArray{T,2}, K::ct.TileArray{T,2},
+                         V::ct.TileArray{T,2}, Slots::ct.TileArray{Int32,1}, D::Int, P::Int,
+                         HEADS::Int) where {T}
     t = ct.bid(1)
-    P = size(KP, 2)
     slot = Slots[t] - Int32(1)
-    offset, page = rem(slot, P) + Int32(1), fld(slot, P) + Int32(1)
-    store_token!(KP, K, t, offset, page, D, HEADS)
-    store_token!(VP, V, t, offset, page, D, HEADS)
+    first_col = rem(slot, Int32(P)) + fld(slot, Int32(P)) * Int32(P * HEADS) + Int32(1)
+    for h in Int32(1):Int32(HEADS)
+        src, dst = (t - Int32(1)) * Int32(HEADS) + h, first_col + (h - Int32(1)) * Int32(P)
+        ct.store(KP; index = (Int32(1), dst), tile = ct.load(K; index = (Int32(1), src), shape = (D, 1)))
+        ct.store(VP; index = (Int32(1), dst), tile = ct.load(V; index = (Int32(1), src), shape = (D, 1)))
+    end
     return nothing
-end
-
-@inline function store_token!(pool, src, t, offset, page, D, HEADS)
-    tile = reshape(ct.load(src; index = (Int32(1), Int32(1), t), shape = (D, HEADS, 1)), (D, 1, HEADS, 1))
-    ct.store(pool; index = (Int32(1), offset, Int32(1), page), tile = tile)
 end
 
 function store_kv!(::TileBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4}, k::CuArray{T,3},
                    v::CuArray{T,3}, slots::CuVector{Int32}) where {T}
-    D, heads, n = size(k)
-    @cuda backend = cuTile blocks = n store_kv_kernel(k_pages, v_pages, k, v, slots, ct.Constant(D),
-                                                      ct.Constant(nextpow(2, heads)))
+    D, P, heads, _ = size(k_pages)
+    flat(x) = reshape(x, D, :)
+    @cuda backend = cuTile blocks = length(slots) store_kv_kernel(
+        flat(k_pages), flat(v_pages), flat(k), flat(v), slots, ct.Constant(D), ct.Constant(P), ct.Constant(heads))
     return nothing
 end
 

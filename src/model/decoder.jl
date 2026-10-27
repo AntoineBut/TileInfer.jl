@@ -57,7 +57,9 @@ function forward!(model::DecoderLM{T}, cache::PagedKVCache{T}, seq::Sequence,
         throw(ArgumentError("sequence of $(start + n) tokens exceeds the model's max length $(max_length(model))"))
     reserve!(cache.blocks, seq, n)
     slot_ids = CuArray(slots(cache.blocks, seq, start, n))
-    block_table = CuArray(seq.block_table)
+    # Padded to a multiple of 16 pages: cuTile kernels specialize on the divisibility of each
+    # array's length, so an unpadded table would recompile attention as the sequence grows.
+    block_table = CuArray([seq.block_table; zeros(Int32, -length(seq.block_table) & 15)])
     D, nq, nkv = cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
     positions = start+1:start+n
     cos, sin = model.rope.cos[:, positions], model.rope.sin[:, positions]

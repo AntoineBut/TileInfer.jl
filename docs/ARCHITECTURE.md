@@ -114,8 +114,8 @@ TileInfer/
 │   │   ├── interface.jl        # abstract backend + op signatures
 │   │   ├── reference.jl        # RefBackend
 │   │   └── tile/               # TileBackend: one file per kernel family
-│   │       ├── norm.jl  rope.jl  gemm.jl  gemv.jl  act.jl
-│   │       ├── flash_attn.jl   paged_attn.jl   kv_write.jl
+│   │       ├── norm.jl  elementwise.jl (rope, silu, kv_write, embed)  linear.jl (GEMV, GEMM)
+│   │       ├── attention.jl    # paged flash-attention: prefill, split-KV decode + combine
 │   │       └── sampling.jl     spec_verify.jl
 │   └── cli.jl
 ├── test/                       # per-op tests vs reference; e2e vs HF logits
@@ -228,8 +228,8 @@ batch size of 1.
 | 4 | `linear!` GEMM | prefill | start from `examples/matmul.jl`; cuBLAS as baseline |
 | 5 | `linear!` GEMV / skinny GEMM | decode | memory-bound; split-K, wide loads; the most important kernel for decode tok/s |
 | 6 | `silu_mul!` | both | later fused into the gate_up GEMM epilogue |
-| 7 | `flash_attn_prefill!` | prefill | FA-2 online softmax; start from `examples/fmha.jl` (already GQA + causal); extend to varlen + paged K/V |
-| 8 | `paged_attn_decode!` | decode/verify | flash-decoding: split KV across CTAs, then a combine kernel; GQA packing |
+| 7 | `attention_prefill!` | prefill | FA-2 online softmax from `examples/fmha.jl`, walking the block table one page (= one KV tile) per step; only diagonal pages masked |
+| 8 | `attention_decode!` | decode/verify (≤ 8 tokens) | flash-decoding: GQA-packed query tile, fixed split count (grid independent of context), FP32 partials, combine kernel |
 | 9 | `sample!` | both | argmax / temperature / top-k / top-p (sort-free: threshold search or Gumbel-max) |
 | 10 | `spec_verify!` | spec | parallel rejection sampling over k drafts, accept-length per sequence |
 | 11 | `embedding!` | both | `ct.gather` on rows |
@@ -383,7 +383,7 @@ Versions are as of 2026-10-26, checked against the repos.
 | M2 ✅ | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | done 2026-10-26: Float32 logits match HF to ~1e-4 with identical 24-token greedy continuations; BF16 within 0.625 (≈5 ulps), top-1 equal except one exact tie; `tileinfer run` streams text at ~27–29 tok/s decode (Qwen3-0.6B, reference path, ≈5 % of the roofline), first token after ~13 s in a fresh process (JIT) |
 | M3 ✅ | Paged KV + BlockManager; `chat` with multi-turn | done 2026-10-26: paged reference path matches the HF Float32 fixtures (also with 4-position, fragmented pages); `tileinfer chat` reuses the cached common prefix across turns, and a reply with reuse equals a fresh run on the full prompt; decode ~20 tok/s (the reference attention gathers every page of the sequence at each step) |
 | M4 ✅ | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | done 2026-10-27 (`src/ops/tile/`): element-wise kernels bit-identical to the reference, linear ≤ 1 BF16 ulp; whole model on TileBackend matches the HF Float32 fixtures (identical greedy continuations). Decode GEMV 68–93 % of the DRAM roofline (1.0–1.3× cuBLAS); prefill GEMM 0.70–0.92× cuBLAS; rope/rmsnorm/store_kv/embed 3–29× the reference. End to end: prefill 1.47×, decode only 1.13× — the reference attention fallback (≈1 ms/layer, ~6k GPU allocations per token, GC spikes) dominates until M5; tiny decode kernels sit at the ~5.5 µs launch floor until CUDA graphs (M6) |
-| M5 | Paged flash-attention (prefill, decode split-KV, verify) | correctness + % of bandwidth/FLOP roofline |
+| M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
 | M6 | CUDA graphs for decode; NVTX timeline | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B |
 | M7 | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report |
 | M8+ | prefix caching, fused epilogues, async scheduling, INT8/weight-only quant, multi-sequence | — |
@@ -407,7 +407,8 @@ Answered by M0 (environment: Julia 1.13.3, CUDA.jl 6.3, cuTile 1.0.0, tileiras 1
 
 Still open:
 
-3. Paged KV loads: a runtime-indexed `ct.load` per page vs sparse-view gather.
+3. Paged KV loads: a runtime-indexed `ct.load` per page vs sparse-view gather. M5 uses one
+   runtime-indexed load per page; sparse views (several pages per load) are not measured yet.
 4. GEMV performance in cuTile at M = 1 (and M = k+1) vs cuBLAS. This decides
    whether to keep a cuBLAS fallback for decode linears.
 
