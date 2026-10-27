@@ -20,6 +20,7 @@ python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz
 ```
 
 Profiling workflow, model-step costs and how to read the summary: [docs/PROFILING.md](docs/PROFILING.md).
+What each milestone and optimization gained, including what did not pan out: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 To tune a kernel, profile it before and after a change and read `ncu_summary.py --compare`
 rather than raw `ncu` output (`ncu` is in /usr/local/NVIDIA-Nsight-Compute). Take timings
 from bench/run.jl: `ncu` serializes kernels and locks clocks.
