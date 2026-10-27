@@ -22,18 +22,19 @@ end
 Forward steps of `model` on `cache`, with CUDA graphs for steps of up to
 $MAX_GRAPH_TOKENS tokens when `graphs`. Run steps with `forward!(runner, seq, ids)`.
 """
-struct ModelRunner{T,M<:DecoderLM{T},C<:PagedKVCache{T}}
-    model::M
-    cache::C
-    graphs::Bool
-    steps::Dict{Int,CapturedStep{T}}
+mutable struct ModelRunner{T,M<:DecoderLM{T},C<:PagedKVCache{T}}
+    const model::M
+    const cache::C
+    const graphs::Bool
+    const steps::Dict{Int,CapturedStep{T}}
+    greedy::Any                      # GreedyPipeline, created on first use
 end
 
 function ModelRunner(model::DecoderLM{T}, cache::PagedKVCache{T};
                      graphs::Bool = supports_graphs(model.backend)) where {T}
     graphs && !supports_graphs(model.backend) &&
         throw(ArgumentError("$(nameof(typeof(model.backend))) steps cannot be captured in CUDA graphs"))
-    return ModelRunner(model, cache, graphs, Dict{Int,CapturedStep{T}}())
+    return ModelRunner(model, cache, graphs, Dict{Int,CapturedStep{T}}(), nothing)
 end
 
 """
@@ -66,3 +67,87 @@ end
 
 "Number of token counts with a captured CUDA graph."
 num_graphs(r::ModelRunner) = count(s -> s.graph !== nothing, values(r.steps))
+
+# --- Greedy decoding with the host one step behind the GPU ---
+#
+# Two sets of step buffers alternate. The step on set k samples its token on the device
+# (argmax) straight into the ids of set 3 - k, and into `mirror[3 - k]` in host-mapped
+# memory. So the host can launch the step that consumes a token before reading it: while
+# the GPU runs that step, the host waits for the previous one, reads its token, checks for
+# a stop token and streams it. The GPU no longer idles between steps.
+
+mutable struct GreedyPipeline{T}
+    buffers::NTuple{2,StepBuffers{T}}
+    graphs::Vector{Union{Nothing,CUDA.CuGraphExec}}
+    mirror::CuVector{Int32}          # host-mapped: mirror[k] is the token in buffers[k].ids
+    mirror_host::Vector{Int32}
+    scratch::Any                     # for argmax_token!
+    done::NTuple{2,CuEvent}          # recorded after the step on each set
+end
+
+function greedy_pipeline(r::ModelRunner{T}) where {T}
+    r.greedy === nothing || return r.greedy::GreedyPipeline{T}
+    mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, 2)
+    bufs = (StepBuffers(r.model, r.cache, 1), StepBuffers(r.model, r.cache, 1))
+    r.greedy = GreedyPipeline{T}(bufs, [nothing, nothing], mirror, unsafe_wrap(Array, mirror),
+                                 argmax_scratch(r.model.config.vocab_size), (CuEvent(), CuEvent()))
+    return r.greedy
+end
+
+# Sample the token of `logits` into set k (its ids and mirror slot).
+sample_into!(r::ModelRunner, p::GreedyPipeline, k, logits) =
+    argmax_token!(r.model.backend, p.buffers[k].ids, view(p.mirror, k:k), logits, p.scratch)
+
+function run_greedy_step!(r::ModelRunner, p::GreedyPipeline, k)
+    b = p.buffers[k]
+    step() = (run_step!(r.model, r.cache, b); sample_into!(r, p, 3 - k, b.logits))
+    if p.graphs[k] === nothing
+        NVTX.@range "eager step" step()
+        p.graphs[k] = NVTX.@range "capture step" CUDA.instantiate(CUDA.capture(step))
+    else
+        NVTX.@range "replay step" CUDA.launch(p.graphs[k])
+    end
+    record(p.done[k])
+end
+
+"""
+    generate_greedy!(runner, seq, ids; max_new_tokens, stop_ids, on_token) -> Vector{Int}
+
+[`generate!`](@ref) with greedy sampling, pipelined so that the host runs one step behind
+the GPU. Needs a runner with CUDA graphs.
+"""
+function generate_greedy!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
+                          max_new_tokens::Integer, stop_ids, on_token = nothing)
+    r.graphs || throw(ArgumentError("pipelined greedy decoding needs CUDA graphs"))
+    p = greedy_pipeline(r)
+    generated = Int[]
+    max_new_tokens > 0 || return generated
+    logits = forward!(r, seq, ids)
+    sample_into!(r, p, 1, logits)
+    ready = CuEvent()
+    record(ready)                    # the first token, in set 1
+    k = 1                            # the set whose ids hold the next token to read
+    while true
+        more = length(generated) + 1 < max_new_tokens    # will a token follow this one?
+        if more                      # run the token before knowing it
+            NVTX.@range "upload inputs" prepare_step!(p.buffers[k], r.model, r.cache, seq, nothing)
+            run_greedy_step!(r, p, k)
+            push!(seq.tokens, -1)    # filled in below
+        end
+        NVTX.@range "wait for token" synchronize(ready)
+        id = Int(p.mirror_host[k])
+        more && (seq.tokens[end] = id)
+        if id in stop_ids
+            if more                  # the stop token went through the model: drop it again
+                synchronize()
+                truncate!(r.cache, seq, length(seq) - 1)
+            end
+            break
+        end
+        push!(generated, id)
+        on_token === nothing || on_token(id)
+        more || break
+        ready, k = p.done[k], 3 - k
+    end
+    return generated
+end

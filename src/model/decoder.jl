@@ -51,28 +51,27 @@ that only writes into these buffers allocates nothing, so on a backend that
 [`ModelRunner`](@ref)).
 """
 struct StepBuffers{T}
+    # The step's inputs: views of one device vector `meta`, uploaded in one copy from the
+    # pinned `staging` (written through its host view `staging_host`). Each segment starts
+    # at a multiple of `segment` (32 entries, 128 bytes), so every view stays aligned.
+    meta::CuVector{Int32}
+    staging::CuVector{Int32}         # pinned host memory (CUDA.HostMemory)
+    staging_host::Vector{Int32}
+    uploaded::CuEvent                # recorded after the last copy out of `staging`
+    segment::Int
     ids::CuVector{Int32}            # (n,) 0-based token ids
     positions::CuVector{Int32}      # (n,) 0-based positions
     slots::CuVector{Int32}          # (n,) cache slots, see `slots`
     block_table::CuVector{Int32}    # the sequence's pages, zero-padded to a fixed length
-    host_table::Vector{Int32}       # staging for block_table
     x::CuMatrix{T}                  # residual stream (hidden, n)
     h::CuMatrix{T}                  # normalized input of a sublayer (hidden, n)
     qkv::CuMatrix{T}                # fused projection ((heads + 2 kv_heads) head_dim, n)
-    q::CuArray{T,3}                 # (head_dim, heads, n), copied out of qkv
-    k::CuArray{T,3}                 # (head_dim, kv_heads, n)
-    v::CuArray{T,3}
-    q_normed::CuArray{T,3}          # after the Qwen3 q/k norm
-    k_normed::CuArray{T,3}
-    q_rot::CuArray{T,3}             # after rope
-    k_rot::CuArray{T,3}
+    q::CuArray{T,3}                 # attention queries (head_dim, heads, n), after q norm and rope
     attn::CuArray{T,3}              # attention output (head_dim, heads, n)
     attn_workspace::Union{Nothing,CuArray{Float32,3}}
     proj::CuMatrix{T}               # output of wo or w_down (hidden, n)
     gate_up::CuMatrix{T}            # (2 intermediate, n)
     act::CuMatrix{T}                # (intermediate, n)
-    final::CuMatrix{T}              # final-normalized hidden states of the logit columns
-    logits_T::CuMatrix{T}           # (vocab, 1 or n)
     logits::CuMatrix{Float32}
 end
 
@@ -84,38 +83,50 @@ function StepBuffers(m::DecoderLM{T}, cache::PagedKVCache{T}, n::Integer; all_lo
     # A fixed table length, a multiple of 16: cuTile kernels specialize on the divisibility
     # of each array's length, so a table that grew with the sequence would recompile them.
     table_len = cld(num_pages(cache), 16) * 16
+    a = cld(n, 32) * 32
+    meta = CUDA.zeros(Int32, 3a + table_len)
+    staging = CuArray{Int32,1,CUDA.HostMemory}(undef, length(meta))
+    staging_host = unsafe_wrap(Array, staging)
+    fill!(staging_host, 0)
     q = dev(T, D, nq, n)
-    return StepBuffers{T}(dev(Int32, n), dev(Int32, n), dev(Int32, n), CUDA.zeros(Int32, table_len),
-                          zeros(Int32, table_len), dev(T, H, n), dev(T, H, n), dev(T, (nq + 2nkv) * D, n),
-                          q, dev(T, D, nkv, n), dev(T, D, nkv, n), dev(T, D, nq, n), dev(T, D, nkv, n),
-                          dev(T, D, nq, n), dev(T, D, nkv, n), dev(T, D, nq, n),
+    return StepBuffers{T}(meta, staging, staging_host, CuEvent(), a, view(meta, 1:n), view(meta, a+1:a+n),
+                          view(meta, 2a+1:2a+n), view(meta, 3a+1:3a+table_len),
+                          dev(T, H, n), dev(T, H, n), dev(T, (nq + 2nkv) * D, n),
+                          q, dev(T, D, nq, n),
                           attention_workspace(m.backend, q, first(cache.k)), dev(T, H, n), dev(T, 2I, n),
-                          dev(T, I, n), dev(T, H, m_out), dev(T, cfg.vocab_size, m_out),
-                          dev(Float32, cfg.vocab_size, m_out))
+                          dev(T, I, n), dev(Float32, cfg.vocab_size, m_out))
 end
 
 num_tokens(b::StepBuffers) = length(b.ids)
 
 """
     prepare_step!(buffers, model, cache, seq, ids)
+    prepare_step!(buffers, model, cache, seq, nothing)
 
 Reserve cache pages for the 0-based token `ids` after the positions of `seq`, and upload
-the step's inputs into `buffers`. Host side only; `seq.tokens` is not changed.
+the step's inputs into `buffers` with one asynchronous copy, ordered before the step on the
+stream. With `nothing`, the ids are already on the device (written by a previous step's
+sampling). Host side only; `seq.tokens` is not changed.
 """
 function prepare_step!(b::StepBuffers, model::DecoderLM, cache::PagedKVCache, seq::Sequence,
-                       ids::AbstractVector{<:Integer})
-    n = length(ids)
-    n == num_tokens(b) || throw(ArgumentError("buffers are for $(num_tokens(b)) tokens, got $n"))
+                       ids::Union{Nothing,AbstractVector{<:Integer}})
+    n = num_tokens(b)
+    ids === nothing || length(ids) == n || throw(ArgumentError("buffers are for $n tokens, got $(length(ids))"))
     start = length(seq)
     start + n <= max_length(model) ||
         throw(ArgumentError("sequence of $(start + n) tokens exceeds the model's max length $(max_length(model))"))
     reserve!(cache.blocks, seq, n)
-    copyto!(b.ids, Int32.(ids))
-    copyto!(b.positions, Int32.(start:start+n-1))
-    copyto!(b.slots, slots(cache.blocks, seq, start, n))
-    fill!(b.host_table, 0)
-    copyto!(b.host_table, seq.block_table)
-    copyto!(b.block_table, b.host_table)
+    synchronize(b.uploaded)          # the previous copy out of `staging` has run
+    h, a = b.staging_host, b.segment
+    ids === nothing || (h[1:n] .= ids)
+    h[a+1:a+n] .= start:start+n-1
+    h[2a+1:2a+n] .= slots(cache.blocks, seq, start, n)
+    table = view(h, 3a+1:length(h))
+    fill!(table, 0)
+    copyto!(table, seq.block_table)
+    first = ids === nothing ? a + 1 : 1
+    copyto!(b.meta, first, b.staging, first, length(h) - first + 1)
+    record(b.uploaded)
     return b
 end
 
@@ -133,39 +144,25 @@ function run_step!(model::DecoderLM{T}, cache::PagedKVCache{T}, b::StepBuffers{T
     flat(a) = reshape(a, :, n)
 
     embed!(be, b.x, w.embed, b.ids)                                 # (hidden, n)
+    rmsnorm!(be, b.h, b.x, first(w.layers).attn_norm, eps)
     for (l, layer) in enumerate(w.layers)
-        rmsnorm!(be, b.h, b.x, layer.attn_norm, eps)
         linear!(be, b.qkv, layer.wqkv, b.h)
         layer.bqkv === nothing || (b.qkv .+= layer.bqkv)
-        # Copies of the q, k and v rows of the fused projection (to be fused away, M8+).
-        flat(b.q) .= view(b.qkv, 1:nq*D, :)
-        flat(b.k) .= view(b.qkv, nq*D+1:(nq+nkv)*D, :)
-        flat(b.v) .= view(b.qkv, (nq+nkv)*D+1:(nq+2nkv)*D, :)
-        q, k = b.q, b.k
-        if cfg.qk_norm
-            q = rmsnorm!(be, b.q_normed, q, layer.q_norm, eps)
-            k = rmsnorm!(be, b.k_normed, k, layer.k_norm, eps)
-        end
-        rope!(be, b.q_rot, q, model.rope.cos, model.rope.sin, b.positions)
-        rope!(be, b.k_rot, k, model.rope.cos, model.rope.sin, b.positions)
-        store_kv!(be, cache.k[l], cache.v[l], b.k_rot, b.v, b.slots)
-        attention!(be, b.attn, b.attn_workspace, b.q_rot, cache.k[l], cache.v[l], b.block_table,
+        attention_inputs!(be, b.q, cache.k[l], cache.v[l], b.qkv, layer.q_norm, layer.k_norm, model.rope,
+                          b.positions, b.slots, eps)
+        attention!(be, b.attn, b.attn_workspace, b.q, cache.k[l], cache.v[l], b.block_table,
                    b.positions, scale)
         linear!(be, b.proj, layer.wo, flat(b.attn))
-        b.x .+= b.proj
+        add_rmsnorm!(be, b.x, b.h, b.proj, layer.mlp_norm, eps)    # x += proj; h = norm(x)
 
-        rmsnorm!(be, b.h, b.x, layer.mlp_norm, eps)
-        linear!(be, b.gate_up, layer.w_gate_up, b.h)
-        silu_mul!(be, b.act, b.gate_up)
+        linear_swiglu!(be, b.act, b.gate_up, layer.w_gate_up, b.h)
         linear!(be, b.proj, layer.w_down, b.act)
-        b.x .+= b.proj
+        # The next layer's input norm, or the final norm after the last layer.
+        add_rmsnorm!(be, b.x, b.h, b.proj, l < length(w.layers) ? w.layers[l+1].attn_norm : w.norm, eps)
     end
 
-    last = size(b.logits, 2) == n ? b.x : view(b.x, :, n:n)        # a column view is a CuArray
-    rmsnorm!(be, b.final, last, w.norm, eps)
-    linear!(be, b.logits_T, w.lm_head, b.final)
-    b.logits .= b.logits_T
-    return b.logits
+    last = size(b.logits, 2) == n ? b.h : view(b.h, :, n:n)        # a column view is a CuArray
+    return linear!(be, b.logits, w.lm_head, last)                  # Float32 logits
 end
 
 """

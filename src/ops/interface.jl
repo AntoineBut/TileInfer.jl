@@ -92,6 +92,60 @@ silu_mul!(be::Backend, y, args...) = copyto!(y, silu_mul(be, args...))
 attention!(be::Backend, out, workspace, args...) = copyto!(out, attention(be, args...))
 
 """
+    attention_inputs!(backend, q, k_pages, v_pages, qkv, q_norm, k_norm, table, positions, slots, eps)
+
+Everything between the fused q/k/v projection `qkv` ((heads + 2 kv_heads) head_dim, n) and
+attention, as one op: the optional Qwen3 q/k RMSNorm (`q_norm`/`k_norm` or `nothing`),
+rotary embedding with the [`RotaryTable`](@ref) `table` at `positions`, and writing the keys
+and values into the page pools at `slots`. Writes the queries into `q` (head_dim, heads, n)
+and returns it. The fallback chains the primitive ops; TileBackend fuses them.
+"""
+function attention_inputs!(be::Backend, q, k_pages, v_pages, qkv, q_norm, k_norm, table, positions, slots, eps)
+    D, nq, n = size(q)
+    nkv = size(k_pages, 3)
+    split(rows, heads) = reshape(qkv[rows, :], D, heads, n)
+    qs, k, v = split(1:nq*D, nq), split(nq*D+1:(nq+nkv)*D, nkv), split((nq+nkv)*D+1:size(qkv, 1), nkv)
+    if q_norm !== nothing
+        qs, k = rmsnorm(be, qs, q_norm, eps), rmsnorm(be, k, k_norm, eps)
+    end
+    store_kv!(be, k_pages, v_pages, rope(be, k, table.cos, table.sin, positions), v, slots)
+    return copyto!(q, rope(be, qs, table.cos, table.sin, positions))
+end
+
+"""
+    linear_swiglu!(backend, y, gate_up, W, x)
+
+`y = silu_mul(linear(W, x))` for the stacked gate/up weight `W`, in one op where the
+backend can fuse it; `gate_up` is scratch for backends that cannot. Returns `y`.
+"""
+linear_swiglu!(be::Backend, y, gate_up, W, x) = silu_mul!(be, y, linear!(be, gate_up, W, x))
+
+"""
+    add_rmsnorm!(backend, x, h, delta, w, eps)
+
+The residual update `x .+= delta` (rounded to T), then `h = rmsnorm(x, w, eps)`, in one
+op. Returns `h`.
+"""
+function add_rmsnorm!(be::Backend, x, h, delta, w, eps)
+    x .+= delta
+    return rmsnorm!(be, h, x, w, eps)
+end
+
+"""
+    argmax_token!(backend, ids, mirror, logits, scratch)
+
+Greedy sampling of the logits (vocab, 1): the 0-based argmax, written to `ids[1]` and
+`mirror[1]`. On TileBackend this runs on the device and can be captured in a graph.
+`scratch` comes from `argmax_scratch(vocab)`.
+"""
+function argmax_token!(::Backend, ids, mirror, logits, scratch)
+    token = Int32[argmax(vec(Array(logits))) - 1]
+    copyto!(ids, token)
+    copyto!(mirror, token)
+    return ids
+end
+
+"""
     attention_workspace(backend, q, k_pages)
 
 Scratch memory `attention!` needs for queries shaped like `q`, or `nothing`.

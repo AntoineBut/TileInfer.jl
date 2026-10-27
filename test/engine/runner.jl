@@ -43,7 +43,21 @@ if test_model_dir() !== nothing
                 return TileInfer.generate!(TileInfer.ModelRunner(m, c; graphs), TileInfer.new_sequence(c), prompt;
                                            max_new_tokens = 30, stop_ids = Int[])
             end
-            @test gen(true) == gen(false)
+            @test gen(true) == gen(false)                         # pipelined vs step by step
+        end
+
+        @testset "pipelined greedy decoding stops like the plain loop" begin
+            function run(graphs, stop_ids)
+                c = new_cache()
+                s = TileInfer.new_sequence(c)
+                out = TileInfer.generate!(TileInfer.ModelRunner(m, c; graphs), s, prompt;
+                                          max_new_tokens = 12, stop_ids)
+                return out, copy(s.tokens), copy(s.block_table)
+            end
+            full, = run(false, Int[])
+            for stop_ids in ([full[6]], Int[])                         # stop token, budget
+                @test run(true, stop_ids) == run(false, stop_ids)
+            end
         end
 
         @testset "reference backend steps run eagerly" begin

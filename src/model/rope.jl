@@ -1,10 +1,15 @@
 # Rotary position embedding tables, computed once on the host the way transformers does:
 # inverse frequencies and angles in Float32, cos/sin rounded to the model's element type.
 
-"Per-position `cos`/`sin` tables (head_dim, max_len) on the device; column p+1 is position p."
+"""
+Per-position `cos`/`sin` tables (head_dim, max_len) on the device; column p+1 is position p.
+`cos_sin` holds both, interleaved as (head_dim, 2 max_len): columns 2p+1 and 2p+2 are the
+cos and sin of position p, so a fused kernel needs one array argument for them.
+"""
 struct RotaryTable{T,M<:AbstractMatrix{T}}
     cos::M
     sin::M
+    cos_sin::M
 end
 
 function inverse_frequencies(cfg::ModelConfig)
@@ -34,9 +39,10 @@ function RotaryTable{T}(cfg::ModelConfig, max_len::Integer) where {T}
     inv_freq = inverse_frequencies(cfg)
     angles = [Float32(p) * f for f in inv_freq, p in 0:max_len-1]   # (head_dim/2, max_len)
     angles = vcat(angles, angles)                                   # both halves share angles
-    c = CuArray(T.(Float32.(cos.(Float64.(angles)))))
-    s = CuArray(T.(Float32.(sin.(Float64.(angles)))))
-    return RotaryTable(c, s)
+    c = T.(Float32.(cos.(Float64.(angles))))
+    s = T.(Float32.(sin.(Float64.(angles))))
+    cs = reshape(permutedims(cat(c, s; dims = 3), (1, 3, 2)), size(c, 1), :)
+    return RotaryTable(CuArray(c), CuArray(s), CuArray(cs))
 end
 
 Base.length(r::RotaryTable) = size(r.cos, 2)

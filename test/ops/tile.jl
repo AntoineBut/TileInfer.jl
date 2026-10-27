@@ -67,6 +67,58 @@ using Random: randperm
             end
         end
 
+        # Fused q/k norm + rope + KV write vs the same tile ops run one by one (the generic
+        # fallback): bit-identical; and vs the reference within the rmsnorm tolerance.
+        @testset "attention_inputs (qk_norm = $qk_norm)" for qk_norm in (true, false)
+            D, nq, nkv, P, pages, L = 128, 16, 8, 16, 6, 64
+            positions = Int32[3, 17, 18, 40, 0]                      # any order, across pages
+            n = length(positions)
+            slots = CuArray(Int32[13, 14, 15, 16, 70])
+            θ = rand(Float32, D ÷ 2, L) .* 100
+            angles = vcat(θ, θ)
+            c, s = T.(cos.(angles)), T.(sin.(angles))
+            table = TileInfer.RotaryTable(CuArray(c), CuArray(s),
+                                          CuArray(reshape(permutedims(cat(c, s; dims = 3), (1, 3, 2)), D, :)))
+            qkv = rnd((nq + 2nkv) * D, n)
+            qn, kn = qk_norm ? (rnd(D), rnd(D)) : (nothing, nothing)
+            pos = CuArray(positions)
+            function run(be; fused = true)
+                q, kp, vp = CUDA.zeros(T, D, nq, n), CUDA.zeros(T, D, P, nkv, pages), CUDA.zeros(T, D, P, nkv, pages)
+                args = (be, q, kp, vp, qkv, qn, kn, table, pos, slots, 1e-6)
+                fused ? TileInfer.attention_inputs!(args...) :
+                        invoke(TileInfer.attention_inputs!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 10)...}, args...)
+                return host.((q, kp, vp))
+            end
+            fused, unfused, reference = run(tile), run(tile; fused = false), run(ref)
+            @test fused == unfused
+            worst = maximum(ulps(r, f, T) for (r, f) in zip(reference, fused))
+            @test worst <= (T == BFloat16 ? 1 : 32)    # rmsnorm's sum order, amplified by rope
+        end
+
+        @testset "add_rmsnorm H = $H" for H in (1024, 2560, 100)
+            x, d, w = rnd(H, 5), rnd(H, 5), rnd(H)
+            x1, x2, h1, h2 = copy(x), copy(x), similar(x), similar(x)
+            TileInfer.add_rmsnorm!(tile, x1, h1, d, w, 1e-6)
+            invoke(TileInfer.add_rmsnorm!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 5)...}, tile, x2, h2, d, w, 1e-6)
+            @test host(x1) == host(x2) && host(h1) == host(h2)       # same as add, then rmsnorm
+        end
+
+        @testset "linear_swiglu ($in, 2 × $I) n = $n" for (in, I) in ((1024, 3072), (200, 100)), n in (1, 3)
+            W, x = rnd(in, 2I; scale = 1 / 30), rnd(in, n)
+            y, y_unfused, scratch = CuMatrix{T}(undef, I, n), CuMatrix{T}(undef, I, n), CuMatrix{T}(undef, 2I, n)
+            TileInfer.linear_swiglu!(tile, y, scratch, W, x)
+            invoke(TileInfer.linear_swiglu!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 4)...}, tile, y_unfused, scratch, W, x)
+            # Same as GEMV then silu_mul; bit-identical when both use the same column tile
+            # (as at Qwen3 sizes), else the reductions may round differently.
+            @test ulps(y_unfused, y, T) <= (T == BFloat16 ? 1 : 8)
+        end
+
+        @testset "linear into Float32 n = $n" for n in (1, 17)
+            W, x = rnd(1024, 300; scale = 1 / 30), rnd(1024, n)
+            y = TileInfer.linear!(tile, CuMatrix{Float32}(undef, 300, n), W, x)
+            @test Array(y) == host(TileInfer.linear(tile, W, x))       # rounded to T, then converted
+        end
+
         @testset "linear with bias" begin
             W, x, b = rnd(64, 32), rnd(64, 2), rnd(32)
             @test host(TileInfer.linear(tile, W, x, b)) ≈ host(TileInfer.linear(ref, W, x, b)) rtol = 1e-2
@@ -99,6 +151,17 @@ using Random: randperm
             else
                 @test host(y) ≈ host(exact) rtol = 1e-5
             end
+        end
+    end
+
+    @testset "argmax_token (vocab = $V)" for V in (151936, 5000, 4096)
+        ids, mirror, scratch = CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1), TileInfer.argmax_scratch(V)
+        for trial in 1:3
+            logits = randn(Float32, V, 1)
+            trial == 2 && (logits[[17, V ÷ 2, V], 1] .= 100)        # ties: the first one wins
+            trial == 3 && (logits[V, 1] = 100)                       # in the last, padded chunk
+            TileInfer.argmax_token!(tile, ids, mirror, CuArray(logits), scratch)
+            @test Array(ids)[1] == Array(mirror)[1] == argmax(vec(logits)) - 1
         end
     end
 

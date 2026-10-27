@@ -17,6 +17,7 @@ using TileInfer: DecoderLM, PagedKVCache, RefBackend, TileBackend
 const OP_REPS = 20
 const PREFILL = 512
 const CONTEXT = 1024        # cached positions seen by decode attention / decode steps
+const GEN = 64              # tokens per generation benchmark
 
 "What a benchmark measures, for the report."
 struct Workload
@@ -131,7 +132,8 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
         name = backend_name(be)
         prefill_key, decode_key = "model/prefill$PREFILL/$name", "model/decode_ctx$CONTEXT/$name"
         graph_key = "model/decode_graph_ctx$CONTEXT/$name"           # through a ModelRunner
-        keys = TileInfer.supports_graphs(be) ? (prefill_key, decode_key, graph_key) : (prefill_key, decode_key)
+        gen_keys = ("model/generate$(GEN)_ctx$CONTEXT/$name", "model/generate$(GEN)_unpipelined_ctx$CONTEXT/$name")
+        keys = TileInfer.supports_graphs(be) ? (prefill_key, decode_key, graph_key, gen_keys...) : (prefill_key, decode_key)
         any(k -> occursin(filter, k), keys) || continue
         m = DecoderLM(cfg, w, model.rope, be)
         cache = PagedKVCache(m; max_tokens = CONTEXT + PREFILL)
@@ -168,16 +170,32 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
             end evals = 1)
             info[decode_key] = Workload(1, weights + kv, 2 * params, 1)
         end
-        if graph_key in keys && occursin(filter, graph_key)
+        if graph_key in keys && any(k -> occursin(filter, k), (graph_key, gen_keys...))
             runner = TileInfer.ModelRunner(m, cache)
             TileInfer.forward!(runner, ctx, [42])                     # captures the graph
             TileInfer.truncate!(cache, ctx, CONTEXT - 1)
-            setleaf!(suite, split(graph_key, "/"), @benchmarkable begin
-                TileInfer.forward!($runner, $ctx, [42])
-                CUDA.synchronize()
-                TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
-            end evals = 1)
-            info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
+            if occursin(filter, graph_key)
+                setleaf!(suite, split(graph_key, "/"), @benchmarkable begin
+                    TileInfer.forward!($runner, $ctx, [42])
+                    CUDA.synchronize()
+                    TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+                end evals = 1)
+                info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
+            end
+            # Greedy generation of GEN tokens (times are per call; tok/s per token), with the
+            # host one step behind the GPU and, for comparison, step by step.
+            for pipeline in (true, false)
+                key = "model/generate$(GEN)$(pipeline ? "" : "_unpipelined")_ctx$CONTEXT/$name"
+                occursin(filter, key) || continue
+                gen() = TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[], pipeline)
+                gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, CONTEXT - 1)
+                setleaf!(suite, split(key, "/"), @benchmarkable begin
+                    $gen()
+                    CUDA.synchronize()
+                    TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+                end evals = 1)
+                info[key] = Workload(1, GEN * (weights + kv), 2 * params * GEN, GEN)
+            end
         end
     end
 

@@ -11,13 +11,17 @@
 Continue `seq` with the 0-based token `ids` and generate up to `max_new_tokens` tokens.
 Returns the new token ids, without the stop token. `on_token(id)` is called after each
 new token, for streaming. Afterwards `seq` holds `ids` and every generated token except
-the last one, which was sampled but never run through the model.
+the last one, which was sampled but never run through the model. Greedy decoding on a
+runner with CUDA graphs is pipelined ([`generate_greedy!`](@ref)) unless `pipeline = false`.
 """
 function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
                    max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
                    stop_ids = r.model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
-                   on_token = nothing)
+                   on_token = nothing, pipeline::Bool = true)
     isempty(ids) && throw(ArgumentError("no tokens to process"))
+    # Greedy decoding with graphs runs pipelined, the host one step behind the GPU.
+    pipeline && sampling.temperature == 0 && r.graphs &&
+        return generate_greedy!(r, seq, ids; max_new_tokens, stop_ids, on_token)
     generated = Int[]
     logits = forward!(r, seq, ids)
     for _ in 1:max_new_tokens
