@@ -35,6 +35,8 @@ end
     code, _, err = run_cli("run", "nobody/not-pulled", "hi")
     @test code == 1 && occursin("is not pulled", err)
     if test_model_dir() !== nothing
+        code, _, err = run_cli("run", TEST_MODEL, "hi", "--backend", "gpu")
+        @test code == 1 && occursin("--backend expects tile or ref", err)
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--top-p", "lots")
         @test code == 1 && occursin("--top-p expects a number", err)
         # Greedy raw completion; the same continuation as the float32 HF fixture would be

@@ -11,6 +11,7 @@
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
+# "x ref" is the speedup over the reference backend's version of the same benchmark.
 
 include("suite.jl")
 using JSON: JSON
@@ -56,12 +57,22 @@ function load_results(name)
     return BenchmarkTools.load(path)[1], env
 end
 
+# The baseline trial at `path`, or nothing. (Indexing a BenchmarkGroup with a missing key
+# returns an empty group rather than failing.)
+function lookup(g::BenchmarkGroup, path)
+    for k in path
+        haskey(g, k) || return nothing
+        g = g[k]
+    end
+    return g isa BenchmarkTools.Trial ? g : nothing
+end
+
 format_time(t) = t < 1e3 ? @sprintf("%.0f ns", t) : t < 1e6 ? @sprintf("%.1f µs", t / 1e3) :
                  @sprintf("%.2f ms", t / 1e6)
 
 function report(results, info; baseline = nothing)
     rows = sort!(collect(leaves(results)); by = r -> join(first(r), "/"))
-    @printf("%-40s %10s %10s %9s %6s %8s %8s", "benchmark", "min", "median", "GB/s", "%peak", "TFLOP/s", "tok/s")
+    @printf("%-40s %10s %10s %9s %6s %8s %8s %7s", "benchmark", "min", "median", "GB/s", "%peak", "TFLOP/s", "tok/s", "x ref")
     baseline === nothing || @printf(" %9s  %s", "speedup", "vs baseline")
     println()
     for (path, trial) in rows
@@ -73,8 +84,11 @@ function report(results, info; baseline = nothing)
                 bandwidth / 1e9, 100 * bandwidth / PEAK_BANDWIDTH,
                 w.flops >= 1e9 ? @sprintf("%.2f", w.flops / (tmin * 1e-9) / 1e12) : "",
                 w.tokens > 0 ? @sprintf("%.1f", w.tokens / (tmin * 1e-9)) : "")
+        # Speedup over the reference backend's version of the same benchmark in this run.
+        ref = path[end] == "ref" ? nothing : lookup(results, [path[1:end-1]; "ref"])
+        print(ref === nothing ? "        " : @sprintf(" %6.2fx", minimum(ref).time / minimum(trial).time))
         if baseline !== nothing
-            old = try baseline[path] catch; nothing end
+            old = lookup(baseline, path)
             if old === nothing
                 print("         -  (new)")
             else
@@ -104,11 +118,11 @@ function main(args)
         baseline, base_env = load_results(opts["compare"])
         println("Baseline \"$(opts["compare"])\": commit $(get(base_env, "commit", "?")) on $(get(base_env, "gpu", "?"))")
     end
-    report(results, info; baseline)
-    if haskey(opts, "save")
+    if haskey(opts, "save")             # before reporting, so a report error loses nothing
         save_results(opts["save"], results, env)
         println("Saved to $(result_path(opts["save"]))")
     end
+    report(results, info; baseline)
 end
 
 main(ARGS)

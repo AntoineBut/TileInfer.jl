@@ -18,6 +18,7 @@ const USAGE = """
       --top-k K, --top-p P  sampling filters
       --seed S              random seed
       --thinking on|off     Qwen3 reasoning mode (default on)
+      --backend tile|ref    cuTile kernels (default) or the reference ops
       --raw                 run only: send the prompt as-is, without the chat template
     """
 
@@ -87,14 +88,18 @@ function parse_option(::Type{T}, options, name, default) where {T}
     return value
 end
 
-const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking")
+const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
+                            "backend")
+const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
 function load_for_generation(model_name, options)
     thinking = get(options, "thinking", "on")
     thinking in ("on", "off") || throw(ArgumentError("--thinking expects on or off"))
+    backend = get(BACKENDS, get(options, "backend", "tile"), nothing)
+    backend === nothing && throw(ArgumentError("--backend expects tile or ref"))
     dir = model_dir(model_name)
-    model = load_model(dir; max_len = parse_option(Int, options, "max-context", 4096))
+    model = load_model(dir; backend, max_len = parse_option(Int, options, "max-context", 4096))
     tok = load_tokenizer(dir)
     defaults, stop_ids = generation_defaults(dir, model.config)
     sampling = SamplingParams(temperature = parse_option(Float64, options, "temperature", defaults.temperature),
@@ -104,24 +109,32 @@ function load_for_generation(model_name, options)
     return (; model, tok, sampling, stop_ids, rng, enable_thinking = thinking == "on")
 end
 
-# Streams tokens to `io` and records when the first one arrived.
+# Streams tokens to `io` and records when the first two arrived.
 mutable struct TimedStream
     stream::TextStream
     start::Float64
     first_token::Float64
+    second_token::Float64
 end
 
-TimedStream(tok::BPETokenizer, io::IO) = TimedStream(TextStream(tok, io), time(), 0.0)
+TimedStream(tok::BPETokenizer, io::IO) = TimedStream(TextStream(tok, io), time(), 0.0, 0.0)
 
 function (t::TimedStream)(id)
-    t.first_token == 0 && (t.first_token = time())
+    now = time()
+    if t.first_token == 0
+        t.first_token = now
+    elseif t.second_token == 0
+        t.second_token = now
+    end
     t.stream(id)
 end
 
-# Time to first token includes JIT compilation in a fresh process; decode speed does not.
+# In a fresh process, time to first token includes compiling the prefill kernels, and the
+# first decode step compiles the single-token ones. Decode speed is measured from the
+# second token on so that it excludes both.
 function timing_summary(t::TimedStream, generated::Integer)
     stop = time()
-    rate = generated > 1 ? (generated - 1) / (stop - t.first_token) : NaN
+    rate = generated > 2 ? (generated - 2) / (stop - t.second_token) : NaN
     ttft = t.first_token == 0 ? stop - t.start : t.first_token - t.start
     return string("first token after ", round(ttft; digits = 2), " s, then ", round(rate; digits = 1), " tok/s")
 end

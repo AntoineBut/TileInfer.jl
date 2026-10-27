@@ -69,4 +69,11 @@ sequence's keys and values are in the pages listed by `block_table` (a device ve
 """
 function attention end
 
+"""
+    has_kernel(backend, op) -> Bool
+
+Whether `backend` implements `op` itself, rather than delegating to another backend.
+"""
+has_kernel(::Backend, op) = true
+
 export Backend, RefBackend, TileBackend

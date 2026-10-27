@@ -10,7 +10,7 @@ Hot kernels are written in cuTile.jl. Clear, measurable code wins over feature b
 ## Commands
 
 ```sh
-julia --project=test test/runtests.jl                 # full suite, ~90 s (cuTile examples, model loads)
+julia --project=test test/runtests.jl                 # full suite, ~130 s (cuTile examples, model loads)
 julia --project=test test/runtests.jl kernels graphs  # only files whose path contains an arg, ~10 s
 julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
 julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME]  # op + model benchmarks
@@ -69,6 +69,22 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
 - **Numerics vs transformers:** RefBackend rounds to `T` where PyTorch does. Float32 runs
   must match the HF fixtures to ~1e-4 (that is the correctness check); BFloat16 runs differ by
   a few ulps and greedy continuations diverge at near-ties, which is expected.
+
+## cuTile notes (learned the hard way)
+
+- Kernels live in `src/ops/tile/`, one in-place launcher per op (`rmsnorm!(be, y, ...)`)
+  with the functional op allocating the output; round to `T` where the reference does, so
+  element-wise kernels are bit-identical to RefBackend (tests check that).
+- No `for` loops over tuples of arrays in kernels ("Cannot resolve LoopOp init value"):
+  unroll through an `@inline` helper.
+- `ct.load`/`ct.store` indices are in tile units; along a size-1 tile axis that is the
+  element index. `order = (2, 1)` loads a transposed tile (index/shape in permuted order).
+- Kernels specialize on each array's shape divisibility and contiguity, not only on types:
+  a new token count can mean a new compile.
+- Tiny kernels cost ~5.5 µs per launch (vs ~3.5 µs for a CUDA.jl broadcast); below that,
+  only CUDA graphs help.
+- The GPU also drives the desktop (compositor, browsers, …) and idles at 210 MHz: time
+  kernels as the minimum over many short trials after a warm-up, never as one averaged loop.
 
 ## Dependency notes
 

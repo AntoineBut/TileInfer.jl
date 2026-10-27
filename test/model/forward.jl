@@ -20,9 +20,10 @@ end
 dir = test_model_dir()
 if dir !== nothing
     @testset "forward vs transformers" begin
-        @testset "float32" begin
+        loaded = TileInfer.load_model(TEST_MODEL; T = Float32, max_len = 128)
+        @testset "float32 $(nameof(typeof(backend)))" for backend in (RefBackend(), TileBackend())
             # Same math in the same precision: agreement down to accumulation order.
-            m = TileInfer.load_model(TEST_MODEL; T = Float32, max_len = 128)
+            m = TileInfer.DecoderLM(loaded.config, loaded.weights, loaded.rope, backend)
             run_all(cache, seq, ids) = Array(TileInfer.forward!(m, cache, seq, ids; all_logits = true))
             for (name, case) in LOGITS
                 ids = Int.(case["ids"])
@@ -65,15 +66,16 @@ if dir !== nothing
                 TileInfer.truncate!(cache, seq, length(ids) - 1)
                 @test Array(TileInfer.forward!(m, cache, seq, ids[end:end]))[:, 1] ≈ full[:, end] rtol = 1e-4
             end
-            m = nothing; GC.gc(); CUDA.reclaim()
         end
+        loaded = nothing; GC.gc(); CUDA.reclaim()
 
-        @testset "bfloat16" begin
+        loaded = TileInfer.load_model(TEST_MODEL; T = BFloat16, max_len = 128)
+        @testset "bfloat16 $(nameof(typeof(backend)))" for backend in (RefBackend(), TileBackend())
             # Rounding to BFloat16 at the same points as PyTorch, but with GPU vs CPU
             # accumulation order: logits within a few BFloat16 ulps (0.125 at |logit| ~ 20),
             # argmax equal except on near-ties. Greedy continuations are not compared:
             # they legitimately diverge after the first near-tie.
-            m = TileInfer.load_model(TEST_MODEL; T = BFloat16, max_len = 128)
+            m = TileInfer.DecoderLM(loaded.config, loaded.weights, loaded.rope, backend)
             for (name, case) in LOGITS
                 ids = Int.(case["ids"])
                 cache = TileInfer.PagedKVCache(m)
@@ -82,7 +84,7 @@ if dir !== nothing
                 @test maxdiff < 1.0
                 @test mismatches == 0
             end
-            m = nothing; GC.gc(); CUDA.reclaim()
         end
+        loaded = nothing; GC.gc(); CUDA.reclaim()
     end
 end

@@ -6,6 +6,10 @@ import cuTile as ct
 
 include("ops/interface.jl")
 include("ops/reference.jl")
+include("ops/tile/norm.jl")
+include("ops/tile/elementwise.jl")
+include("ops/tile/linear.jl")
+include("ops/tile/attention.jl")
 include("config.jl")
 include("model/weights.jl")
 include("model/rope.jl")

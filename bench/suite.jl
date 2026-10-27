@@ -57,7 +57,9 @@ function add_op!(suite, info, filter, path, op, make_args; bytes, flops = 0.0)
     calls = [argsets[mod1(i, copies)] for i in 1:OP_REPS]
     for be in BACKENDS
         key = [path..., backend_name(be)]
-        occursin(filter, join(key, "/")) && applicable(op, be, first(argsets)...) || continue
+        # Skip backends without the op, and fallbacks that would only repeat another backend.
+        occursin(filter, join(key, "/")) && applicable(op, be, first(argsets)...) &&
+            TileInfer.has_kernel(be, op) || continue
         setleaf!(suite, key, @benchmarkable begin
             for args in $calls
                 $op($be, args...)
