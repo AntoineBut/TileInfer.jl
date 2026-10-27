@@ -27,6 +27,7 @@ const TESTS = [
     "ops/tile.jl",
     "model/forward.jl",
     "engine/sampler.jl",
+    "engine/runner.jl",
     "engine/chat.jl",
     "cli.jl",
     "smoke/examples.jl",    # ~40 s: compiles all cuTile examples

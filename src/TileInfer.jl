@@ -1,6 +1,7 @@
 module TileInfer
 
 using CUDA
+using NVTX: NVTX
 using cuTile: cuTile
 import cuTile as ct
 
@@ -20,6 +21,7 @@ include("hub/loader.jl")
 include("tokenizer/bpe.jl")
 include("tokenizer/chat_template.jl")
 include("model/decoder.jl")
+include("engine/runner.jl")
 include("engine/sampler.jl")
 include("engine/generate.jl")
 include("engine/chat.jl")

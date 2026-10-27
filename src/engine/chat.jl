@@ -11,10 +11,11 @@
 A conversation with `model`, with its own paged KV cache for up to `max_tokens` positions.
 Send messages with [`reply!`](@ref).
 """
-mutable struct ChatSession{M<:DecoderLM,C<:PagedKVCache}
+mutable struct ChatSession{M<:DecoderLM,C<:PagedKVCache,R<:ModelRunner}
     model::M
     tokenizer::BPETokenizer
     cache::C
+    runner::R                    # keeps its CUDA graphs across turns
     seq::Sequence
     messages::Vector{ChatMessage}
     sampling::SamplingParams
@@ -27,8 +28,8 @@ function ChatSession(model::DecoderLM, tok::BPETokenizer; sampling::SamplingPara
                      stop_ids = model.config.eos_token_ids, enable_thinking::Bool = true,
                      max_tokens::Integer = max_length(model), rng::AbstractRNG = Random.default_rng())
     cache = PagedKVCache(model; max_tokens = min(max_tokens, max_length(model)))
-    return ChatSession(model, tok, cache, new_sequence(cache), ChatMessage[], sampling,
-                       collect(Int, stop_ids), enable_thinking, rng)
+    return ChatSession(model, tok, cache, ModelRunner(model, cache), new_sequence(cache), ChatMessage[],
+                       sampling, collect(Int, stop_ids), enable_thinking, rng)
 end
 
 "Statistics of one chat turn: prompt tokens reused from the cache and newly prefilled."
@@ -62,7 +63,7 @@ function reply!(s::ChatSession, text::AbstractString; max_new_tokens::Integer = 
     # Reuse the cached prefix, but always run at least one token to get logits.
     reused = min(common_prefix(s.seq.tokens, prompt), length(prompt) - 1)
     truncate!(s.cache, s.seq, reused)
-    generated = generate!(s.model, s.cache, s.seq, prompt[reused+1:end]; max_new_tokens,
+    generated = generate!(s.runner, s.seq, prompt[reused+1:end]; max_new_tokens,
                           sampling = s.sampling, stop_ids = s.stop_ids, rng = s.rng, on_token)
     reply = decode(s.tokenizer, generated)
     append!(s.messages, (ChatMessage("user", text), ChatMessage("assistant", reply)))

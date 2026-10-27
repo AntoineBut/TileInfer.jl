@@ -11,8 +11,9 @@
 #   merges them. The grid does not depend on the context length (splits without pages
 #   write a neutral partial), which keeps the launch shape fixed for CUDA graphs.
 #
-# Positions are 1-based: query t of the step is at position start + t and sees keys at
-# positions ≤ start + t.
+# Positions are 1-based here: query t of the step is at position start + t and sees keys at
+# positions ≤ start + t, where start (the 0-based position of the first query) is read from
+# the device, so a captured CUDA graph stays valid as the sequence grows.
 #
 # Arrays are passed as 2-D views to keep launches under 32 kernel parameters (see the cuTile
 # notes in CLAUDE.md): a pool viewed as (head_dim, page_size × kv_heads × pages) holds the
@@ -48,11 +49,12 @@ end
 @inline page_column(BT, j, h, KV_HEADS) = (BT[j + Int32(1)] - Int32(1)) * Int32(KV_HEADS) + h
 
 function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
-                                  V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, start::Int32,
+                                  V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                   qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, TM::Int,
                                   PAGE::Int) where {T}
     ct.@compiler_options occupancy = 2
     bx, head = ct.bid(1), ct.bid(2)
+    start = Pos[Int32(1)]
     h = cld(head, Int32(GROUP))
     len = start + size(Q, 2)
     first_pos = start + (bx - Int32(1)) * Int32(TM)               # queries first_pos+1 : first_pos+TM
@@ -82,11 +84,12 @@ end
 # The partial of split s goes to column (h - 1) SPLITS + s of the workspace: acc in rows
 # 1:D, m in row D + 1 and l in row D + 2.
 function attention_decode_kernel(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
-                                 V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, start::Int32,
+                                 V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                  qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, NT::Int,
                                  PAGE::Int, SPLITS::Int) where {T}
     ct.@compiler_options occupancy = 2
     h, s = ct.bid(1), ct.bid(2)
+    start = Pos[Int32(1)]
     M = GROUP * NT
     pages = cld(start + size(Q, 2), Int32(PAGE))
     per_split = cld(pages, Int32(SPLITS))
@@ -154,25 +157,25 @@ pool_view(pages::CuArray{<:Any,4}) = reshape(pages, size(pages, 1), :)
 heads_view(x::CuArray{<:Any,3}) = reshape(x, :, size(x, 3))
 
 function attention_prefill!(::TileBackend, out::CuArray{T,3}, q::CuArray{T,3}, k_pages::CuArray{T,4},
-                            v_pages::CuArray{T,4}, block_table::CuVector{Int32}, start::Integer,
+                            v_pages::CuArray{T,4}, block_table::CuVector{Int32}, positions::CuVector{Int32},
                             scale::Real) where {T}
     D, heads, n = size(q)
     P, kv_heads = size(k_pages, 2), size(k_pages, 3)
     @cuda backend = cuTile blocks = (cld(n, PREFILL_TM), heads) attention_prefill_kernel(
         heads_view(out), heads_view(q), pool_view(k_pages), pool_view(v_pages), block_table,
-        Int32(start), Float32(scale), ct.Constant(D), ct.Constant(heads ÷ kv_heads),
+        positions, Float32(scale), ct.Constant(D), ct.Constant(heads ÷ kv_heads),
         ct.Constant(kv_heads), ct.Constant(PREFILL_TM), ct.Constant(P))
     return out
 end
 
 function attention_decode!(::TileBackend, out::CuArray{T,3}, part::CuArray{Float32,3}, q::CuArray{T,3},
                            k_pages::CuArray{T,4}, v_pages::CuArray{T,4}, block_table::CuVector{Int32},
-                           start::Integer, scale::Real) where {T}
+                           positions::CuVector{Int32}, scale::Real) where {T}
     D, heads, n = size(q)
     P, kv_heads = size(k_pages, 2), size(k_pages, 3)
     group, splits = heads ÷ kv_heads, size(part, 3) ÷ kv_heads
     @cuda backend = cuTile blocks = (kv_heads, splits) attention_decode_kernel(
-        part, heads_view(q), pool_view(k_pages), pool_view(v_pages), block_table, Int32(start),
+        part, heads_view(q), pool_view(k_pages), pool_view(v_pages), block_table, positions,
         Float32(scale), ct.Constant(D), ct.Constant(group), ct.Constant(kv_heads), ct.Constant(decode_tokens(group, n)),
         ct.Constant(P), ct.Constant(splits))
     @cuda backend = cuTile blocks = (group * n, kv_heads) attention_combine_kernel(
@@ -180,11 +183,21 @@ function attention_decode!(::TileBackend, out::CuArray{T,3}, part::CuArray{Float
     return out
 end
 
-function attention(be::TileBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
-                   block_table::CuVector{Int32}, start::Integer, scale::Real) where {T}
-    if uses_decode_kernel(size(q, 2) ÷ size(k_pages, 3), size(q, 3))
-        return attention_decode!(be, similar(q), decode_workspace(q, k_pages), q, k_pages, v_pages,
-                                 block_table, start, scale)
-    end
-    return attention_prefill!(be, similar(q), q, k_pages, v_pages, block_table, start, scale)
+attention_workspace(::TileBackend, q::CuArray{<:Any,3}, k_pages::CuArray{<:Any,4}) =
+    uses_decode_kernel(size(q, 2) ÷ size(k_pages, 3), size(q, 3)) ? decode_workspace(q, k_pages) : nothing
+
+# The decode kernels when there is a split-KV workspace, the prefill kernel otherwise.
+function attention!(be::TileBackend, out::CuArray{T,3}, workspace::Union{Nothing,CuArray{Float32,3}},
+                    q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+                    block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real) where {T}
+    workspace === nothing &&
+        return attention_prefill!(be, out, q, k_pages, v_pages, block_table, positions, scale)
+    return attention_decode!(be, out, workspace, q, k_pages, v_pages, block_table, positions, scale)
 end
+
+attention(be::TileBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+          block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real) where {T} =
+    attention!(be, similar(q), attention_workspace(be, q, k_pages), q, k_pages, v_pages, block_table,
+               positions, scale)
+
+supports_graphs(::TileBackend) = true

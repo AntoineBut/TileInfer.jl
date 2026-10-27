@@ -68,6 +68,32 @@ ncu --profile-from-start off -k regex:'^(embed|rmsnorm|gemv|rope|store_kv|silu_m
 python3 bench/ncu_summary.py bench/results/decode.ncu-repz
 ```
 
+## Timeline: NVTX ranges
+
+The host side of generation is annotated with NVTX ranges: `prefill`, and for steps
+through a `ModelRunner` `upload inputs`, `eager step` / `capture step` (first step of a
+token count) and `replay step`, then `sample` in `generate!`. `sample` includes waiting
+for the asynchronous step, since `argmax` synchronizes. Without installing anything,
+CUDA.jl's integrated profiler prints a table of them next to the kernels:
+
+```julia
+CUDA.@profile TileInfer.generate!(runner, seq, ids; max_new_tokens = 4)
+```
+
+For a graphical timeline, Nsight Systems (`nsys`, not installed on this machine yet) records
+the same ranges along with every kernel, including those launched from a graph:
+
+```sh
+nsys profile -t cuda,nvtx -o bench/results/decode julia --project=. -m TileInfer run Qwen/Qwen3-0.6B "Hi"
+```
+
+Snapshot (Qwen3-0.6B, ~100-token context, decode through a graph): `replay step` ≈ 0.34 ms
+of host time per token, `upload inputs` ≈ 16 µs, `sample` ≈ 3.1 ms (mostly the wait for the
+~2.9 ms step).
+
+For per-kernel analysis with `ncu`, profile the eager `model/decode_ctx1024/tile` step,
+which launches the same kernels as the graph.
+
 ## Reading `ncu_summary.py`
 
 With up to 4 kernels in a report (or `--kernel REGEX` narrowing it), each kernel gets:

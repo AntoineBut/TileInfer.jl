@@ -60,8 +60,11 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
   method (cuTile). A new cuTile kernel lands together with its correctness test against the
   reference and a benchmark.
 - **Element type is a type parameter** (`DecoderLM{T}` …). BF16 is the default.
-- **No allocations or host syncs in the decode step**, so it stays CUDA-graph capturable.
-  Compile kernels (launch once) before capturing.
+- **No allocations or host syncs in the decode step**, so it stays CUDA-graph capturable
+  (`ModelRunner` captures steps of ≤ 8 tokens). Every op has an in-place `op!` that
+  `run_step!` calls on `StepBuffers`; a new TileBackend op needs one too. Kernels read
+  per-step values (positions, slots, block table) from device buffers, never as scalar
+  launch arguments, which a graph would freeze. Compile kernels (launch once) before capturing.
 - **No NN frameworks** (Flux/Lux). Models are plain structs of `CuArray`s.
 - **Never `mul!` on BFloat16 `CuArray`s.** CUDA.jl falls back to a generic kernel that
   accumulates in BFloat16 (~30 % error at K = 1024). Use `CUBLAS.gemmEx!` (Float32

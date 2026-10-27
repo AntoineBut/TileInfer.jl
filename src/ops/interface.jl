@@ -36,11 +36,12 @@ function rmsnorm end
 function linear end
 
 """
-    rope(backend, x, cos, sin) -> same shape
+    rope(backend, x, cos, sin, positions) -> same shape
 
-Rotary embedding of `x` (head_dim, heads, tokens) with the `cos`/`sin` columns
-(head_dim, tokens) of the tokens' positions. Uses the "rotate half" pairing of Llama/Qwen:
-element i is paired with element i + head_dim/2.
+Rotary embedding of `x` (head_dim, heads, n) for tokens at the 0-based `positions` (a
+device vector of n `Int32`). `cos`/`sin` are the model's full tables (head_dim, max_len),
+whose column p + 1 is position p. Uses the "rotate half" pairing of Llama/Qwen: element i is
+paired with element i + head_dim/2.
 """
 function rope end
 
@@ -61,13 +62,49 @@ see [`slots`](@ref)): slot s is offset `(s - 1) % page_size` of page `(s - 1) ÷
 function store_kv! end
 
 """
-    attention(backend, q, k_pages, v_pages, block_table, start, scale) -> (head_dim, heads, n)
+    attention(backend, q, k_pages, v_pages, block_table, positions, scale) -> (head_dim, heads, n)
 
-Causal grouped-query attention of the queries `q` (head_dim, heads, n), at positions
-`start+1:start+n` of one sequence, over its first `start + n` cached positions. The
-sequence's keys and values are in the pages listed by `block_table` (a device vector).
+Causal grouped-query attention of the queries `q` (head_dim, heads, n) of one sequence, at
+the consecutive 0-based `positions` (a device vector of n `Int32`), over its first
+`positions[end] + 1` cached positions. The sequence's keys and values are in the pages
+listed by `block_table` (a device vector, which may be padded past the sequence's pages).
 """
 function attention end
+
+"""
+    embed!(backend, y, table, ids)
+    rmsnorm!(backend, y, x, w, eps)
+    linear!(backend, y, W, x)
+    rope!(backend, y, x, cos, sin, positions)
+    silu_mul!(backend, y, gate_up)
+    attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale)
+
+In-place forms of the ops, writing into the preallocated `y` (or `out`) and returning it.
+TileBackend writes directly and allocates nothing, so a step made of these calls can be
+captured in a CUDA graph. The fallbacks here run the allocating op and copy its result.
+`workspace` is the backend's scratch for `attention!`, from [`attention_workspace`](@ref).
+"""
+embed!(be::Backend, y, args...) = copyto!(y, embed(be, args...))
+rmsnorm!(be::Backend, y, args...) = copyto!(y, rmsnorm(be, args...))
+linear!(be::Backend, y, args...) = copyto!(y, linear(be, args...))
+rope!(be::Backend, y, args...) = copyto!(y, rope(be, args...))
+silu_mul!(be::Backend, y, args...) = copyto!(y, silu_mul(be, args...))
+attention!(be::Backend, out, workspace, args...) = copyto!(out, attention(be, args...))
+
+"""
+    attention_workspace(backend, q, k_pages)
+
+Scratch memory `attention!` needs for queries shaped like `q`, or `nothing`.
+"""
+attention_workspace(::Backend, q, k_pages) = nothing
+
+"""
+    supports_graphs(backend) -> Bool
+
+Whether a forward step on `backend` can be captured in a CUDA graph: its in-place ops
+neither allocate nor synchronize with the host.
+"""
+supports_graphs(::Backend) = false
 
 """
     has_kernel(backend, op) -> Bool

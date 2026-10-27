@@ -1,6 +1,7 @@
 # Benchmark suite: every op at the model's real shapes, at decode (1 token) and prefill
-# (512 tokens) sizes, and end-to-end prefill and decode steps, for every backend that
-# implements them. Used by bench/run.jl.
+# (512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
+# CUDA graph where the backend supports it), for every backend that implements them. Used
+# by bench/run.jl.
 #
 # Each benchmark also records the bytes it must move and the FLOPs it must do, so results
 # can be read against the GPU's roofline. Op samples run OP_REPS calls back to back and
@@ -100,7 +101,10 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
             add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (weight(), rnd(in, n));
                     bytes = (in * out + (in + out) * n) * B, flops = 2.0 * in * out * n)
         end
-        add_op!(suite, info, filter, ops("rope"), TileInfer.rope, () -> (rnd(D, nq, n), rnd(D, n), rnd(D, n));
+        # The model's own rope tables: a step reads n of their columns.
+        positions() = CuArray(Int32.(rand(0:length(model.rope)-1, n)))
+        add_op!(suite, info, filter, ops("rope"), TileInfer.rope,
+                () -> (rnd(D, nq, n), model.rope.cos, model.rope.sin, positions());
                 bytes = (2.0 * D * nq * n + 2.0 * D * n) * B)
         add_op!(suite, info, filter, ops("silu_mul"), TileInfer.silu_mul, () -> (rnd(2I, n),); bytes = 3.0 * I * n * B)
 
@@ -117,7 +121,7 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
         # Causal prefill visits about half of the (len × n) score matrix.
         visited = n == 1 ? len : n * (n + 1) / 2
         add_op!(suite, info, filter, ops("attention"), TileInfer.attention,
-                () -> (rnd(D, nq, n), pools()..., CuArray(Int32.(1:pages)), start, 1 / sqrt(D));
+                () -> (rnd(D, nq, n), pools()..., CuArray(Int32.(1:pages)), CuArray(Int32.(start:len-1)), 1 / sqrt(D));
                 bytes = kv_bytes(len) + 2.0 * D * nq * n * B, flops = 4.0 * D * nq * visited)
     end
 
@@ -126,7 +130,9 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
     for be in BACKENDS
         name = backend_name(be)
         prefill_key, decode_key = "model/prefill$PREFILL/$name", "model/decode_ctx$CONTEXT/$name"
-        occursin(filter, prefill_key) || occursin(filter, decode_key) || continue
+        graph_key = "model/decode_graph_ctx$CONTEXT/$name"           # through a ModelRunner
+        keys = TileInfer.supports_graphs(be) ? (prefill_key, decode_key, graph_key) : (prefill_key, decode_key)
+        any(k -> occursin(filter, k), keys) || continue
         m = DecoderLM(cfg, w, model.rope, be)
         cache = PagedKVCache(m; max_tokens = CONTEXT + PREFILL)
         prompt = rand(0:cfg.vocab_size-1, PREFILL)
@@ -149,17 +155,29 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
             info[prefill_key] = Workload(1, weights, 2 * params * PREFILL, PREFILL)
         end
 
+        # One new token after CONTEXT - 1 cached positions, rewound after each sample: eagerly
+        # (buffers allocated per step), and replaying a CUDA graph through a ModelRunner.
+        ctx = TileInfer.new_sequence(cache)
+        TileInfer.forward!(m, cache, ctx, rand(0:cfg.vocab_size-1, CONTEXT - 1))
+        kv = Float64(CONTEXT * TileInfer.bytes_per_token(cfg, T))
         if occursin(filter, decode_key)
-            # One new token after CONTEXT - 1 cached positions, rewound after each sample.
-            ctx = TileInfer.new_sequence(cache)
-            TileInfer.forward!(m, cache, ctx, rand(0:cfg.vocab_size-1, CONTEXT - 1))
             setleaf!(suite, split(decode_key, "/"), @benchmarkable begin
                 TileInfer.forward!($m, $cache, $ctx, [42])
                 CUDA.synchronize()
                 TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
             end evals = 1)
-            kv = Float64(CONTEXT * TileInfer.bytes_per_token(cfg, T))
             info[decode_key] = Workload(1, weights + kv, 2 * params, 1)
+        end
+        if graph_key in keys && occursin(filter, graph_key)
+            runner = TileInfer.ModelRunner(m, cache)
+            TileInfer.forward!(runner, ctx, [42])                     # captures the graph
+            TileInfer.truncate!(cache, ctx, CONTEXT - 1)
+            setleaf!(suite, split(graph_key, "/"), @benchmarkable begin
+                TileInfer.forward!($runner, $ctx, [42])
+                CUDA.synchronize()
+                TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+            end evals = 1)
+            info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
         end
     end
 

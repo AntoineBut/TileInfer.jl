@@ -18,18 +18,21 @@ end
 
 # cuBLAS GEMM with Float32 accumulation. Not `mul!`: for BFloat16, CUDA.jl's `mul!` falls
 # back to a generic kernel that accumulates in BFloat16 (~30 % error at K = 1024).
-function linear(::RefBackend, W::CuMatrix{T}, x::CuMatrix{T}, bias = nothing) where {T}
-    y = CuMatrix{T}(undef, size(W, 2), size(x, 2))
+linear!(::RefBackend, y::CuMatrix{T}, W::CuMatrix{T}, x::CuMatrix{T}) where {T} =
     CUBLAS.gemmEx!('T', 'N', true, W, x, false, y)
+
+function linear(be::RefBackend, W::CuMatrix{T}, x::CuMatrix{T}, bias = nothing) where {T}
+    y = linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
     bias === nothing || (y .+= bias)
     return y
 end
 
-function rope(::RefBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T}) where {T}
-    half = size(x, 1) ÷ 2
+function rope(::RefBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T},
+              positions::CuVector{Int32}) where {T}
+    half, n = size(x, 1) ÷ 2, size(x, 3)
     rotated = vcat(-x[half+1:end, :, :], x[1:half, :, :])
-    c = reshape(cos, size(cos, 1), 1, size(cos, 2))
-    s = reshape(sin, size(sin, 1), 1, size(sin, 2))
+    c = reshape(cos[:, positions .+ Int32(1)], size(cos, 1), 1, n)
+    s = reshape(sin[:, positions .+ Int32(1)], size(sin, 1), 1, n)
     return x .* c .+ rotated .* s       # each op rounds to T, as in PyTorch
 end
 
@@ -66,8 +69,9 @@ end
 # Eager attention, per KV head over its group of query heads at once:
 #   S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
 function attention(::RefBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
-                   block_table::CuVector{Int32}, start::Integer, scale::Real) where {T}
+                   block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real) where {T}
     D, heads, n = size(q)
+    start = Int(Array(view(positions, 1:1))[1])              # host sync: not graph-capturable
     kv_heads = size(k_pages, 3)
     group = heads ÷ kv_heads
     len = start + n

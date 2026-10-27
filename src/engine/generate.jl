@@ -1,33 +1,38 @@
-# Single-sequence generation loop on the reference path: prefill the new tokens in one
-# forward pass, then decode one token per step until a stop token or the token budget.
+# Single-sequence generation loop: prefill the new tokens in one forward pass, then decode
+# one token per step until a stop token or the token budget. Steps go through a
+# ModelRunner, so decode steps replay a CUDA graph on backends that support it.
 
 """
-    generate!(model, cache, seq, ids; max_new_tokens = 256, sampling = SamplingParams(),
+    generate!(runner, seq, ids; max_new_tokens = 256, sampling = SamplingParams(),
               stop_ids = model.config.eos_token_ids, rng = Random.default_rng(),
               on_token = nothing) -> Vector{Int}
+    generate!(model, cache, seq, ids; kwargs...)
 
 Continue `seq` with the 0-based token `ids` and generate up to `max_new_tokens` tokens.
 Returns the new token ids, without the stop token. `on_token(id)` is called after each
 new token, for streaming. Afterwards `seq` holds `ids` and every generated token except
 the last one, which was sampled but never run through the model.
 """
-function generate!(model::DecoderLM, cache::PagedKVCache, seq::Sequence, ids::AbstractVector{<:Integer};
+function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
                    max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
-                   stop_ids = model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
+                   stop_ids = r.model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
                    on_token = nothing)
     isempty(ids) && throw(ArgumentError("no tokens to process"))
     generated = Int[]
-    logits = forward!(model, cache, seq, ids)
+    logits = forward!(r, seq, ids)
     for _ in 1:max_new_tokens
-        id = sample(vec(logits), sampling, rng)
+        id = NVTX.@range "sample" sample(vec(logits), sampling, rng)
         id in stop_ids && break
         push!(generated, id)
         on_token === nothing || on_token(id)
         length(generated) == max_new_tokens && break
-        logits = forward!(model, cache, seq, [id])
+        logits = forward!(r, seq, [id])
     end
     return generated
 end
+
+generate!(model::DecoderLM, cache::PagedKVCache, seq::Sequence, ids::AbstractVector{<:Integer}; kwargs...) =
+    generate!(ModelRunner(model, cache), seq, ids; kwargs...)
 
 """
     generate(model, prompt_ids; kwargs...) -> Vector{Int}

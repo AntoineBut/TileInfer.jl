@@ -29,9 +29,10 @@ using Random: randperm
 
         @testset "rope $dims" for dims in ((128, 16, 1), (128, 8, 7), (64, 24, 3))
             D, _, n = dims
-            x, θ = rnd(dims...), rand(Float32, D ÷ 2, n) .* 100
+            x, θ = rnd(dims...), rand(Float32, D ÷ 2, 50) .* 100
             c, s = CuArray(T.(vcat(cos.(θ), cos.(θ)))), CuArray(T.(vcat(sin.(θ), sin.(θ))))
-            @test host(TileInfer.rope(tile, x, c, s)) == host(TileInfer.rope(ref, x, c, s))
+            positions = CuArray(Int32.(rand(0:49, n)))
+            @test host(TileInfer.rope(tile, x, c, s, positions)) == host(TileInfer.rope(ref, x, c, s, positions))
         end
 
         @testset "silu_mul $dims" for dims in ((6144, 1), (6144, 5), (19456, 2), (200, 3))
@@ -82,15 +83,17 @@ using Random: randperm
             D, H, KVH, P, start, n = case
             len = start + n
             pages = cld(len, P) + 2
-            table = CuArray(Int32.(randperm(pages)[1:cld(len, P)]))   # fragmented, out of order
+            # Fragmented, out of order, and zero-padded to 16 entries as forward! does.
+            table = CuArray([Int32.(randperm(pages)[1:cld(len, P)]); zeros(Int32, 16 - cld(len, P))])
+            positions = CuArray(Int32.(start:start+n-1))
             q, k_pages, v_pages = rnd(D, H, n), rnd(D, P, KVH, pages), rnd(D, P, KVH, pages)
-            y = TileInfer.attention(tile, q, k_pages, v_pages, table, start, 1 / sqrt(D))
+            y = TileInfer.attention(tile, q, k_pages, v_pages, table, positions, 1 / sqrt(D))
             @test size(y) == size(q)
             # Exact attention of the same inputs. The reference rounds scores and
             # probabilities to T as PyTorch's eager attention does (up to ~12 BFloat16 ulps
             # from exact); the flash kernels keep them in Float32 until the PV product.
             f32(x) = CuArray(host(x))
-            exact = TileInfer.attention(ref, f32(q), f32(k_pages), f32(v_pages), table, start, 1 / sqrt(D))
+            exact = TileInfer.attention(ref, f32(q), f32(k_pages), f32(v_pages), table, positions, 1 / sqrt(D))
             if T == BFloat16
                 @test ulps(exact, y, T) <= 5      # ≤ 3.5 over 30 seeds at n = 512
             else

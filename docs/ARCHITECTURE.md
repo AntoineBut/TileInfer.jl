@@ -305,19 +305,33 @@ The engine's `step()` becomes: `propose → verify → accept → rollback → e
 
 ## 9. ModelRunner & CUDA graphs
 
-- `InputMetadata`: positions, slot_mapping, block_tables, seq_lens,
-  query_start_loc (varlen), logits indices. They live in static device buffers sized
-  for the maximum and are filled by `copyto!` from pinned host buffers.
-- **Eager prefill**, **graph-captured decode/verify**. Graphs are keyed by
-  `(num_seqs, tokens_per_seq)` buckets, as in DeepInfer's
-  `build_graph_batch_sizes`. Use CUDA.jl's `capture` / `@captured` /
-  `instantiate`.
-- Graphs matter a lot in Julia. Each `@cuda` launch has host-side overhead
-  (argument conversion, cache lookup), and a Qwen3 layer is about 10 kernels, so 28
-  layers is about 300 launches per token. At around 5 µs each that is about 1.5 ms per token, a
-  significant share of a 0.6B model's roughly 2 ms budget.
-- Spike early: confirm that cuTile launches (`cudacall` underneath) are
-  capture-safe and that no host sync or allocation happens inside the step.
+Implemented in M6 (`src/model/decoder.jl`, `src/engine/runner.jl`):
+
+- **One forward pass, written in place.** `run_step!` runs a step entirely on the device,
+  writing only into a `StepBuffers` (every activation, the logits) and the KV cache. Every
+  op has an in-place form (`rmsnorm!`, `linear!`, …); TileBackend's allocate nothing, and
+  RefBackend falls back to "compute, then copy", so both backends share the same layer
+  loop. `forward!(model, cache, seq, ids)` is that step with buffers allocated for it.
+- **Inputs on the device.** The step's metadata (the vLLM `InputMetadata` for one
+  sequence): token ids, 0-based positions, cache slots, and the block table zero-padded to
+  the pool's page count (a multiple of 16, so its length never changes). `prepare_step!`
+  reserves pages and uploads them with `copyto!` before the step (synchronous pageable
+  copies for now; pinned async copies later). Kernels read `start` and positions from
+  these buffers, never as scalar launch arguments, which a graph would freeze.
+- **`ModelRunner(model, cache)`.** Steps of up to 8 tokens (decode, spec verify) keep a
+  `StepBuffers` per token count. The first step of a count runs eagerly (that compiles its
+  kernels), then is captured with `CUDA.capture`/`instantiate`; later steps upload their
+  inputs and `CUDA.launch` the graph. Longer steps (prefill) run eagerly. Graphs are
+  keyed by tokens per step only, as there is one sequence; with several sequences the key
+  becomes `(num_seqs, tokens_per_seq)` buckets, as in DeepInfer's `build_graph_batch_sizes`.
+  The graph holds the addresses of weights, pools and buffers, so it is valid for the
+  runner's lifetime. `generate!` and `ChatSession` (graphs persist across turns) use it.
+- **Correctness:** a replayed step's logits are bit-identical to an eager step's, and a
+  decode step allocates no GPU memory (`test/engine/runner.jl`).
+- Graphs remove the host cost of the ~540 launches of a decode step (≈ 5 µs each), but not
+  their GPU-side cost: tiny kernels still take 2–3 µs each, so fusion (M8+) is what
+  reduces the step further. Replaying the graph itself costs ~0.34 ms of host time, which
+  overlaps with the GPU.
 
 ---
 
@@ -384,9 +398,9 @@ Versions are as of 2026-10-26, checked against the repos.
 | M3 ✅ | Paged KV + BlockManager; `chat` with multi-turn | done 2026-10-26: paged reference path matches the HF Float32 fixtures (also with 4-position, fragmented pages); `tileinfer chat` reuses the cached common prefix across turns, and a reply with reuse equals a fresh run on the full prompt; decode ~20 tok/s (the reference attention gathers every page of the sequence at each step) |
 | M4 ✅ | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | done 2026-10-27 (`src/ops/tile/`): element-wise kernels bit-identical to the reference, linear ≤ 1 BF16 ulp; whole model on TileBackend matches the HF Float32 fixtures (identical greedy continuations). Decode GEMV 68–93 % of the DRAM roofline (1.0–1.3× cuBLAS); prefill GEMM 0.70–0.92× cuBLAS; rope/rmsnorm/store_kv/embed 3–29× the reference. End to end: prefill 1.47×, decode only 1.13× — the reference attention fallback (≈1 ms/layer, ~6k GPU allocations per token, GC spikes) dominates until M5; tiny decode kernels sit at the ~5.5 µs launch floor until CUDA graphs (M6) |
 | M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
-| M6 | CUDA graphs for decode; NVTX timeline | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B |
+| M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
 | M7 | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report |
-| M8+ | prefix caching, fused epilogues, async scheduling, INT8/weight-only quant, multi-sequence | — |
+| M8+ | Performance: fewer, fused kernels (q/k/v slice copies, q/k norm + rope, residual add + RMSNorm, Float32 logits from the lm_head, attention combine), pinned async uploads; then prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6) |
 
 ## 14. Open questions / spikes
 

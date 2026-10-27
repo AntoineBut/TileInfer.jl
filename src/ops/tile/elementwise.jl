@@ -3,18 +3,20 @@
 
 # Rotary embedding, one block per token over all heads. The two halves of head_dim are
 # loaded as separate tiles (tile index 1 and 2 along the first axis), which is exactly the
-# "rotate half" pairing: out1 = x1 cos1 - x2 sin1, out2 = x2 cos2 + x1 sin2.
+# "rotate half" pairing: out1 = x1 cos1 - x2 sin1, out2 = x2 cos2 + x1 sin2. The cos/sin
+# columns are looked up from the token's position, so positions can live on the device.
 function rope_kernel(Y::ct.TileArray{T,3}, X::ct.TileArray{T,3}, C::ct.TileArray{T,2},
-                     S::ct.TileArray{T,2}, HALF::Int, HEADS::Int) where {T}
+                     S::ct.TileArray{T,2}, Pos::ct.TileArray{Int32,1}, HALF::Int, HEADS::Int) where {T}
     t = ct.bid(1)
+    p = Pos[t] + Int32(1)                                 # table column of the position
     f32(tile) = convert(ct.Tile{Float32}, tile)
     rnd(tile) = f32(convert(ct.Tile{T}, tile))           # round to T, keep computing in Float32
     x1 = f32(ct.load(X; index = (Int32(1), Int32(1), t), shape = (HALF, HEADS, 1)))
     x2 = f32(ct.load(X; index = (Int32(2), Int32(1), t), shape = (HALF, HEADS, 1)))
-    c1 = reshape(f32(ct.load(C; index = (Int32(1), t), shape = (HALF, 1))), (HALF, 1, 1))
-    c2 = reshape(f32(ct.load(C; index = (Int32(2), t), shape = (HALF, 1))), (HALF, 1, 1))
-    s1 = reshape(f32(ct.load(S; index = (Int32(1), t), shape = (HALF, 1))), (HALF, 1, 1))
-    s2 = reshape(f32(ct.load(S; index = (Int32(2), t), shape = (HALF, 1))), (HALF, 1, 1))
+    c1 = reshape(f32(ct.load(C; index = (Int32(1), p), shape = (HALF, 1))), (HALF, 1, 1))
+    c2 = reshape(f32(ct.load(C; index = (Int32(2), p), shape = (HALF, 1))), (HALF, 1, 1))
+    s1 = reshape(f32(ct.load(S; index = (Int32(1), p), shape = (HALF, 1))), (HALF, 1, 1))
+    s2 = reshape(f32(ct.load(S; index = (Int32(2), p), shape = (HALF, 1))), (HALF, 1, 1))
     y1 = rnd(x1 .* c1) .+ rnd(.-x2 .* s1)
     y2 = rnd(x2 .* c2) .+ rnd(x1 .* s2)
     ct.store(Y; index = (Int32(1), Int32(1), t), tile = convert(ct.Tile{T}, y1))
@@ -22,16 +24,17 @@ function rope_kernel(Y::ct.TileArray{T,3}, X::ct.TileArray{T,3}, C::ct.TileArray
     return nothing
 end
 
-function rope!(::TileBackend, y::CuArray{T,3}, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T}) where {T}
+function rope!(::TileBackend, y::CuArray{T,3}, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T},
+               positions::CuVector{Int32}) where {T}
     D, heads, n = size(x)
     # Heads are padded to a power of two: loads pad, stores clip.
-    @cuda backend = cuTile blocks = n rope_kernel(y, x, cos, sin, ct.Constant(D ÷ 2),
+    @cuda backend = cuTile blocks = n rope_kernel(y, x, cos, sin, positions, ct.Constant(D ÷ 2),
                                                   ct.Constant(nextpow(2, heads)))
     return y
 end
 
-rope(be::TileBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T}) where {T} =
-    rope!(be, similar(x), x, cos, sin)
+rope(be::TileBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T}, positions::CuVector{Int32}) where {T} =
+    rope!(be, similar(x), x, cos, sin, positions)
 
 # SwiGLU: out = silu(gate) * up, with gate and up as separate (strided) views of the
 # stacked gate_up activations. Grid: (tiles along intermediate, tokens).
@@ -96,10 +99,12 @@ function embed_kernel(Y::ct.TileArray{T,2}, Table::ct.TileArray{T,2}, Ids::ct.Ti
     return nothing
 end
 
-function embed(::TileBackend, table::CuMatrix{T}, ids::CuVector{Int32}) where {T}
+function embed!(::TileBackend, y::CuMatrix{T}, table::CuMatrix{T}, ids::CuVector{Int32}) where {T}
     H = size(table, 1)
-    y = CuMatrix{T}(undef, H, length(ids))
     @cuda backend = cuTile blocks = length(ids) embed_kernel(y, table, ids,
                                                              ct.Constant(min(nextpow(2, H), ELEMENTWISE_TILE)))
     return y
 end
+
+embed(be::TileBackend, table::CuMatrix{T}, ids::CuVector{Int32}) where {T} =
+    embed!(be, CuMatrix{T}(undef, size(table, 1), length(ids)), table, ids)

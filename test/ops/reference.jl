@@ -26,15 +26,17 @@ using LinearAlgebra: dot
     end
 
     @testset "rope" begin
-        D, H, n = 8, 2, 3
-        x = randn(Float32, D, H, n); θ = rand(Float32, D ÷ 2, n)
+        D, H, L = 8, 2, 10
+        positions = [7, 2, 9]                       # 0-based, looked up in tables of L positions
+        n = length(positions)
+        x = randn(Float32, D, H, n); θ = rand(Float32, D ÷ 2, L)
         c, s = vcat(cos.(θ), cos.(θ)), vcat(sin.(θ), sin.(θ))
-        y = Array(TileInfer.rope(be, CuArray(x), CuArray(c), CuArray(s)))
+        y = Array(TileInfer.rope(be, CuArray(x), CuArray(c), CuArray(s), CuArray(Int32.(positions))))
         for h in 1:H, t in 1:n, i in 1:D÷2
-            # Element i rotates together with element i + D/2 by angle θ[i, t].
-            a, b = x[i, h, t], x[i+D÷2, h, t]
-            @test y[i, h, t] ≈ a * cos(θ[i, t]) - b * sin(θ[i, t])
-            @test y[i+D÷2, h, t] ≈ b * cos(θ[i, t]) + a * sin(θ[i, t])
+            # Element i rotates together with element i + D/2 by angle θ[i, position + 1].
+            a, b, φ = x[i, h, t], x[i+D÷2, h, t], θ[i, positions[t]+1]
+            @test y[i, h, t] ≈ a * cos(φ) - b * sin(φ)
+            @test y[i+D÷2, h, t] ≈ b * cos(φ) + a * sin(φ)
         end
     end
 
@@ -73,7 +75,9 @@ using LinearAlgebra: dot
         table = Int32[3, 1, 6][1:cld(len, P)]
         k_pool, v_pool = paged(kc, table, P, 6), paged(vc, table, P, 6)
         scale = 1 / sqrt(D)
-        o = Array(TileInfer.attention(be, CuArray(q), k_pool, v_pool, CuArray(table), start, scale))
+        positions = CuArray(Int32.(start:start+n-1))
+        padded = CuArray([table; zeros(Int32, 5)])  # entries past the sequence's pages are ignored
+        o = Array(TileInfer.attention(be, CuArray(q), k_pool, v_pool, padded, positions, scale))
         for h in 1:H, t in 1:n
             g = cld(h, H ÷ KVH)                        # query heads share KV heads in blocks
             keys = 1:start+t                           # causal: up to the query's own position
