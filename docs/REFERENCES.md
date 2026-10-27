@@ -106,3 +106,13 @@ Model building blocks
 
 - GPU support matrix: https://developer.nvidia.com/cuda/gpus
 - RTX 4080 SUPER: Ada AD103, sm_89, 80 SMs, 16 GB GDDR6X, ~736 GB/s. Bandwidth sets the decode roofline.
+
+## Profiling
+
+Workflow and scripts: [PROFILING.md](PROFILING.md).
+
+- Nsight Compute docs (UI, metrics, rules, source view): https://docs.nvidia.com/nsight-compute/NsightCompute/index.html
+- `ncu` command line options: https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html
+- Kernel profiling guide (metric names, warp stall reasons, roofline): https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html
+- Python report interface (`ncu_report`, used by `bench/ncu_summary.py`): https://docs.nvidia.com/nsight-compute/PythonReportInterface/index.html.
+  The module itself is in `/usr/local/NVIDIA-Nsight-Compute/extras/python/`.

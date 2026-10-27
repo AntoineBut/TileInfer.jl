@@ -14,7 +14,15 @@ julia --project=test test/runtests.jl                 # full suite, ~90 s (cuTil
 julia --project=test test/runtests.jl kernels graphs  # only files whose path contains an arg, ~10 s
 julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
 julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME]  # op + model benchmarks
+ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
+    julia --project=bench bench/profile.jl ops/linear_down/decode/tile          # one kernel under Nsight Compute
+python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
 ```
+
+Profiling workflow, model-step costs and how to read the summary: [docs/PROFILING.md](docs/PROFILING.md).
+To tune a kernel, profile it before and after a change and read `ncu_summary.py --compare`
+rather than raw `ncu` output (`ncu` is in /usr/local/NVIDIA-Nsight-Compute). Take timings
+from bench/run.jl: `ncu` serializes kernels and locks clocks.
 
 Benchmarks (bench/suite.jl): every op at Qwen3-0.6B shapes for decode (n = 1) and prefill
 (n = 512), plus end-to-end prefill and decode steps, for each backend that has a method
