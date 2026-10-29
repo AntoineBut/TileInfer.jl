@@ -19,6 +19,7 @@ julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [-
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
+julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~6 min
 ```
 
 Profiling workflow, model-step costs and how to read the summary: [docs/PROFILING.md](docs/PROFILING.md).
@@ -113,10 +114,15 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
   only CUDA graphs help.
 - The GPU also drives the desktop (compositor, browsers, …) and idles at 210 MHz: time
   kernels as the minimum over many short trials after a warm-up, never as one averaged loop.
-- Tile shapes and code layout change codegen a lot, so measure every restructuring:
-  identical logic moved into an `@inline` helper ran 1.7× slower, a 3-D tile reduced over
-  its third axis 60× slower, and dropping a trivial size-1 axis 5× slower. Small tile
-  dimensions (8 columns) also compile to slow code: pad them to 16.
+- Tile shapes change codegen a lot; code layout (helpers, closures, 3-D vs 2-D reductions,
+  size-1 axes) measured no difference. Measured rules, with reproducers, in
+  [docs/CUTILE_QUIRKS.md](docs/CUTILE_QUIRKS.md): keep the M side of a `muladd` ≥ 16 and
+  the N side ≥ 8 (in Julia's terms the second operand's columns and the first operand's
+  rows; narrower is up to 8× slower and spills); each block-wide reduction costs ~0.15 µs
+  whatever the tile, so reductions in a loop add up; blocks are always 128 threads.
+- Scalar shifts need a count of the operand's type (`x >> UInt32(16)` for a `UInt32`).
+- To check whether a rewrite changes codegen, add a probe to `bench/quirks/probes/`: it
+  compares time, registers, spills, Tile IR and SASS of equivalent kernels.
 
 ## Dependency notes
 
