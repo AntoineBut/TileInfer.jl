@@ -50,11 +50,11 @@ if test_model_dir() !== nothing
             return out, copy(s.tokens), copy(s.block_table)
         end
         function speculative(max_new_tokens, stop_ids; sampling = TileInfer.SamplingParams(), seed = 1, k = 4,
-                             stats = TileInfer.SpecStats())
+                             stats = TileInfer.SpecStats(), proposer = TileInfer.NgramProposer(; k))
             c = new_cache()
             s = TileInfer.new_sequence(c)
             out = TileInfer.generate!(TileInfer.ModelRunner(m, c), s, prompt; max_new_tokens, stop_ids, sampling,
-                                      rng = Xoshiro(seed), speculative = TileInfer.NgramProposer(; k), spec_stats = stats)
+                                      rng = Xoshiro(seed), speculative = proposer, spec_stats = stats)
             return out, copy(s.tokens), copy(s.block_table)
         end
 
@@ -95,6 +95,38 @@ if test_model_dir() !== nothing
                 @test speculative(30, [stop]; sampling = sampled) == plain(30, [stop]; sampling = sampled)
             end
             @test all(speculative(n, Int[]; sampling = sampled) == plain(n, Int[]; sampling = sampled) for n in 1:12)
+        end
+
+        @testset "draft-model proposer" begin
+            # The target drafts for itself on a cache of its own: nearly every draft is accepted.
+            continuation(ctx, n) = (c = new_cache();
+                                    TileInfer.generate!(TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c), ctx;
+                                                        max_new_tokens = n, stop_ids = Int[], pipeline = false))
+            p = TileInfer.DraftProposer(m; k = 4, max_tokens = 512)
+            first4 = continuation(prompt, 4)
+            @test TileInfer.propose(p, prompt, 4) == first4                # the draft's greedy continuation
+            @test TileInfer.propose(p, prompt, 2) == first4[1:2]           # rewound to the prompt
+            # A rejection after two drafts: the draft rewinds to the common prefix and runs the
+            # target's token. Then all four accepted: it runs the last draft and the bonus token.
+            ctx = [prompt; first4[1:2]; 77]
+            @test TileInfer.propose(p, ctx, 4) == continuation(ctx, 4)
+            ctx = [ctx; continuation(ctx, 5)]
+            @test TileInfer.propose(p, ctx, 3) == continuation(ctx, 3)
+            @test length(p.seq) == length(ctx) + 2                          # the last draft is never run
+
+            @testset "$(p.temperature == 0 ? "greedy" : "sampled"), k = $k" for p in (TileInfer.SamplingParams(), sampled),
+                    k in (1, 4, 7)
+                stats = TileInfer.SpecStats()
+                proposer = TileInfer.DraftProposer(m; k, max_tokens = 512)
+                @test speculative(60, Int[]; sampling = p, proposer, stats) == plain(60, Int[]; sampling = p)
+                @test TileInfer.acceptance_rate(stats) > (p.temperature == 0 ? 0.95 : 0.5)
+            end
+            proposer = TileInfer.DraftProposer(m; k = 4, max_tokens = 512)
+            full, = plain(30, Int[])
+            for stop in (full[3], full[17])
+                @test speculative(30, [stop]; proposer) == plain(30, [stop])
+            end
+            @test all(speculative(n, Int[]; proposer) == plain(n, Int[]) for n in 1:10)   # one proposer, rewound each time
         end
 
         @testset "sampling the device cannot do is rejected" begin

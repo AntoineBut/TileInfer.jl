@@ -46,5 +46,15 @@ end
         @test code == 0
         @test occursin("Paris", out)
         @test occursin("4 generated", err)
+        # Speculative decoding, by n-gram lookup and with the model drafting for itself.
+        for spec in (("--speculate", "3"), ("--draft", TEST_MODEL))
+            code, out, err = run_cli("run", TEST_MODEL, "The capital of France is", "--raw",
+                                     "--temperature", "0", "--max-tokens", "12", "--max-context", "256", spec...)
+            @test code == 0
+            @test occursin("Paris", out)
+            @test occursin("tokens per step", err)
+        end
+        code, _, err = run_cli("run", TEST_MODEL, "hi", "--speculate", "8")
+        @test code == 1 && occursin("--speculate expects 1 to 7", err)
     end
 end

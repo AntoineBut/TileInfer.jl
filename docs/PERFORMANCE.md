@@ -427,3 +427,30 @@ top-k 20, top-p 0.95), against pipelined sampled decoding:
 | | 4B | 80 tok/s | 1.04× | 1.05× | 1.04× | 1.04× | 1.08 (0.03) |
 
 The rename task is nearly deterministic at temperature 0.6 (the same steps as greedy).
+
+## Draft-model speculative decoding (2026-10-29)
+
+`DraftProposer(draft_model; k)`: Qwen3-0.6B drafts for Qwen3-4B on a cache of its own. Each
+proposal rewinds the draft to the longest common prefix with the context, runs the one or
+two new tokens through a captured step, then decodes k - 1 steps as a chain of CUDA graphs
+(each samples the next draft on the device into the next step's ids); the host syncs once
+per proposal. The draft decodes greedily even when the target samples, which keeps the
+verification exact (the draft is a function of the context). `bench/speculative.jl`, 4B
+target, 256 tokens, decode tok/s (from the first new token), best of 3:
+
+| Prompt | plain | n-gram k = 2 / 4 / 7 | draft k = 2 / 4 / 7 | draft acceptance at k = 4, tokens per step |
+|---|---|---|---|---|
+| rename two variables (greedy) | 72 tok/s | 2.29× / 3.18× / **4.22×** | 2.28× / 2.89× / 3.62× | 0.96, 4.78 |
+| add a docstring and comments | 79 | 1.37× / 1.46× / 1.53× | 1.64× / **1.78×** / 1.65× | 0.56, 3.24 |
+| explain hash-map collisions | 79 | 1.09× / 1.09× / 1.11× | 1.59× / **1.63×** / 1.46× | 0.49, 2.94 |
+| short story | 79 | 1.04× / 1.03× / 1.03× | **1.39×** / 1.35× / 1.09× | 0.36, 2.44 |
+| *sampled (0.6, top-k 20, top-p 0.95):* rename | 78 | 2.09× / 2.92× / **3.87×** | 2.09× / 2.65× / 3.33× | 0.96, 4.78 |
+| add a docstring and comments | 79 | 1.38× / 1.45× / 1.54× | 1.71× / **1.91×** / 1.79× | 0.62, 3.46 |
+| explain hash-map collisions | 79 | 1.08× / 1.08× / 1.10× | **1.47×** / 1.39× / 1.13× | 0.38, 2.53 |
+| short story | 79 | 1.02× / 1.02× / 1.02× | **1.42×** / 1.37× / 1.18× | 0.37, 2.49 |
+
+A draft step of the 0.6B model costs about a fifth of a 4B decode step, so each draft
+token must be accepted with a probability of roughly 0.2 or more to pay; at k = 7 the late
+drafts on open text rarely are. n-gram lookup is free but only finds text the reply copies.
+Candidates: pick k (or the proposer) from the measured acceptance, as DeepInfer's scheduler
+does; combine both proposers (n-gram when it matches, the draft otherwise).

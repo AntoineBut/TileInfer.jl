@@ -6,10 +6,11 @@
 
 """
     ChatSession(model, tokenizer; sampling, stop_ids, enable_thinking = true,
-                max_tokens = max_length(model), rng = Random.default_rng())
+                max_tokens = max_length(model), rng = Random.default_rng(), speculative = nothing)
 
 A conversation with `model`, with its own paged KV cache for up to `max_tokens` positions.
-Send messages with [`reply!`](@ref).
+Send messages with [`reply!`](@ref). `speculative` is a proposer for speculative decoding
+(see [`generate!`](@ref)).
 """
 mutable struct ChatSession{M<:DecoderLM,C<:PagedKVCache,R<:ModelRunner}
     model::M
@@ -22,14 +23,16 @@ mutable struct ChatSession{M<:DecoderLM,C<:PagedKVCache,R<:ModelRunner}
     stop_ids::Vector{Int}
     enable_thinking::Bool
     rng::AbstractRNG
+    speculative::Any                 # a proposer or nothing
 end
 
 function ChatSession(model::DecoderLM, tok::BPETokenizer; sampling::SamplingParams = SamplingParams(),
                      stop_ids = model.config.eos_token_ids, enable_thinking::Bool = true,
-                     max_tokens::Integer = max_length(model), rng::AbstractRNG = Random.default_rng())
+                     max_tokens::Integer = max_length(model), rng::AbstractRNG = Random.default_rng(),
+                     speculative = nothing)
     cache = PagedKVCache(model; max_tokens = min(max_tokens, max_length(model)))
     return ChatSession(model, tok, cache, ModelRunner(model, cache), new_sequence(cache), ChatMessage[],
-                       sampling, collect(Int, stop_ids), enable_thinking, rng)
+                       sampling, collect(Int, stop_ids), enable_thinking, rng, speculative)
 end
 
 "Statistics of one chat turn: prompt tokens reused from the cache and newly prefilled."
@@ -37,6 +40,7 @@ struct TurnStats
     reused::Int
     prefilled::Int
     generated::Int
+    spec::SpecStats                  # speculative steps and drafts (all zero without)
 end
 
 "Clear the conversation and free its cache pages."
@@ -63,9 +67,11 @@ function reply!(s::ChatSession, text::AbstractString; max_new_tokens::Integer = 
     # Reuse the cached prefix, but always run at least one token to get logits.
     reused = min(common_prefix(s.seq.tokens, prompt), length(prompt) - 1)
     truncate!(s.cache, s.seq, reused)
+    spec = SpecStats()
     generated = generate!(s.runner, s.seq, prompt[reused+1:end]; max_new_tokens,
-                          sampling = s.sampling, stop_ids = s.stop_ids, rng = s.rng, on_token)
+                          sampling = s.sampling, stop_ids = s.stop_ids, rng = s.rng, on_token,
+                          s.speculative, spec_stats = spec)
     reply = decode(s.tokenizer, generated)
     append!(s.messages, (ChatMessage("user", text), ChatMessage("assistant", reply)))
-    return reply, TurnStats(reused, length(prompt) - reused, length(generated))
+    return reply, TurnStats(reused, length(prompt) - reused, length(generated), spec)
 end

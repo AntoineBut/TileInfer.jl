@@ -188,3 +188,87 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
     end
     return generated
 end
+
+# --- Draft-model proposer ---
+#
+# A small model with the same vocabulary (Qwen3-0.6B for Qwen3-4B) runs ahead of the target
+# on a cache of its own. Its sequence follows the generation's context lazily: each proposal
+# first drops what the target rejected (the longest common prefix with the context is kept)
+# and runs the one or two new tokens, then decodes k - 1 more steps. Those steps form a chain
+# of CUDA graphs: step i reads draft i from its buffers and samples draft i + 1 straight into
+# the ids of step i + 1 and into host-mapped memory, so the host enqueues the whole chain
+# and synchronizes once.
+#
+# The draft decodes greedily, even when the target samples: a greedy draft is a function of
+# the context, so the verification above stays exact. (The general rule, where the draft
+# samples from its q and drafts are accepted with probability min(1, p/q), needs q at every
+# position and accepts more often at high temperatures.)
+
+"""
+    DraftProposer(draft_model; k = 4, max_tokens = max_length(draft_model),
+                  graphs = supports_graphs(draft_model.backend))
+
+Proposes the next `k` tokens that `draft_model` decodes greedily, on a KV cache of its own
+for up to `max_tokens` positions. The draft model must share the target's vocabulary.
+"""
+mutable struct DraftProposer{R<:ModelRunner,T}
+    const k::Int
+    const runner::R
+    const seq::Sequence
+    const buffers::Vector{StepBuffers{T}}        # step i runs draft i, for i in 1:k-1
+    const graphs::Vector{Union{Nothing,CUDA.CuGraphExec}}
+    const sink::CuVector{Int32}                  # ids written by the last step of the chain
+    const mirror::CuVector{Int32}                # host-mapped: the drafts
+    const mirror_host::Vector{Int32}
+end
+
+function DraftProposer(m::DecoderLM{T}; k::Integer = 4, max_tokens::Integer = max_length(m),
+                       graphs::Bool = supports_graphs(m.backend)) where {T}
+    1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("k must be in 1:$(MAX_GRAPH_TOKENS - 1)"))
+    cache = PagedKVCache(m; max_tokens = min(max_tokens, max_length(m)))
+    r = ModelRunner(m, cache; graphs)
+    mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, k)
+    return DraftProposer{typeof(r),T}(k, r, new_sequence(cache), [StepBuffers(m, cache, 1) for _ in 1:k-1],
+                                      fill!(Vector{Union{Nothing,CUDA.CuGraphExec}}(undef, k - 1), nothing),
+                                      CuVector{Int32}(undef, 1), mirror, unsafe_wrap(Array, mirror))
+end
+
+# Where the sample of chain step i (or of the forward step before the chain, i = 0) goes.
+next_ids(p::DraftProposer, i) = i < p.k - 1 ? p.buffers[i+1].ids : p.sink
+sample_draft!(p::DraftProposer, i, logits) =
+    sample_token!(p.runner.model.backend, next_ids(p, i), view(p.mirror, i+1:i+1), logits, p.runner.sampler)
+
+function run_draft_step!(p::DraftProposer, i)
+    r, b = p.runner, p.buffers[i]
+    step() = (run_step!(r.model, r.cache, b); sample_draft!(p, i, b.logits))
+    if !r.graphs
+        step()
+    elseif p.graphs[i] === nothing
+        NVTX.@range "eager draft step" step()
+        p.graphs[i] = NVTX.@range "capture draft step" CUDA.instantiate(CUDA.capture(step))
+    else
+        NVTX.@range "replay draft step" CUDA.launch(p.graphs[i])
+    end
+end
+
+function propose(p::DraftProposer, context::AbstractVector{<:Integer}, k::Integer)
+    k = min(k, p.k)
+    k >= 1 || return Int[]
+    r, seq = p.runner, p.seq
+    # Keep what the draft shares with the context, but run at least one token for logits.
+    keep = min(common_prefix(seq.tokens, context), length(context) - 1)
+    truncate!(r.cache, seq, keep)
+    logits = forward!(r, seq, view(context, keep+1:length(context)))
+    NVTX.@range "draft" begin
+        sample_draft!(p, 0, logits)
+        for i in 1:k-1
+            prepare_step!(p.buffers[i], r.model, r.cache, seq, nothing)
+            push!(seq.tokens, -1)                # draft i, read below
+            run_draft_step!(p, i)
+        end
+        synchronize()
+    end
+    drafts = Int.(p.mirror_host[1:k])
+    seq.tokens[end-k+2:end] .= drafts[1:k-1]
+    return drafts
+end

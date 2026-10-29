@@ -20,6 +20,9 @@ const USAGE = """
       --thinking on|off     Qwen3 reasoning mode (default on)
       --backend tile|ref    cuTile kernels (default) or the reference ops
       --raw                 run only: send the prompt as-is, without the chat template
+      --speculate K         speculative decoding with up to K drafts per step (1-7), by
+                            n-gram lookup in the conversation, or by --draft
+      --draft <model>       a smaller model with the same vocabulary drafts (K = 4 by default)
     """
 
 # Splits `args` into positionals and `--name value` options; names in `flags` take no
@@ -89,7 +92,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend")
+                            "backend", "speculate", "draft")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -106,7 +109,21 @@ function load_for_generation(model_name, options)
                               top_k = parse_option(Int, options, "top-k", defaults.top_k),
                               top_p = parse_option(Float64, options, "top-p", defaults.top_p))
     rng = Random.Xoshiro(parse_option(Int, options, "seed", rand(UInt32)))
-    return (; model, tok, sampling, stop_ids, rng, enable_thinking = thinking == "on")
+    return (; model, tok, sampling, stop_ids, rng, enable_thinking = thinking == "on",
+            speculative = load_proposer(model, options))
+end
+
+# The proposer of --speculate / --draft, or nothing.
+function load_proposer(model::DecoderLM, options)
+    haskey(options, "speculate") || haskey(options, "draft") || return nothing
+    k = parse_option(Int, options, "speculate", 4)
+    1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("--speculate expects 1 to $(MAX_GRAPH_TOKENS - 1) drafts, got $k"))
+    haskey(options, "draft") || return NgramProposer(; k)
+    draft = load_model(model_dir(options["draft"]); T = eltype(model), backend = model.backend,
+                       max_len = max_length(model))
+    draft.config.vocab_size == model.config.vocab_size ||
+        throw(ArgumentError("the draft model's vocabulary ($(draft.config.vocab_size)) differs from the model's ($(model.config.vocab_size))"))
+    return DraftProposer(draft; k)
 end
 
 # Streams tokens to `io` and records when the first two arrived.
@@ -139,6 +156,10 @@ function timing_summary(t::TimedStream, generated::Integer)
     return string("first token after ", round(ttft; digits = 2), " s, then ", round(rate; digits = 1), " tok/s")
 end
 
+spec_summary(s::SpecStats, generated::Integer) = s.steps == 0 ? "" :
+    string("; ", round(generated / s.steps; digits = 2), " tokens per step, ",
+           round(100 * acceptance_rate(s); digits = 1), " % of drafts accepted")
+
 function cmd_run(positional, options)
     check_options(options, (GENERATION_OPTIONS..., "raw"))
     length(positional) == 2 || throw(ArgumentError("run takes a model and a prompt"))
@@ -149,11 +170,12 @@ function cmd_run(positional, options)
                     enable_thinking = g.enable_thinking)
     ids = encode(g.tok, text)
     stream = TimedStream(g.tok, stdout)
+    spec = SpecStats()
     generated = generate(g.model, ids; max_new_tokens = parse_option(Int, options, "max-tokens", 512),
-                         g.sampling, g.stop_ids, g.rng, on_token = stream)
+                         g.sampling, g.stop_ids, g.rng, on_token = stream, g.speculative, spec_stats = spec)
     println(); flush(stdout)
     println(stderr, "[", length(ids), " prompt tokens, ", length(generated), " generated; ",
-            timing_summary(stream, length(generated)), "]")
+            timing_summary(stream, length(generated)), spec_summary(spec, length(generated)), "]")
 end
 
 """
@@ -179,7 +201,8 @@ function chat_loop(session::ChatSession, input::IO, output::IO; max_new_tokens::
             _, stats = reply!(session, text; max_new_tokens, on_token = stream)
             println(output); flush(output)
             println(stderr, "[", stats.reused, " tokens reused, ", stats.prefilled, " prefilled, ",
-                    stats.generated, " generated; ", timing_summary(stream, stats.generated), "]")
+                    stats.generated, " generated; ", timing_summary(stream, stats.generated),
+                    spec_summary(stats.spec, stats.generated), "]")
         catch e
             e isa OutOfPagesError || e isa ArgumentError || rethrow()
             println(output)
@@ -192,7 +215,7 @@ function cmd_chat(positional, options)
     check_options(options, GENERATION_OPTIONS)
     length(positional) == 1 || throw(ArgumentError("chat takes exactly one model"))
     g = load_for_generation(only(positional), options)
-    session = ChatSession(g.model, g.tok; g.sampling, g.stop_ids, g.enable_thinking, g.rng)
+    session = ChatSession(g.model, g.tok; g.sampling, g.stop_ids, g.enable_thinking, g.rng, g.speculative)
     chat_loop(session, stdin, stdout; max_new_tokens = parse_option(Int, options, "max-tokens", 2048))
 end
 
