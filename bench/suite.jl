@@ -1,5 +1,5 @@
 # Benchmark suite: every op at the model's real shapes, at decode (1 token) and prefill
-# (512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
+# (64 and 512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
 # CUDA graph where the backend supports it), for every backend that implements them. Used
 # by bench/run.jl.
 #
@@ -16,6 +16,7 @@ using TileInfer: DecoderLM, PagedKVCache, RefBackend, TileBackend
 
 const OP_REPS = 20
 const PREFILL = 512
+const SHORT = 64            # a short prompt, or a follow-up turn of a chat
 const CONTEXT = 1024        # cached positions seen by decode attention / decode steps
 const GEN = 64              # tokens per generation benchmark
 
@@ -86,7 +87,7 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
     suite, info = BenchmarkGroup(), Dict{String,Workload}()
     rnd(dims...) = CUDA.rand(T, dims...)
 
-    for (label, n) in (("decode", 1), ("prefill$PREFILL", PREFILL))
+    for (label, n) in (("decode", 1), ("prefill$SHORT", SHORT), ("prefill$PREFILL", PREFILL))
         ops(name) = ["ops", name, label]
         ids() = CuArray(rand(Int32(0):Int32(cfg.vocab_size - 1), n))
         # Reads one table column per token and writes it: the table is shared, not copied.
@@ -130,10 +131,12 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
     params = weights / sizeof(T)
     for be in BACKENDS
         name = backend_name(be)
-        prefill_key, decode_key = "model/prefill$PREFILL/$name", "model/decode_ctx$CONTEXT/$name"
+        prefill_keys = ("model/prefill$SHORT/$name", "model/prefill$PREFILL/$name")
+        decode_key = "model/decode_ctx$CONTEXT/$name"
         graph_key = "model/decode_graph_ctx$CONTEXT/$name"           # through a ModelRunner
         gen_keys = ("model/generate$(GEN)_ctx$CONTEXT/$name", "model/generate$(GEN)_unpipelined_ctx$CONTEXT/$name")
-        keys = TileInfer.supports_graphs(be) ? (prefill_key, decode_key, graph_key, gen_keys...) : (prefill_key, decode_key)
+        keys = TileInfer.supports_graphs(be) ? (prefill_keys..., decode_key, graph_key, gen_keys...) :
+                                               (prefill_keys..., decode_key)
         any(k -> occursin(filter, k), keys) || continue
         m = DecoderLM(cfg, w, model.rope, be)
         cache = PagedKVCache(m; max_tokens = CONTEXT + PREFILL)
@@ -147,14 +150,15 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
         end
         TileInfer.release!(cache, seq)
 
-        if occursin(filter, prefill_key)
-            setleaf!(suite, split(prefill_key, "/"), @benchmarkable begin
+        for (key, p) in zip(prefill_keys, (prompt[1:SHORT], prompt))
+            occursin(filter, key) || continue
+            setleaf!(suite, split(key, "/"), @benchmarkable begin
                 seq = TileInfer.new_sequence($cache)
-                TileInfer.forward!($m, $cache, seq, $prompt)
+                TileInfer.forward!($m, $cache, seq, $p)
                 CUDA.synchronize()
                 TileInfer.release!($cache, seq)
             end evals = 1)
-            info[prefill_key] = Workload(1, weights, 2 * params * PREFILL, PREFILL)
+            info[key] = Workload(1, weights, 2 * params * length(p), length(p))
         end
 
         # One new token after CONTEXT - 1 cached positions, rewound after each sample: eagerly

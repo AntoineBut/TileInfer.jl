@@ -26,7 +26,7 @@ rather than raw `ncu` output (`ncu` is in /usr/local/NVIDIA-Nsight-Compute). Tak
 from bench/run.jl: `ncu` serializes kernels and locks clocks.
 
 Benchmarks (bench/suite.jl): every op at Qwen3-0.6B shapes for decode (n = 1) and prefill
-(n = 512), plus end-to-end prefill and decode steps, for each backend that has a method
+(n = 64 and 512), plus end-to-end prefill and decode steps, for each backend that has a method
 (new `TileBackend` methods are picked up automatically). Report columns are per call, with
 GB/s and % of the 736 GB/s roofline. Op arguments rotate through copies totalling > 2× L2, so
 decode GEMMs read from DRAM as in the real model. Save a baseline before changing a kernel
@@ -94,6 +94,10 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
   only CUDA graphs help.
 - The GPU also drives the desktop (compositor, browsers, …) and idles at 210 MHz: time
   kernels as the minimum over many short trials after a warm-up, never as one averaged loop.
+- Tile shapes and code layout change codegen a lot, so measure every restructuring:
+  identical logic moved into an `@inline` helper ran 1.7× slower, a 3-D tile reduced over
+  its third axis 60× slower, and dropping a trivial size-1 axis 5× slower. Small tile
+  dimensions (8 columns) also compile to slow code: pad them to 16.
 
 ## Dependency notes
 

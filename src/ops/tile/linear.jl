@@ -6,7 +6,8 @@
 #   stay busy even for small layers. 70–93 % of the DRAM roofline on Qwen3-0.6B's layers.
 # - GEMM for several tokens (prefill). Compute-bound, on tensor cores: W tiles are loaded
 #   transposed (order = (2, 1)) so the product is a plain (TM × TK) · (TK × TN) muladd with
-#   a Float32 accumulator, and blocks are swizzled for L2 reuse. 0.8–0.9× cuBLAS.
+#   a Float32 accumulator, and blocks are swizzled for L2 reuse. The tile shape depends on
+#   the layer and token count (gemm_config).
 #
 # Both round once to T at the end, like cuBLAS, then convert to the output's element type
 # S (Float32 logits straight from the lm_head, as the reference rounds then converts). A
@@ -74,7 +75,6 @@ function gemm_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{T,2}, X::ct.TileArray
 end
 
 const GEMV_BLOCKS = 256           # target block count for decode GEMVs
-const GEMM_BLOCKS = 120           # use 128 × 128 output tiles from this many blocks (1.5 × SMs)
 
 function gemv_config(in::Integer, out::Integer)
     TK = min(nextpow(2, in), 1024)
@@ -82,10 +82,24 @@ function gemv_config(in::Integer, out::Integer)
     return TK, TM
 end
 
-function gemm_config(out::Integer, n::Integer)
-    TN = clamp(nextpow(2, n), 16, 128)
-    big = cld(out, 128) * cld(n, TN) >= GEMM_BLOCKS
-    return (big ? 128 : 64), TN, 64
+# GEMM tiles (TM, TN, TK), small to large. gemm_config picks the one with the lowest cost
+# waves × (TM TN)^0.7, where a wave is one block per SM: a larger tile does more work per
+# block, but more efficiently, and leaves fewer blocks to fill the GPU, or a partial last
+# wave. Columns past n are wasted work, so tiles wider than n are not considered.
+# Fitted to a sweep of 30 tile shapes on Qwen3-0.6B and 4B layers at n = 2…1024 on the
+# 4080S: within 2 % of the best tile on average (worst 1.18×), and 1.06× cuBLAS.
+const GEMM_TILES = ((32, 16, 256), (32, 32, 64), (64, 32, 64), (64, 64, 64), (64, 128, 64), (128, 128, 64))
+
+num_sms() = CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+
+function gemm_config(out::Integer, n::Integer, sms::Integer = num_sms())
+    best, best_cost = first(GEMM_TILES), Inf
+    for (TM, TN, TK) in GEMM_TILES
+        TN <= max(16, nextpow(2, n)) || continue
+        cost = cld(cld(out, TM) * cld(n, TN), sms) * (TM * TN)^0.7
+        cost <= best_cost && ((best, best_cost) = ((TM, TN, TK), cost))  # ties: the larger tile
+    end
+    return best
 end
 
 function linear!(::TileBackend, y::CuMatrix{S}, W::CuMatrix{T}, x::CuMatrix{T}) where {S,T}

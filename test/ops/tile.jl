@@ -56,7 +56,7 @@ using Random: randperm
         end
 
         @testset "linear ($in, $out) n = $n" for (in, out) in ((1024, 4096), (2048, 1024), (1000, 37)),
-                                                 n in (1, 3, 17, 512)
+                                                 n in (1, 3, 17, 100, 512)
             W, x = rnd(in, out; scale = 1 / 30), rnd(in, n)
             y_ref, y = TileInfer.linear(ref, W, x), TileInfer.linear(tile, W, x)
             @test size(y) == (out, n)

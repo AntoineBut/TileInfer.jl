@@ -122,6 +122,17 @@ Against the ~1.78 ms roofline at 1,024 positions:
   page, so the kernel is latency-bound; longer contexts amortize this better.
 - **Small kernels: ~0.25 ms**, already fused down to 3 per layer.
 
+## Per-shape GEMM tiles (2026-10-29)
+
+Prefill GEMM tiling for few tokens, and two ideas that did not pay on the 4080S:
+
+| Change | Result | Decision |
+|---|---|---|
+| **Per-shape GEMM tiles** (`gemm_config`): pick the tile minimizing waves × (TM TN)^0.7 among 6 shapes, instead of 64 or 128 rows × the next power of two ≥ n columns | Fitted to a sweep of 30 tile shapes × 8 layers (0.6B and 4B) × n = 2…1024: within 2 % of the best tile on average (worst 1.18×), 1.22× the old rule, 1.06× cuBLAS. `bench/run.jl` at n = 64: o 1.77×, down 1.98×, qkv and gate_up unchanged; **model/prefill64 3.62 → 3.00 ms (1.21×)**; n = 1 and 512 unchanged | **kept** |
+| Split-K GEMM (Float32 partials + reduce kernel) for few tokens | Never beat the best direct tile at n = 2…64 (e.g. down n = 8: 13.7 µs vs 12.2 µs). K ≤ 3072 here, and 32-row tiles already give enough blocks; split-K pays with longer K or more SMs | not kept |
+| Block-table entry of the next page read one page ahead in decode attention | 1.00× at 1k, 8k and 32k positions (n = 1 and 8): with 64-key pages and `ct.load` latency hints, long contexts already run at 600–660 GB/s. It matters with tiny pages, where every key is a gather | not kept |
+
+
 ## Comparison with vLLM (same machine, `bench/ref`)
 
 | Engine | Decode tok/s | Prefill tok/s |
