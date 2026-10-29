@@ -22,7 +22,8 @@ with the reason, so they are not retried blindly.
   (256 − 1) / (latency(256) − latency(1)). Same prompt ids and the same first tokens on both
   engines.
 - **Kernel breakdowns**: `CUDA.@profile trace = true` over 20 generated tokens, summing
-  kernel durations per name (the tracer adds ~5 % to wall time).
+  kernel durations per name (the tracer adds ~5 % to wall time). Since 2026-10-29
+  `bench/breakdown.jl` does this for decode and prefill steps of both models, per kernel role.
 - **Roofline for decode at 1,024 positions**: Qwen3-0.6B reads 1.19 GB of weights + 117 MB
   of KV cache per token ≈ 1.78 ms, i.e. ~560 tok/s; Qwen3-4B 8.04 GB + 151 MB ≈ 11.1 ms,
   ~90 tok/s.
@@ -220,8 +221,8 @@ context (1,024 positions), same KV shape (8 KV heads of 128), so attention costs
 | Attention decode, all layers | 15.1 × 28 = 423 | 15.0 × 36 = 540 |
 
 (gate_up is the plain GEMV; the decode step uses the fused SwiGLU GEMV: 21.6 µs on 0.6B vs
-22.8 µs for GEMV + silu_mul, perf branch. The fused ops `attention_inputs!`, `add_rmsnorm!`, `linear_swiglu!` and
-`argmax_token!` have no op benchmarks yet, so these rows do not sum to the step.)
+22.8 µs for GEMV + silu_mul, perf branch. The fused ops are not in this table: see "Full
+picture" below for the whole step, kernel by kernel.)
 
 At 4B the decode step is GEMVs at ~88 % of DRAM bandwidth. What is left: ~2–6 % by bringing
 the layer GEMVs to the lm_head's 94 %, and beyond that only fewer bytes (weight-only INT8
@@ -247,3 +248,80 @@ halves them). Attention is latency-bound at 38 % of DRAM for both (one page per 
   and 13.5 µs × 28 = 0.4 ms on 0.6B. A SwiGLU epilogue in the gate_up GEMM, as in the GEMV,
   saves the kernel and the round trip of the (2I, n) activations.
 
+
+## Full picture: every kernel of a step (2026-10-29)
+
+Before optimizing kernels: what each one costs inside real steps (`bench/breakdown.jl`,
+decode replayed from graphs at 1,024 positions), and the fused ops' own op benchmarks
+(`attention_inputs`, `add_rmsnorm`, `linear_swiglu`, `argmax`; baseline `full-picture`,
+all other benchmarks unchanged from `two-models`). µs per step, share of the GPU-busy time.
+
+### Decode
+
+| Kernels | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| Layer GEMVs: qkv / o / gate_up + SwiGLU / down | 385 / 207 / 567 / 288 = 1,447 (59.0 %) | 1,683 / 1,138 / 5,347 / 2,625 = 10,793 (84.8 %) |
+| lm_head GEMV | 451 (18.4 %) | 1,114 (8.8 %) |
+| Attention decode + combine | 252 + 58 = 309 (12.6 %) | 324 + 74 = 399 (3.1 %) |
+| Attention inputs (q, kv), add + RMSNorm ×2 | 63 + 65 + 106 = 234 (9.5 %) | 100 + 86 + 225 = 411 (3.2 %) |
+| Embedding, first norm, argmax | 9 (0.3 %) | 10 (0.1 %) |
+| **GPU busy per token** | **2,450** (99 % of the 2,472 µs period) | **12,726** (99.9 % of 12,740) |
+| Roofline (weights + KV once) | 1,780 | 11,130 |
+
+GEMV bandwidth inside the step: 0.6B qkv 83 %, o 77 %, gate_up + SwiGLU 85 %, down 83 %,
+lm_head 94 %; 4B 91 / 90 / 91 / 93 / 95 %. Over the roofline:
+
+- **0.6B, +670 µs**: GEMVs +279 (1,898 vs a 1,619 floor; the 4–12 MB layers lose to fill and
+  drain), small kernels +242 (~2 µs each, 116 of them), attention +149 (309 vs 160 to read
+  the KV once, latency-bound with about one page per split). Three levers of similar size.
+- **4B, +1,596 µs**: GEMVs +976 (11,907 vs 10,931: the layer GEMVs at 90–93 % against the
+  lm_head's 95 %), small kernels +421, attention +193. GEMV bandwidth first.
+- **Host**: greedy decode keeps the GPU 99 % busy. Sampled decode idles it ~0.9 ms per token
+  (66 % busy on 0.6B under the tracer, 93 % on 4B; 0.88 / 0.69 ms per token in run.jl).
+
+Op benchmarks against the same kernels inside the 0.6B decode graph (µs per call): eager
+launches inflate every kernel under ~6 µs, so use the breakdown for small kernels.
+
+| | qkv | o | gate_up + SwiGLU | down | lm_head | attention | attention inputs | add + RMSNorm | argmax |
+|---|---|---|---|---|---|---|---|---|---|
+| `bench/run.jl` (eager) | 13.0 | 8.3 | 21.2 | 11.3 | 453 | 15.1 | 15.6 | 5.9 | 9.8 |
+| In the graph | 13.7 | 7.4 | 20.2 | 10.3 | 451 | 11.1 | 4.6 | 1.9 | 4.2 |
+
+### Prefill
+
+| Kernels | 0.6B, 64 tokens | 0.6B, 512 | 4B, 64 | 4B, 512 |
+|---|---|---|---|---|
+| GEMMs: qkv + o + gate_up + down | 1,796 (66.3 %) | 6,467 (73.6 %) | 12,367 (86.4 %) | 41,895 (88.3 %) |
+| of which gate_up | 736 (27.2 %) | 2,448 (27.9 %) | 6,136 (42.9 %) | 20,653 (43.5 %) |
+| lm_head GEMV (last token) | 454 (16.7 %) | 483 (5.5 %) | 1,122 (7.8 %) | 1,141 (2.4 %) |
+| Attention prefill | 96 (3.5 %) | 751 (8.5 %) | 133 (0.9 %) | 1,537 (3.2 %) |
+| Attention inputs (q, kv) | 193 (7.1 %) | 730 (8.3 %) | 331 (2.3 %) | 1,459 (3.1 %) |
+| add + RMSNorm ×2, silu_mul | 165 (6.1 %) | 343 (3.9 %) | 354 (2.5 %) | 1,382 (2.9 %) |
+| **GPU busy** (run.jl step) | **2,708** (2.89 ms) | **8,781** (9.00 ms) | **14,312** (14.55 ms) | **47,425** (47.64 ms) |
+
+- **GEMMs are 66–88 % of prefill**, gate_up alone 28 % (0.6B) to 44 % (4B). At 512 tokens
+  they are compute-bound and 0.77–0.93× cuBLAS (see "Two models"); at 64 tokens they are
+  bandwidth-bound and read the weights at 67 % (0.6B) and 80 % (4B) of DRAM, against 83–93 %
+  for the decode GEMVs that read the same bytes.
+- **Attention inputs at 512 tokens cost as much as attention itself on 0.6B** (730 vs
+  751 µs): `q_inputs_kernel` runs one block per (token, head), 8,192 blocks of one 128-element
+  column each, 16 µs per launch for 8.6 MB (≈ 42 % of DRAM with kv_inputs).
+- **0.6B prefill64 idles the GPU 9 % of the step** (busy 2.71 ms, span 2.98, run.jl 2.89):
+  283 eager launches of mostly short kernels, which the host cannot enqueue as fast as they
+  run. 4B kernels are long enough (98 % busy). A graph for short prefills would remove it.
+- The lm_head reads 311 MB (0.6B) for one token's logits: 17 % of a 64-token prefill.
+
+### What to optimize
+
+Upper bounds from the tables above (removing the whole excess):
+
+| Target | Where it shows | At most |
+|---|---|---|
+| Device top-k/top-p sampling, pipelined like greedy | sampled decode | 0.7–0.9 ms per token: 1.36× on 0.6B, 1.05× on 4B |
+| Prefill GEMMs at n = 512 to cuBLAS (larger tiles, split-K for under-filled shapes such as 0.6B down) | prefill512 | up to ~10 % of the step (4B: ~5 ms) |
+| Prefill GEMMs at n = 64 to GEMV bandwidth | prefill64 | ~10–20 % of the GEMM time |
+| Layer GEMVs from 90–93 % to the lm_head's 95 % (4B), fill/drain of small GEMVs (0.6B) | decode | 4B ~3 %, 0.6B ~11 % |
+| Small decode kernels: fewer of them (q + kv inputs in one kernel, norms into GEMV epilogues) | decode | 0.6B ~10 %, 4B ~3 % |
+| Attention decode (latency-bound at 1k positions) | decode, long contexts | 0.6B ~6 %, grows with context |
+| `q_inputs_kernel` with several tokens per block | prefill512 | 0.6B ~4 % |
+| Graphs (or fewer launches) for short prefills | 0.6B prefill64 | ~9 % |

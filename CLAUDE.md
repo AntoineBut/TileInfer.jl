@@ -14,6 +14,7 @@ julia --project=test test/runtests.jl                 # full suite, ~130 s (cuTi
 julia --project=test test/runtests.jl kernels graphs  # only files whose path contains an arg, ~10 s
 julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
 julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME] [--model REPO,...]  # op + model benchmarks
+julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter RE]  # GPU time per kernel of real steps, ~2 min
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
@@ -27,10 +28,11 @@ from bench/run.jl: `ncu` serializes kernels and locks clocks.
 
 Benchmarks (bench/suite.jl): for Qwen3-0.6B and Qwen3-4B (keys start with the model,
 `Qwen3-4B/ops/linear_qkv/decode/tile`), every op at the model's shapes for decode (n = 1) and
-prefill (n = 64 and 512), plus end-to-end prefill and decode steps and 64-token generation
+prefill (n = 64 and 512), primitive and fused (`attention_inputs`, `add_rmsnorm`,
+`linear_swiglu`, `argmax`, as the step calls them), plus end-to-end prefill and decode steps and 64-token generation
 (greedy pipelined, greedy step by step, and with the model's recommended sampling), for each
 backend that has a method (new `TileBackend` methods are picked up automatically). The models
-run one after the other (~7 min for both with `--seconds 2`); `--model` or a filter narrows
+run one after the other (~9 min for both with `--seconds 2`); `--model` or a filter narrows
 it. A kernel change must be checked on both: 0.6B is dominated by per-kernel overheads, 4B by
 bandwidth (decode) and tensor-core throughput (prefill). Report columns are per call, with
 GB/s and % of the 736 GB/s roofline. Op arguments rotate through copies totalling > 2× L2, so
@@ -38,6 +40,10 @@ decode GEMMs read from DRAM as in the real model. Save a baseline before changin
 (`--save before`), then `--compare before`. Results live in bench/results/ (gitignored);
 results saved before the model prefix existed compare as Qwen3-0.6B.
 Expect ~±10 % run-to-run noise from GPU clocks; use `--seconds 2` for decisions.
+Op benchmarks launch eagerly, so kernels under ~6 µs measure their launch (rmsnorm, rope,
+attention inputs, decode attention), not their GPU time. For what each kernel costs inside
+a real step (decode replayed from a graph), and its share of the step, use bench/breakdown.jl
+(see docs/PROFILING.md); decide what to optimize from it, and measure the change with run.jl.
 
 If `julia` is not on PATH, use `~/.juliaup/bin/julia`.
 `test/` and `bench/` are workspace projects that share the root `Manifest.toml`. Add

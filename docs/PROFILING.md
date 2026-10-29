@@ -70,6 +70,40 @@ ncu --profile-from-start off -c 12 -o bench/results/decode \
 python3 bench/ncu_summary.py bench/results/decode.ncu-repz
 ```
 
+## Step breakdown: `bench/breakdown.jl`
+
+Where the GPU time of whole steps goes, kernel by kernel, for both models:
+
+```sh
+julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter 4B/decode]   # ~2 min
+```
+
+It traces, with CUDA.jl's profiler, greedy decode (pipelined, replayed from CUDA graphs),
+decode with the model's sampling, and 64- and 512-token prefills, and prints for each the
+GPU time per step of every kernel by role: GEMV/GEMM launches by projection (qkv, o,
+gate_up, down, lm_head), other layer kernels by name and occurrence (`add_rmsnorm_kernel #1`
+after attention, `#2` after the MLP). Roles come from the step's launch order (prologue,
+`num_layers` identical layer sequences, epilogue), so a change to `run_step!` shows up
+without editing the script. Totals per step: `busy` (kernel time), `span` (first kernel
+start to last kernel end: span − busy is GPU idle inside the step, e.g. eager launches the
+host could not enqueue fast enough), and `period` (start to start: period − span is the
+gap between steps, e.g. host sampling).
+
+Use it to decide what to optimize; the op benchmarks cannot, because they launch eagerly:
+a kernel under ~6 µs measures its launch there (decode `attention_inputs` 15.8 µs in
+`bench/run.jl`, 4.6 µs inside the graph). Then measure a change with `bench/run.jl`.
+
+Two things it handles, because they bit:
+
+- **Clocks.** Starting the profiler idles the GPU long enough to drop its clocks, so the
+  first ~15 ms of a trace run up to 3× slow (a 311 MB lm_head GEMV at 41 GB/s). Each case
+  runs for a second untraced, then ~0.4 s traced, and only the second half of the steps is
+  reported; the first half's busy time is printed to show the two agree.
+- **Tracer overhead.** CUPTI adds a little per launch and flushes its buffers at syncs, so
+  `period` of eager steps (prefill) can include gaps that `bench/run.jl` does not see (4B
+  prefill64: 22.2 ms period vs 14.6 ms in run.jl). Trust `busy` and the shares; take
+  absolute step times from run.jl.
+
 ## Timeline: NVTX ranges
 
 The host side of generation is annotated with NVTX ranges: `prefill`, and for steps

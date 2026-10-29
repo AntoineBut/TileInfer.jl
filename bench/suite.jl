@@ -1,5 +1,5 @@
-# Benchmark suite: every op at a model's real shapes, at decode (1 token) and prefill
-# (64 and 512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
+# Benchmark suite: every op at a model's real shapes (the primitive ops, and the fused ones a
+# step runs), at decode (1 token) and prefill (64 and 512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
 # CUDA graph where the backend supports it), for every backend that implements them. Keys
 # start with the model ("Qwen3-4B/ops/linear_qkv/decode/tile"); bench/run.jl and
 # bench/profile.jl run the suite for each model of MODELS in turn.
@@ -140,12 +140,17 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
                 bytes = (2.0 * H * n + H) * B)
         for (name, (in, out)) in (("qkv", size(first(w.layers).wqkv)), ("o", size(first(w.layers).wo)),
                                   ("gate_up", size(first(w.layers).w_gate_up)),
-                                  ("down", size(first(w.layers).w_down)), ("lm_head", size(w.lm_head)))
-            name == "lm_head" && n > 1 && continue              # prefill only needs the last token
-            # The lm_head is 311 MB: use the real one rather than allocating copies.
-            weight() = name == "lm_head" ? w.lm_head : rnd(in, out)
-            add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (weight(), rnd(in, n));
+                                  ("down", size(first(w.layers).w_down)))
+            add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (rnd(in, out), rnd(in, n));
                     bytes = (in * out + (in + out) * n) * B, flops = 2.0 * in * out * n)
+        end
+        # The lm_head as a step runs it: the last token only, into Float32 logits. The weight
+        # is the real one (311 MB for 0.6B, 778 MB for 4B) rather than copies.
+        # (`let`: argument closures run lazily, after later assignments in this loop body.)
+        n == 1 && let (in, out) = size(w.lm_head)
+            add_op!(suite, info, filter, ops("linear_lm_head"), TileInfer.linear!,
+                    () -> (CuMatrix{Float32}(undef, out, 1), w.lm_head, rnd(in, 1));
+                    bytes = (in * out + in) * B + 4.0 * out, flops = 2.0 * in * out)
         end
         # The model's own rope tables: a step reads n of their columns.
         positions() = CuArray(Int32.(rand(0:length(model.rope)-1, n)))
@@ -169,6 +174,28 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         add_op!(suite, info, filter, ops("attention"), TileInfer.attention,
                 () -> (rnd(D, nq, n), pools()..., CuArray(Int32.(1:pages)), CuArray(Int32.(start:len-1)), 1 / sqrt(D));
                 bytes = kv_bytes(len) + 2.0 * D * nq * n * B, flops = 4.0 * D * nq * visited)
+
+        # The fused ops of a step, in place as run_step! calls them (decode: 10 kernels per
+        # layer, of which 6 are these). Their bytes are the unfused minimum, so % peak shows
+        # what the fusion achieves.
+        layer = first(w.layers)
+        add_op!(suite, info, filter, ops("add_rmsnorm"), TileInfer.add_rmsnorm!,
+                () -> (rnd(H, n), rnd(H, n), rnd(H, n), rnd(H), eps);
+                bytes = (4.0 * H * n + H) * B)                   # read x, delta; write x, h
+        let (in, out) = size(layer.w_gate_up)
+            add_op!(suite, info, filter, ops("linear_swiglu"), TileInfer.linear_swiglu!,
+                    () -> (rnd(out ÷ 2, n), rnd(out, n), rnd(in, out), rnd(in, n));
+                    bytes = (in * out + (in + out ÷ 2) * n) * B, flops = 2.0 * in * out * n)
+        end
+        # q/k norm + rope from the fused qkv, keys and values into the pools.
+        add_op!(suite, info, filter, ops("attention_inputs"), TileInfer.attention_inputs!,
+                () -> (rnd(D, nq, n), pools()..., rnd((nq + 2nkv) * D, n), layer.q_norm, layer.k_norm, model.rope,
+                       CuArray(Int32.(start:len-1)), CuArray(Int32.(start+1:start+n)), eps);
+                bytes = (2.0 * nq + 4.0 * nkv + 2.0) * D * n * B)  # qkv in, q and k/v out, rope table
+        n == 1 && add_op!(suite, info, filter, ops("argmax"), TileInfer.argmax_token!,
+                          () -> (CuVector{Int32}(undef, 1), CuVector{Int32}(undef, 1),
+                                 CUDA.rand(Float32, cfg.vocab_size, 1), TileInfer.argmax_scratch(cfg.vocab_size));
+                          bytes = 4.0 * cfg.vocab_size)
     end
 
     weights = Float64(TileInfer.weight_bytes(w))
