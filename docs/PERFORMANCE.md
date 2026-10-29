@@ -409,3 +409,21 @@ on 0.6B is the host/GPU overlap of pipelined decoding: speculative steps synchro
 the accepted count before proposing. In BFloat16 the outputs can part from plain greedy at
 near-ties (verify steps round differently than decode steps); in Float32 they are identical
 (test/engine/speculative.jl).
+
+**Sampling** (same day). For a deterministic proposer, rejection sampling (accept d with
+probability p(d), else sample from p without d) is the same as sampling the target's token at
+each position and accepting d when they agree. The verify step does that with the device
+sampler and the counters plain decoding would use, so sampled speculative decoding picks the
+tokens of plain sampled decoding: identical over 200 tokens in Float32 (4 seeds); in BF16 they
+part after 15–45 tokens, sooner than greedy, as a sample flips whenever its uniform falls
+within round-off of a cumulative boundary. With Qwen3's recommended sampling (temperature 0.6,
+top-k 20, top-p 0.95), against pipelined sampled decoding:
+
+| Prompt | Model | plain | k = 1 | k = 2 | k = 4 | k = 7 | tokens per step at k = 7 (acceptance) |
+|---|---|---|---|---|---|---|---|
+| rename two variables | 0.6B | 422 tok/s | 1.64× | 2.19× | 3.13× | **4.06×** | 4.83 (0.63) |
+| | 4B | 78 tok/s | 1.65× | 2.08× | 2.86× | **3.73×** | 4.07 (0.53) |
+| short story | 0.6B | 432 tok/s | 1.00× | 1.01× | 1.00× | 1.00× | 1.10 (0.03) |
+| | 4B | 80 tok/s | 1.04× | 1.05× | 1.04× | 1.04× | 1.08 (0.03) |
+
+The rename task is nearly deterministic at temperature 0.6 (the same steps as greedy).

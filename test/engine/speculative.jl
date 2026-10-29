@@ -1,5 +1,7 @@
 # Speculative decoding: the n-gram proposer, the verify step against eager forward steps, and
-# speculative greedy generation against the plain greedy loop.
+# speculative generation (greedy and sampled) against the plain loop.
+
+using Random: Xoshiro
 
 @testset "n-gram proposer" begin
     p = TileInfer.NgramProposer(k = 3, max_ngram = 2)
@@ -27,7 +29,7 @@ if test_model_dir() !== nothing
             TileInfer.forward!(m, eager_c, eager_s, prompt)
             for ids in ([5], [6, 7, 8], [9, 10, 11], [12, 13, 14, 15, 16, 17, 18, 19])
                 logits = Array(TileInfer.forward!(m, eager_c, eager_s, ids; all_logits = true))
-                @test TileInfer.verify!(r, s, ids) == [argmax(col) - 1 for col in eachcol(logits)]
+                @test TileInfer.verify!(r, s, ids, 0) == [argmax(col) - 1 for col in eachcol(logits)]
             end
             @test s.tokens == eager_s.tokens
             @test TileInfer.num_graphs(r) == 3                     # 1, 3 and 8 tokens
@@ -38,17 +40,21 @@ if test_model_dir() !== nothing
         # BFloat16 tie after 46 tokens with this prompt).
         m = TileInfer.load_model(TEST_MODEL; T = Float32, backend = TileBackend(), max_len = 512)
 
-        function plain(max_new_tokens, stop_ids)
+        # Plain decoding step by step: the reference for both greedy and sampled generation
+        # (pipelined decoding picks the same tokens, see runner.jl).
+        function plain(max_new_tokens, stop_ids; sampling = TileInfer.SamplingParams(), seed = 1)
             c = new_cache()
             s = TileInfer.new_sequence(c)
-            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), s, prompt; max_new_tokens, stop_ids, pipeline = false)
+            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), s, prompt; max_new_tokens, stop_ids, sampling,
+                                      rng = Xoshiro(seed), pipeline = false)
             return out, copy(s.tokens), copy(s.block_table)
         end
-        function speculative(max_new_tokens, stop_ids; k = 4, stats = TileInfer.SpecStats())
+        function speculative(max_new_tokens, stop_ids; sampling = TileInfer.SamplingParams(), seed = 1, k = 4,
+                             stats = TileInfer.SpecStats())
             c = new_cache()
             s = TileInfer.new_sequence(c)
-            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), s, prompt; max_new_tokens, stop_ids,
-                                      speculative = TileInfer.NgramProposer(; k), spec_stats = stats)
+            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), s, prompt; max_new_tokens, stop_ids, sampling,
+                                      rng = Xoshiro(seed), speculative = TileInfer.NgramProposer(; k), spec_stats = stats)
             return out, copy(s.tokens), copy(s.block_table)
         end
 
@@ -71,10 +77,30 @@ if test_model_dir() !== nothing
             @test speculative(0, Int[])[1] == Int[]
         end
 
-        @testset "sampled speculative decoding is rejected" begin
+        # Drafts are accepted when the token sampled at their position equals them, with the
+        # counters of plain decoding: the same tokens as plain sampled decoding.
+        sampled = TileInfer.SamplingParams(temperature = 0.6, top_k = 20, top_p = 0.95)
+
+        @testset "same tokens as plain sampled decoding (seed $seed, k = $k)" for seed in 1:3, k in (1, 4, 7)
+            stats = TileInfer.SpecStats()
+            expected = plain(60, Int[]; sampling = sampled, seed)
+            @test speculative(60, Int[]; sampling = sampled, seed, k, stats) == expected
+            @test length(unique(expected[1])) > 5                  # not stuck on one token
+            @test stats.accepted > 0
+        end
+
+        @testset "stops like plain sampled decoding" begin
+            full, = plain(30, Int[]; sampling = sampled)
+            for stop in (full[2], full[10], full[25])
+                @test speculative(30, [stop]; sampling = sampled) == plain(30, [stop]; sampling = sampled)
+            end
+            @test all(speculative(n, Int[]; sampling = sampled) == plain(n, Int[]; sampling = sampled) for n in 1:12)
+        end
+
+        @testset "sampling the device cannot do is rejected" begin
             c = new_cache()
             @test_throws ArgumentError TileInfer.generate!(TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c), prompt;
-                                                           sampling = TileInfer.SamplingParams(temperature = 0.6, top_k = 20),
+                                                           sampling = TileInfer.SamplingParams(temperature = 0.6),
                                                            speculative = TileInfer.NgramProposer())
         end
 

@@ -108,3 +108,11 @@ function reset_sampler!(s::TokenSampler, p::SamplingParams, seed::UInt32)
     copyto!(s.state, UInt32[greedy ? 1 : p.top_k, seed, 0])
     return s
 end
+
+"""
+    set_counter!(s, counter)
+
+Sample the next token with `counter`, as when rewinding to a token that was sampled ahead.
+Ordered on the stream before the steps that follow.
+"""
+set_counter!(s::TokenSampler, counter::Integer) = copyto!(view(s.state, 3:3), UInt32[counter])

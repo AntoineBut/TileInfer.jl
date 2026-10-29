@@ -1,12 +1,23 @@
 # Speculative decoding: a cheap proposer guesses the next k tokens, and one forward step of
-# the target model on [last token, d1..dk] checks them all at once. With greedy decoding the
-# target's own choice after each prefix is the argmax of that position's logits, so the
-# drafts are accepted up to the first one that differs from it, and the target's choice at
-# that point comes for free (the "bonus" token): each step emits 1 to k + 1 tokens for the
+# the target model on [last token, d1..dk] checks them all at once. The step samples the
+# target's own choice after each prefix, the token it would have sampled one step at a time,
+# so the drafts are accepted up to the first one that differs from it, and the target's
+# choice at that point comes for free (the "bonus" token): each step emits 1 to k + 1 tokens for the
 # cost of one step of k + 1 tokens, which at decode sizes costs little more than one token
 # (the step reads the weights once either way). The keys and values of rejected drafts are
 # dropped again by truncating the sequence: its pages go back to the pool, and later steps
 # overwrite the stale slots.
+#
+# Sampling. Rejection sampling (Leviathan et al., Chen et al.) accepts a draft d drawn from
+# the proposer's q with probability min(1, p(d) / q(d)), where p is the target's (filtered)
+# distribution, and otherwise samples from max(p - q, 0) renormalized. The n-gram proposer is
+# deterministic, q is one-hot on d: that is "accept d with probability p(d), else sample from
+# p without d", the same as sampling t ~ p and accepting d if t == d. So the verify step
+# samples each position with the device sampler and the counter plain decoding would use for
+# that token (`sampling_uniform(seed, counter)`): the drafts are accepted with probability
+# p(d), and the tokens are those of plain sampled decoding, up to round-off. Greedy decoding
+# is the case p = one-hot on the argmax. A proposer with a non-degenerate q (a draft model)
+# will need the general rule.
 #
 # The proposer here is n-gram (prompt) lookup: no draft model, the drafts are the tokens
 # that followed the latest earlier occurrence of the sequence's last n tokens.
@@ -60,44 +71,48 @@ end
 
 acceptance_rate(s::SpecStats) = s.drafted == 0 ? NaN : s.accepted / s.drafted
 
-# A step that returns the target model's greedy token after each of its n inputs: the
-# forward step with the logits of every token, then an argmax per column, all captured
-# together in a CUDA graph. The tokens land in host-mapped memory.
+# A step that returns the token the target model samples after each of its n inputs: the
+# forward step with the logits of every token, then the runner's sampler on each column
+# (counters c, c + 1, …), all captured together in a CUDA graph. The tokens land in
+# host-mapped memory.
 mutable struct VerifyStep{T}
     buffers::StepBuffers{T}
     graph::Union{Nothing,CUDA.CuGraphExec}
     targets::CuVector{Int32}         # device copies (`sample_token!` writes both)
     mirror::CuVector{Int32}          # host-mapped
     mirror_host::Vector{Int32}
-    sampler::TokenSampler            # greedy
 end
 
 function VerifyStep(r::ModelRunner{T}, n::Integer) where {T}
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, n)
     return VerifyStep{T}(StepBuffers(r.model, r.cache, n; all_logits = true), nothing, CuVector{Int32}(undef, n),
-                         mirror, unsafe_wrap(Array, mirror), TokenSampler(r.model.config.vocab_size))
+                         mirror, unsafe_wrap(Array, mirror))
 end
 
 function run_verify_step!(r::ModelRunner, v::VerifyStep)
     b, be = v.buffers, r.model.backend
     run_step!(r.model, r.cache, b)
     for j in 1:num_tokens(b)
-        sample_token!(be, view(v.targets, j:j), view(v.mirror, j:j), view(b.logits, :, j:j), v.sampler)
+        sample_token!(be, view(v.targets, j:j), view(v.mirror, j:j), view(b.logits, :, j:j), r.sampler)
     end
 end
 
 """
-    verify!(runner, seq, ids) -> Vector{Int}
+    verify!(runner, seq, ids, counter) -> Vector{Int}
 
 Run the 0-based token `ids` (the last sampled token, then the drafts) through the model,
-appending them to `seq`, and return the greedy token after each of them. Steps of each
-length are captured in a CUDA graph like [`forward!`](@ref) steps.
+appending them to `seq`, and return the token the runner's sampler picks after each of them,
+with counters `counter`, `counter + 1`, … (the argmax when greedy). Steps of each length are
+captured in a CUDA graph like [`forward!`](@ref) steps.
 """
-function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}) where {T}
+function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}, counter::Integer) where {T}
     n = length(ids)
     1 <= n <= MAX_GRAPH_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_GRAPH_TOKENS tokens, got $n"))
     v = get!(() -> VerifyStep(r, n), r.verify_steps, n)::VerifyStep{T}
-    NVTX.@range "upload inputs" prepare_step!(v.buffers, r.model, r.cache, seq, ids)
+    NVTX.@range "upload inputs" begin
+        prepare_step!(v.buffers, r.model, r.cache, seq, ids)
+        set_counter!(r.sampler, counter)
+    end
     if v.graph !== nothing
         NVTX.@range "replay verify" CUDA.launch(v.graph)
     else
@@ -115,10 +130,11 @@ end
     generate_speculative!(runner, seq, ids, proposer; max_new_tokens, stop_ids, on_token,
                           stats = SpecStats()) -> Vector{Int}
 
-Greedy [`generate!`](@ref) with drafts from `proposer` checked by [`verify!`](@ref): the
-same tokens as plain greedy decoding up to near-ties (a verify step of k + 1 tokens runs
-other kernels than a decode step, so the logits differ in the last bits), and `seq` ends in
-the same state. Counts steps and accepted drafts in `stats`.
+[`generate!`](@ref) with the runner's sampler (set it with [`reset_sampler!`](@ref)) and drafts
+from `proposer` checked by [`verify!`](@ref): the same tokens as plain decoding with that
+sampler up to near-ties (a verify step of k + 1 tokens runs other kernels than a decode
+step, so the logits differ in the last bits), and `seq` ends in the same state. Counts steps
+and accepted drafts in `stats`.
 """
 function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer}, proposer;
                                max_new_tokens::Integer, stop_ids, on_token = nothing,
@@ -126,7 +142,8 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
     generated = Int[]
     max_new_tokens > 0 || return generated
     logits = forward!(r, seq, ids)
-    last = argmax(vec(Array(logits))) - 1    # sampled, not yet in the cache
+    # Sampled with counter 0, not yet in the cache.
+    last = Int(Array(sample_token!(r.model.backend, r.token, r.token, logits, r.sampler))[1])
     context = copy(seq.tokens)       # seq.tokens and `last`, for the proposer
     while true
         last in stop_ids && break
@@ -138,7 +155,8 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
         # A step emits at most k + 1 tokens: draft no more than the budget needs.
         drafts = remaining > 1 ? propose(proposer, context, min(proposer.k, remaining - 1)) : Int[]
         start = length(seq)
-        targets = verify!(r, seq, [last; drafts])
+        # The token after `last` is generated token number length(generated) (0-based).
+        targets = verify!(r, seq, [last; drafts], length(generated))
         accepted = 0
         while accepted < length(drafts) && drafts[accepted+1] == targets[accepted+1]
             accepted += 1

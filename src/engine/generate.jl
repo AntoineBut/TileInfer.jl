@@ -19,9 +19,9 @@ The tokens are a function of the logits and one seed drawn from `rng` (see
 [`on_device`](@ref), pipelined ([`generate_pipelined!`](@ref)) on a runner with CUDA graphs
 unless `pipeline = false`; otherwise on the host, step by step.
 
-With a proposer as `speculative` (such as [`NgramProposer`](@ref)), greedy decoding checks
+With a proposer as `speculative` (such as [`NgramProposer`](@ref)), decoding checks
 its drafts several tokens per step ([`generate_speculative!`](@ref)) and counts them in
-`spec_stats`. Sampled speculative decoding is not supported yet.
+`spec_stats`; the sampling must be [`on_device`](@ref).
 """
 function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
                    max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
@@ -29,14 +29,14 @@ function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer}
                    on_token = nothing, pipeline::Bool = true, speculative = nothing,
                    spec_stats::SpecStats = SpecStats())
     isempty(ids) && throw(ArgumentError("no tokens to process"))
-    if speculative !== nothing
-        sampling.temperature == 0 || throw(ArgumentError("speculative decoding supports only greedy decoding for now"))
-        return generate_speculative!(r, seq, ids, speculative; max_new_tokens, stop_ids, on_token, stats = spec_stats)
-    end
     seed = rand(rng, UInt32)
     device = on_device(sampling)
+    speculative === nothing || device ||
+        throw(ArgumentError("speculative decoding needs sampling on the device (top_k = $(sampling.top_k))"))
     if device
         reset_sampler!(r.sampler, sampling, seed)
+        speculative === nothing ||
+            return generate_speculative!(r, seq, ids, speculative; max_new_tokens, stop_ids, on_token, stats = spec_stats)
         pipeline && r.graphs && return generate_pipelined!(r, seq, ids; max_new_tokens, stop_ids, on_token)
     end
     generated = Int[]
