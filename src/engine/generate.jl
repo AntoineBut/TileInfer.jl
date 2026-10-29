@@ -5,7 +5,8 @@
 """
     generate!(runner, seq, ids; max_new_tokens = 256, sampling = SamplingParams(),
               stop_ids = model.config.eos_token_ids, rng = Random.default_rng(),
-              on_token = nothing, pipeline = true) -> Vector{Int}
+              on_token = nothing, pipeline = true, speculative = nothing,
+              spec_stats = SpecStats()) -> Vector{Int}
     generate!(model, cache, seq, ids; kwargs...)
 
 Continue `seq` with the 0-based token `ids` and generate up to `max_new_tokens` tokens.
@@ -17,12 +18,21 @@ The tokens are a function of the logits and one seed drawn from `rng` (see
 [`sample_host`](@ref)), however they are sampled: on the device when the sampling is
 [`on_device`](@ref), pipelined ([`generate_pipelined!`](@ref)) on a runner with CUDA graphs
 unless `pipeline = false`; otherwise on the host, step by step.
+
+With a proposer as `speculative` (such as [`NgramProposer`](@ref)), greedy decoding checks
+its drafts several tokens per step ([`generate_speculative!`](@ref)) and counts them in
+`spec_stats`. Sampled speculative decoding is not supported yet.
 """
 function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
                    max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
                    stop_ids = r.model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
-                   on_token = nothing, pipeline::Bool = true)
+                   on_token = nothing, pipeline::Bool = true, speculative = nothing,
+                   spec_stats::SpecStats = SpecStats())
     isempty(ids) && throw(ArgumentError("no tokens to process"))
+    if speculative !== nothing
+        sampling.temperature == 0 || throw(ArgumentError("speculative decoding supports only greedy decoding for now"))
+        return generate_speculative!(r, seq, ids, speculative; max_new_tokens, stop_ids, on_token, stats = spec_stats)
+    end
     seed = rand(rng, UInt32)
     device = on_device(sampling)
     if device

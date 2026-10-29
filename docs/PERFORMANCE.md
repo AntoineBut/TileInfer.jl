@@ -387,3 +387,25 @@ Verify-sized GEMMs (n = 2–8, bandwidth-bound) are within 1 % either way. The `
 hint did not help any GEMM or GEMV, and prefill attention stays at `occupancy = 2`
 (3 measured the same).
 
+
+## Speculative decoding, greedy with n-gram lookup (2026-10-29)
+
+`generate!(…; speculative = NgramProposer(k = …))`: prompt lookup proposes up to k tokens,
+one verify step of k + 1 tokens (all logits, argmax per position on the device, one graph
+per step length) accepts the matching prefix plus a bonus token, and `truncate!` drops the
+rejected keys and values. 200-token budget, BF16, best of 5, against greedy pipelined decoding
+(both include the prefill):
+
+| Prompt | Model | plain | k = 1 | k = 2 | k = 4 | k = 7 | tokens per step at k = 7 (acceptance) |
+|---|---|---|---|---|---|---|---|
+| rename two variables in a 15-line function (116 / 110 tokens out) | 0.6B | 424 tok/s | 1.65× | 2.22× | 3.19× | **4.15×** | 4.83 (0.63) |
+| | 4B | 78 tok/s | 1.65× | 2.08× | 2.87× | **3.75×** | 4.07 (0.53) |
+| short story (nothing to copy) | 0.6B | 434 tok/s | 0.96× | 0.97× | 0.97× | 0.96× | 1.05 (0.02) |
+| | 4B | 80 tok/s | 1.05× | 1.05× | 1.05× | 1.05× | 1.08 (0.03) |
+
+A verify step of 8 tokens costs little more than a decode step (the GEMMs at n = 8 still
+read the weights once), so the speedup tracks tokens per step. With no matches the loss
+on 0.6B is the host/GPU overlap of pipelined decoding: speculative steps synchronize to read
+the accepted count before proposing. In BFloat16 the outputs can part from plain greedy at
+near-ties (verify steps round differently than decode steps); in Float32 they are identical
+(test/engine/speculative.jl).

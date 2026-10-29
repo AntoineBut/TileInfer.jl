@@ -4,7 +4,8 @@ A single-GPU, single-client LLM inference engine in Julia. Every hot kernel is
 written in cuTile.jl. The goal is to learn how the engine works, so the code
 favours being clear and easy to instrument over supporting many features.
 
-Status (2026-10-29): M0–M6 done, and the first M8 fusions; M7 (speculative decoding) is next.
+Status (2026-10-29): M0–M6 done, and the first M8 fusions; M7 (speculative decoding) in progress:
+greedy verifier and n-gram proposer done, rejection sampling and the draft model next.
 Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB). Benchmarked on Qwen3-0.6B and Qwen3-4B.
 External documentation and papers are listed in [REFERENCES.md](REFERENCES.md).
 
@@ -111,7 +112,7 @@ TileInfer/
 │   │   ├── sampler.jl          # SamplingParams, sampling_uniform, host reference, TokenSampler
 │   │   ├── generate.jl         # generate!, generation defaults, TextStream
 │   │   ├── chat.jl             # ChatSession with prefix reuse
-│   │   └── spec_decode.jl      # proposers + verifier (planned, M7)
+│   │   └── speculative.jl      # n-gram proposer, greedy verify step, speculative generate (M7; rejection sampling planned)
 │   ├── ops/
 │   │   ├── interface.jl        # abstract backend + op signatures, fused-op fallbacks
 │   │   ├── reference.jl        # RefBackend
@@ -402,7 +403,7 @@ Versions are as of 2026-10-26, checked against the repos.
 | M4 ✅ | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | done 2026-10-27 (`src/ops/tile/`): element-wise kernels bit-identical to the reference, linear ≤ 1 BF16 ulp; whole model on TileBackend matches the HF Float32 fixtures (identical greedy continuations). Decode GEMV 68–93 % of the DRAM roofline (1.0–1.3× cuBLAS); prefill GEMM 0.70–0.92× cuBLAS; rope/rmsnorm/store_kv/embed 3–29× the reference. End to end: prefill 1.47×, decode only 1.13× — the reference attention fallback (≈1 ms/layer, ~6k GPU allocations per token, GC spikes) dominates until M5; tiny decode kernels sit at the ~5.5 µs launch floor until CUDA graphs (M6) |
 | M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
 | M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
-| M7 | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report |
+| M7 (in progress) | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report. Greedy verifier + n-gram proposer done 2026-10-29 (`src/engine/speculative.jl`): verify steps (all-token logits + device argmax per position) captured as graphs; same tokens and cache state as plain greedy in Float32. Code-editing prompt: 4.15× (0.6B) / 3.75× (4B) at k = 7; open-ended text with nothing to copy 0.96× / 1.05×. Next: rejection sampling for temperature > 0, draft-model proposer |
 | M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see PERFORMANCE.md): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device sampling (greedy, temperature / top-k / top-p) inside the graph with pipelined decode, per-shape GEMM tiles. Decode is at 73 % of the roofline on 0.6B and 88 % on 4B, sampled as fast as greedy (M8 target met on 4B only). Not pursued: attention combine fused into the split kernel (slower) |
 
 ## 14. Open questions / spikes
