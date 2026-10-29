@@ -36,7 +36,8 @@ with the reason, so they are not retried blindly.
 | M4 (cuTile kernels, reference attention) | 34.77 ms | 29 | 54.0 ms | 9.5k | norm, rope, kv_write, silu, embed, GEMV, GEMM |
 | M5 (paged flash-attention) | 3.80 ms | 263 | 16.0 ms | 32k | prefill FA-2, split-KV decode |
 | M6 (CUDA graphs) | 2.87 ms (graph) | 348 | 11.8 ms | 43k | allocation-free step, graph replay |
-| perf branch | 2.47 ms (pipelined) | 405 | 9.0 ms | 57k | fusions, device sampling, host/GPU overlap |
+| perf branch | 2.47 ms (pipelined) | 405 | 9.0 ms | 57k | fusions, device greedy sampling, host/GPU overlap |
+| device sampling | 2.46 ms (sampled) | 407 | 9.0 ms | 57k | top-k/top-p sampling in the graph: sampled decode as fast as greedy |
 
 From M3: decode 15.7× faster, prefill 8.5×. Race: **418 tok/s decode, 53k tok/s prefill**,
 3.6 % faster end to end than vLLM on the same machine (see the end).
@@ -317,7 +318,7 @@ Upper bounds from the tables above (removing the whole excess):
 
 | Target | Where it shows | At most |
 |---|---|---|
-| Device top-k/top-p sampling, pipelined like greedy | sampled decode | 0.7–0.9 ms per token: 1.36× on 0.6B, 1.05× on 4B |
+| ~~Device top-k/top-p sampling, pipelined like greedy~~ (done, see "Device sampling") | sampled decode | 0.7–0.9 ms per token: 1.36× on 0.6B, 1.05× on 4B |
 | Prefill GEMMs at n = 512 to cuBLAS (larger tiles, split-K for under-filled shapes such as 0.6B down) | prefill512 | up to ~10 % of the step (4B: ~5 ms) |
 | Prefill GEMMs at n = 64 to GEMV bandwidth | prefill64 | ~10–20 % of the GEMM time |
 | Layer GEMVs from 90–93 % to the lm_head's 95 % (4B), fill/drain of small GEMVs (0.6B) | decode | 4B ~3 %, 0.6B ~11 % |
@@ -325,3 +326,42 @@ Upper bounds from the tables above (removing the whole excess):
 | Attention decode (latency-bound at 1k positions) | decode, long contexts | 0.6B ~6 %, grows with context |
 | `q_inputs_kernel` with several tokens per block | prefill512 | 0.6B ~4 % |
 | Graphs (or fewer launches) for short prefills | 0.6B prefill64 | ~9 % |
+
+## Device sampling (2026-10-29)
+
+Temperature / top-k / top-p sampling now runs on the device inside the captured decode step
+(`sample_token!`, `src/ops/tile/sampling.jl`), so sampled decoding is pipelined like greedy
+(`generate_pipelined!`); greedy is top-1 through the same kernels, and `argmax_token!` is gone.
+A token is a function of the logits and u = `sampling_uniform(seed, counter)` (a hash of a
+per-generation seed and a device-side counter), so the device and `sample_host` pick the same
+tokens and the tests compare them token by token. Device sampling covers top_k ≤ 64; other
+settings (e.g. top_k = 0) still sample on the host, step by step. Baseline `sampling-before`
+(a313e48), result `sampling-after`.
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| Decode, sampled (Qwen3 defaults: T 0.6, top-k 20, top-p 0.95) | 3.32 → **2.46 ms/token (1.35×)**, 407 tok/s | 13.34 → **12.72 ms/token (1.05×)** |
+| Decode, greedy pipelined | 2.44 ms/token (unchanged) | 12.71 ms/token (unchanged) |
+| Sampled vs greedy | +0.5 % | +0.1 % |
+
+Kernel time per token inside the 0.6B graph (`bench/breakdown.jl`), chunk kernel + final block:
+
+| Version | top-k 20 (µs) | top-1 / greedy (µs) | Note |
+|---|---|---|---|
+| Old argmax (greedy only) | — | 4.2 | |
+| 1: repeated `maximum` + `argmax` over values and ids | 10.0 + 11.0 = 21.0 | 2.3 + 3.3 = 5.6 | |
+| 2: `argmax` over ids only, values gathered from the logits | 8.4 + 10.8 = 19.2 | 2.2 + 4.1 | |
+| `maximum` then `minimum` of the positions holding it | 8.9 + 11.2 = 20.1 | — | **reverted**: two plain reductions cost as much as one `argmax` |
+| **3: argmax reducer without NaN handling** (`FirstMax`) | **7.4 + 9.8 = 17.2** | 2.2 + 4.0 = 6.2 | kept |
+| Three levels (1024-logit chunks, 16-list merge, final) | 6.4 + 5.4 + 7.2 = 19.0 | — | **reverted** |
+| 8192-logit chunks, 2048-candidate final tile | 9.7 + 8.1 = 17.8 | — | **reverted**: no better |
+
+- **The cost is the number of sequential block-wide reductions**, not the data: selection is
+  top_k repeated argmax per kernel, and one costs 0.3–0.5 µs on 128 threads whatever the
+  tile (0.32 µs at 1,024 elements, 0.37 at 4,096, 0.48 at 8,192). Smaller tiles in more
+  kernels only add reductions. Under `ncu` both kernels issue an instruction every 3–4
+  cycles with ~8 % achieved occupancy: latency-bound, one warp per scheduler.
+- **17 µs is 0.7 % of a 0.6B token**; going further needs fewer than top_k sequential
+  reductions (e.g. a threshold found by counting, then sorting a small candidate set by
+  pairwise comparison), not worth it at this size.
+

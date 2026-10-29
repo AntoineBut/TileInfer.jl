@@ -85,8 +85,7 @@ vLLM as the reference for the paged KV design.
 
 ## 3. Module layout
 
-As built so far; files for later milestones (scheduler, spec decoding, sampling kernels
-beyond greedy) are marked *(planned)*.
+As built so far; files for later milestones (scheduler, spec decoding) are marked *(planned)*.
 
 ```
 TileInfer/
@@ -108,8 +107,8 @@ TileInfer/
 │   │   ├── paged_cache.jl      # PagedKVCache{T}: per-layer page pools
 │   │   └── block_manager.jl    # Sequence, free list, block tables, truncate (spec rollback)
 │   ├── engine/
-│   │   ├── runner.jl           # ModelRunner: CUDA graphs per token count, pipelined greedy decode
-│   │   ├── sampler.jl          # SamplingParams, host sampling
+│   │   ├── runner.jl           # ModelRunner: CUDA graphs per token count, pipelined decode
+│   │   ├── sampler.jl          # SamplingParams, sampling_uniform, host reference, TokenSampler
 │   │   ├── generate.jl         # generate!, generation defaults, TextStream
 │   │   ├── chat.jl             # ChatSession with prefix reuse
 │   │   └── spec_decode.jl      # proposers + verifier (planned, M7)
@@ -120,7 +119,7 @@ TileInfer/
 │   │       ├── norm.jl  elementwise.jl (rope, silu, kv_write, embed)  linear.jl (GEMV, GEMM)
 │   │       ├── fused.jl        # attention inputs: q/k norm + rope + KV write
 │   │       ├── attention.jl    # paged flash-attention: prefill, split-KV decode + combine
-│   │       └── sampling.jl     # device argmax (top-k/top-p and spec_verify planned)
+│   │       └── sampling.jl     # device top-k/top-p sampling, greedy as top-1 (spec_verify planned)
 │   └── cli.jl
 ├── test/                       # per-op tests vs reference; e2e vs HF logits
 ├── bench/                      # per-kernel + end-to-end tok/s, NVTX ranges
@@ -234,7 +233,7 @@ batch size of 1.
 | 6 | `silu_mul!` | both | later fused into the gate_up GEMM epilogue |
 | 7 | `attention_prefill!` | prefill | FA-2 online softmax from `examples/fmha.jl`, walking the block table one page (= one KV tile) per step; only diagonal pages masked |
 | 8 | `attention_decode!` | decode/verify (≤ 8 tokens) | flash-decoding: GQA-packed query tile, fixed split count (grid independent of context), FP32 partials, combine kernel |
-| 9 | `sample!` | both | argmax / temperature / top-k / top-p (sort-free: threshold search or Gumbel-max) |
+| 9 | `sample_token!` | decode | temperature / top-k (≤ 64) / top-p, greedy as top-1: per-chunk top-k by repeated argmax, then one block merges and samples by inverse transform with a counter-based uniform; done 2026-10-29 |
 | 10 | `spec_verify!` | spec | parallel rejection sampling over k drafts, accept-length per sequence |
 | 11 | `embedding!` | both | `ct.gather` on rows |
 
@@ -404,7 +403,7 @@ Versions are as of 2026-10-26, checked against the repos.
 | M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
 | M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
 | M7 | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report |
-| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see PERFORMANCE.md): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device argmax with pipelined greedy decode, per-shape GEMM tiles. Greedy decode is at 73 % of the roofline on 0.6B and 88 % on 4B (M8 target met on 4B only); sampled decoding still samples on the host (step by step). Not pursued: attention combine fused into the split kernel (slower) |
+| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see PERFORMANCE.md): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device sampling (greedy, temperature / top-k / top-p) inside the graph with pipelined decode, per-shape GEMM tiles. Decode is at 73 % of the roofline on 0.6B and 88 % on 4B, sampled as fast as greedy (M8 target met on 4B only). Not pursued: attention combine fused into the split kernel (slower) |
 
 ## 14. Open questions / spikes
 

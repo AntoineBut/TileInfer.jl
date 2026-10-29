@@ -5,27 +5,38 @@
 """
     generate!(runner, seq, ids; max_new_tokens = 256, sampling = SamplingParams(),
               stop_ids = model.config.eos_token_ids, rng = Random.default_rng(),
-              on_token = nothing) -> Vector{Int}
+              on_token = nothing, pipeline = true) -> Vector{Int}
     generate!(model, cache, seq, ids; kwargs...)
 
 Continue `seq` with the 0-based token `ids` and generate up to `max_new_tokens` tokens.
 Returns the new token ids, without the stop token. `on_token(id)` is called after each
 new token, for streaming. Afterwards `seq` holds `ids` and every generated token except
-the last one, which was sampled but never run through the model. Greedy decoding on a
-runner with CUDA graphs is pipelined ([`generate_greedy!`](@ref)) unless `pipeline = false`.
+the last one, which was sampled but never run through the model.
+
+The tokens are a function of the logits and one seed drawn from `rng` (see
+[`sample_host`](@ref)), however they are sampled: on the device when the sampling is
+[`on_device`](@ref), pipelined ([`generate_pipelined!`](@ref)) on a runner with CUDA graphs
+unless `pipeline = false`; otherwise on the host, step by step.
 """
 function generate!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer};
                    max_new_tokens::Integer = 256, sampling::SamplingParams = SamplingParams(),
                    stop_ids = r.model.config.eos_token_ids, rng::AbstractRNG = Random.default_rng(),
                    on_token = nothing, pipeline::Bool = true)
     isempty(ids) && throw(ArgumentError("no tokens to process"))
-    # Greedy decoding with graphs runs pipelined, the host one step behind the GPU.
-    pipeline && sampling.temperature == 0 && r.graphs &&
-        return generate_greedy!(r, seq, ids; max_new_tokens, stop_ids, on_token)
+    seed = rand(rng, UInt32)
+    device = on_device(sampling)
+    if device
+        reset_sampler!(r.sampler, sampling, seed)
+        pipeline && r.graphs && return generate_pipelined!(r, seq, ids; max_new_tokens, stop_ids, on_token)
+    end
     generated = Int[]
     logits = forward!(r, seq, ids)
-    for _ in 1:max_new_tokens
-        id = NVTX.@range "sample" sample(vec(logits), sampling, rng)
+    for counter in 0:max_new_tokens-1
+        id = NVTX.@range "sample" if device
+            Int(Array(sample_token!(r.model.backend, r.token, r.token, logits, r.sampler))[1])
+        else
+            sample_host(vec(Array(logits)), sampling, sampling_uniform(seed, UInt32(counter)))
+        end
         id in stop_ids && break
         push!(generated, id)
         on_token === nothing || on_token(id)

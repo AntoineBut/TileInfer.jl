@@ -154,15 +154,49 @@ using Random: randperm
         end
     end
 
-    @testset "argmax_token (vocab = $V)" for V in (151936, 5000, 4096)
-        ids, mirror, scratch = CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1), TileInfer.argmax_scratch(V)
-        for trial in 1:3
-            logits = randn(Float32, V, 1)
-            trial == 2 && (logits[[17, V ÷ 2, V], 1] .= 100)        # ties: the first one wins
-            trial == 3 && (logits[V, 1] = 100)                       # in the last, padded chunk
-            TileInfer.argmax_token!(tile, ids, mirror, CuArray(logits), scratch)
-            @test Array(ids)[1] == Array(mirror)[1] == argmax(vec(logits)) - 1
+    # The device sampler must pick the token sample_host picks with the same uniform number,
+    # except where Float32 round-off can move a decision: u or top_p within 1e-5 of a
+    # cumulative-mass boundary (checked by perturbing them on the host).
+    @testset "sample_token (vocab = $V)" for V in (151936, 5000, 4096)
+        ids, mirror = CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1)
+        s = TileInfer.TokenSampler(V)
+        function robust(logits, p, u)
+            t = TileInfer.sample_host(logits, p, u)
+            alts = [(u - 1f-5, p.top_p), (u + 1f-5, p.top_p), (u, p.top_p - 1e-5), (u, min(1, p.top_p + 1e-5))]
+            all(TileInfer.sample_host(logits, TileInfer.SamplingParams(p.temperature, p.top_k, tp), clamp(v, 0, 1)) == t
+                for (v, tp) in alts) || return nothing
+            return t
         end
+        checked = skipped = 0
+        for case in 1:6, (temperature, top_k, top_p) in ((0, 0, 1), (1, 1, 1), (1, 2, 1), (0.6, 20, 0.95),
+                                                           (1.5, 64, 1), (0.3, 64, 0.5), (1, 37, 0.99))
+            logits = randn(Float32, V) .* (case == 2 ? 0.01f0 : 3)                 # case 2: nearly flat
+            case == 3 && (logits[[17, V ÷ 2, V]] .= 50)                              # ties
+            case == 4 && (logits[end-63:end] .= 20 .+ randn(Float32, 64))           # all in the last chunk
+            case == 5 && (logits[1:2:200] .= 10)                                     # ties across the k-th
+            case == 6 && (logits .= round.(logits))                                  # many ties everywhere
+            p = TileInfer.SamplingParams(; temperature, top_k, top_p)
+            seed = rand(UInt32)
+            TileInfer.reset_sampler!(s, p, seed)
+            for counter in UInt32(0):UInt32(9)
+                TileInfer.sample_token!(tile, ids, mirror, CuArray(reshape(logits, V, 1)), s)
+                @test Array(ids)[1] == Array(mirror)[1]
+                expected = robust(logits, p, TileInfer.sampling_uniform(seed, counter))
+                expected === nothing && (skipped += 1; continue)
+                checked += 1
+                Array(ids)[1] == expected || @test Array(ids)[1] == expected
+            end
+            @test Array(s.state)[3] == 10                                            # counter advanced
+        end
+        @test skipped < checked ÷ 20       # mostly case 5, whose equal tokens put top_p on a boundary
+        # The fallback runs sample_host itself, so it is exact.
+        logits = CUDA.randn(Float32, V, 1) .* 3
+        p = TileInfer.SamplingParams(temperature = 0.6, top_k = 20, top_p = 0.95)
+        TileInfer.reset_sampler!(s, p, UInt32(5))
+        TileInfer.sample_token!(ref, ids, mirror, logits, s)
+        @test Array(ids)[1] == Array(mirror)[1] ==
+              TileInfer.sample_host(vec(Array(logits)), p, TileInfer.sampling_uniform(UInt32(5), UInt32(0)))
+        @test Array(s.state)[3] == 1
     end
 
     @test TileInfer.has_kernel(tile, TileInfer.attention)

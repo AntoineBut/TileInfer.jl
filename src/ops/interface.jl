@@ -132,16 +132,19 @@ function add_rmsnorm!(be::Backend, x, h, delta, w, eps)
 end
 
 """
-    argmax_token!(backend, ids, mirror, logits, scratch)
+    sample_token!(backend, ids, mirror, logits, sampler)
 
-Greedy sampling of the logits (vocab, 1): the 0-based argmax, written to `ids[1]` and
-`mirror[1]`. On TileBackend this runs on the device and can be captured in a graph.
-`scratch` comes from `argmax_scratch(vocab)`.
+Sample a token from the logits (vocab, 1) with the parameters and seed of the
+[`TokenSampler`](@ref) `sampler` and its next counter, which it advances. The 0-based token
+goes to `ids[1]` and `mirror[1]`, as [`sample_host`](@ref) picks it. On TileBackend this runs
+on the device and can be captured in a graph.
 """
-function argmax_token!(::Backend, ids, mirror, logits, scratch)
-    token = Int32[argmax(vec(Array(logits))) - 1]
+function sample_token!(::Backend, ids, mirror, logits, s)
+    state = Array(s.state)
+    token = Int32[sample_host(vec(Array(logits)), s.sampling, sampling_uniform(s.seed, state[3]))]
     copyto!(ids, token)
     copyto!(mirror, token)
+    copyto!(s.state, UInt32[state[1], state[2], state[3] + 1])
     return ids
 end
 

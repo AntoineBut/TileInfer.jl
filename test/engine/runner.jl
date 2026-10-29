@@ -1,6 +1,8 @@
 # ModelRunner: steps replayed from CUDA graphs against eager forward! steps on a second
 # cache. Both run the same kernels on the same inputs, so the logits must be bit-identical.
 
+using Random: Xoshiro
+
 if test_model_dir() !== nothing
     @testset "model runner" begin
         m = TileInfer.load_model(TEST_MODEL; backend = TileBackend(), max_len = 256)
@@ -37,27 +39,57 @@ if test_model_dir() !== nothing
             @test CUDA.@allocated(TileInfer.run_step!(m, cache, b)) == 0
         end
 
-        @testset "generation with and without graphs" begin
+        sampled = TileInfer.SamplingParams(temperature = 0.6, top_k = 20, top_p = 0.95)
+
+        @testset "generation with and without graphs ($(p.temperature == 0 ? "greedy" : "sampled"))" for p in
+                (TileInfer.SamplingParams(), sampled)
             function gen(graphs)
                 c = new_cache()
                 return TileInfer.generate!(TileInfer.ModelRunner(m, c; graphs), TileInfer.new_sequence(c), prompt;
-                                           max_new_tokens = 30, stop_ids = Int[])
+                                           max_new_tokens = 30, stop_ids = Int[], sampling = p, rng = Xoshiro(3))
             end
             @test gen(true) == gen(false)                         # pipelined vs step by step
         end
 
-        @testset "pipelined greedy decoding stops like the plain loop" begin
+        @testset "pipelined decoding stops like the plain loop ($(p.temperature == 0 ? "greedy" : "sampled"))" for p in
+                (TileInfer.SamplingParams(), sampled)
             function run(graphs, stop_ids)
                 c = new_cache()
                 s = TileInfer.new_sequence(c)
                 out = TileInfer.generate!(TileInfer.ModelRunner(m, c; graphs), s, prompt;
-                                          max_new_tokens = 12, stop_ids)
+                                          max_new_tokens = 12, stop_ids, sampling = p, rng = Xoshiro(4))
                 return out, copy(s.tokens), copy(s.block_table)
             end
             full, = run(false, Int[])
             for stop_ids in ([full[6]], Int[])                         # stop token, budget
                 @test run(true, stop_ids) == run(false, stop_ids)
             end
+        end
+
+        @testset "sampled tokens follow sample_host" begin
+            c = new_cache()
+            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c), prompt;
+                                      max_new_tokens = 40, stop_ids = Int[], sampling = sampled, rng = Xoshiro(5))
+            seed = rand(Xoshiro(5), UInt32)
+            eager_c = new_cache()
+            eager_s = TileInfer.new_sequence(eager_c)
+            logits = TileInfer.forward!(m, eager_c, eager_s, prompt)
+            expected = Int[]
+            for counter in UInt32(0):UInt32(39)
+                push!(expected, TileInfer.sample_host(vec(Array(logits)), sampled,
+                                                      TileInfer.sampling_uniform(seed, counter)))
+                logits = TileInfer.forward!(m, eager_c, eager_s, [expected[end]])
+            end
+            @test out == expected
+            @test length(unique(out)) > 10                        # not stuck on one token
+            # Settings the device cannot sample run on the host and follow the same rule.
+            wide = TileInfer.SamplingParams(temperature = 0.6, top_k = 0, top_p = 0.95)
+            c = new_cache()
+            out = TileInfer.generate!(TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c), prompt;
+                                      max_new_tokens = 3, stop_ids = Int[], sampling = wide, rng = Xoshiro(5))
+            c = new_cache()
+            logits = TileInfer.forward!(m, c, TileInfer.new_sequence(c), prompt)
+            @test out[1] == TileInfer.sample_host(vec(Array(logits)), wide, TileInfer.sampling_uniform(seed, UInt32(0)))
         end
 
         @testset "reference backend steps run eagerly" begin

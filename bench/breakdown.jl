@@ -7,7 +7,7 @@
 #
 # Steps, for each model on TileBackend:
 #   decode           GEN greedy tokens after CONTEXT - 1 cached positions, pipelined
-#   decode_sampled   the same with the model's recommended sampling (on the host)
+#   decode_sampled   the same with the model's recommended sampling
 #   prefill64/512    a SHORT- or PREFILL-token prompt
 #
 # Each step is split into a prologue (embedding, first norm), num_layers repeats of the

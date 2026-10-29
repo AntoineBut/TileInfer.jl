@@ -109,7 +109,7 @@ Two things it handles, because they bit:
 The host side of generation is annotated with NVTX ranges: `prefill`, and for steps
 through a `ModelRunner` `upload inputs`, `eager step` / `capture step` (first step of a
 token count) and `replay step`, then `sample` in `generate!`. `sample` includes waiting
-for the asynchronous step, since `argmax` synchronizes. Without installing anything,
+for the asynchronous step, since reading the token synchronizes. Without installing anything,
 CUDA.jl's integrated profiler prints a table of them next to the kernels:
 
 ```julia

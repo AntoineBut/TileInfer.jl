@@ -192,9 +192,13 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
                 () -> (rnd(D, nq, n), pools()..., rnd((nq + 2nkv) * D, n), layer.q_norm, layer.k_norm, model.rope,
                        CuArray(Int32.(start:len-1)), CuArray(Int32.(start+1:start+n)), eps);
                 bytes = (2.0 * nq + 4.0 * nkv + 2.0) * D * n * B)  # qkv in, q and k/v out, rope table
-        n == 1 && add_op!(suite, info, filter, ops("argmax"), TileInfer.argmax_token!,
+        # Device sampling with the model's recommended settings (top-1 if it is greedy).
+        n == 1 && add_op!(suite, info, filter, ops("sample"), TileInfer.sample_token!,
                           () -> (CuVector{Int32}(undef, 1), CuVector{Int32}(undef, 1),
-                                 CUDA.rand(Float32, cfg.vocab_size, 1), TileInfer.argmax_scratch(cfg.vocab_size));
+                                 CUDA.rand(Float32, cfg.vocab_size, 1),
+                                 TileInfer.reset_sampler!(TileInfer.TokenSampler(cfg.vocab_size),
+                                                          TileInfer.on_device(sampling) ? sampling : SamplingParams(),
+                                                          UInt32(1)));
                           bytes = 4.0 * cfg.vocab_size)
     end
 
@@ -262,7 +266,7 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
             end
             # Generation of GEN tokens (times are per call; tok/s per token): greedy with the
             # host one step behind the GPU, greedy step by step, and with the model's
-            # sampling (on the host, so step by step).
+            # sampling (pipelined when it can be sampled on the device).
             for (key, (_, sp, pipeline)) in zip(gen_keys, gen_modes)
                 occursin(filter, key) || continue
                 rng = Xoshiro(1)
