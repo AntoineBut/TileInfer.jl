@@ -38,6 +38,7 @@ with the reason, so they are not retried blindly.
 | M6 (CUDA graphs) | 2.87 ms (graph) | 348 | 11.8 ms | 43k | allocation-free step, graph replay |
 | perf branch | 2.47 ms (pipelined) | 405 | 9.0 ms | 57k | fusions, device greedy sampling, host/GPU overlap |
 | device sampling | 2.46 ms (sampled) | 407 | 9.0 ms | 57k | top-k/top-p sampling in the graph: sampled decode as fast as greedy |
+| GEMM occupancy | 2.46 ms (sampled) | 407 | 8.8 ms | 58k | two GEMM blocks per SM on large grids (4B prefill 512: 1.06×) |
 
 From M3: decode 15.7× faster, prefill 8.5×. Race: **418 tok/s decode, 53k tok/s prefill**,
 3.6 % faster end to end than vLLM on the same machine (see the end).
@@ -364,4 +365,25 @@ Kernel time per token inside the 0.6B graph (`bench/breakdown.jl`), chunk kernel
 - **17 µs is 0.7 % of a 0.6B token**; going further needs fewer than top_k sequential
   reductions (e.g. a threshold found by counting, then sorting a small candidate set by
   pairwise comparison), not worth it at this size.
+
+## GEMM occupancy (2026-10-29)
+
+From the codegen audit (docs/CUTILE_QUIRKS.md): the prefill GEMM never set the `occupancy`
+hint. With `occupancy = 2`, tileiras fits two blocks per SM by trimming each block's
+registers and shared memory: grids of ≥ 2 blocks per SM gain latency hiding, smaller grids
+only lose resources. `gemm_occupancy` applies it to grids of ≥ 160 blocks. Baseline
+`gemm-occ-before`, result `gemm-occ-rule`:
+
+| | everywhere | ≥ 2 blocks per SM only (kept) |
+|---|---|---|
+| 4B gate_up / qkv / SwiGLU, n = 512 (608 / 192 / 608 blocks) | 1.11× / 1.08× / 1.11× | 1.12× / 1.10× / 1.11× |
+| 4B o / down, n = 512 (80 blocks) | 0.97× / 0.96× | 0.99× / 1.01× |
+| 0.6B o / down, n = 512 (32 blocks) | **0.86× / 0.89×** | 1.00× / 0.95× |
+| 0.6B gate_up / SwiGLU, n = 64 (192 blocks) | 1.22× / 1.19× | 1.22× / 1.19× |
+| **Prefill 512**: 4B / 0.6B | 1.05× / 1.01× | **1.06× (47.8 → 45.2 ms) / 1.02×** |
+| **Prefill 64**: 4B / 0.6B | 1.01× / 1.07× | 1.01× / 1.04× |
+
+Verify-sized GEMMs (n = 2–8, bandwidth-bound) are within 1 % either way. The `latency`
+hint did not help any GEMM or GEMV, and prefill attention stays at `occupancy = 2`
+(3 measured the same).
 

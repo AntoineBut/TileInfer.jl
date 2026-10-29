@@ -102,6 +102,11 @@ function gemm_config(out::Integer, n::Integer, sms::Integer = num_sms())
     return best
 end
 
+# Two GEMM blocks per SM when the grid has enough of them: the second hides the first's
+# latency (4B gate_up at n = 512: 1.11×), but tileiras trims registers and shared memory to
+# fit both, which slows grids that leave one block per SM (0.6B o/down at n = 512: 0.86×).
+gemm_occupancy(blocks::Integer, sms::Integer = num_sms()) = blocks >= 2sms ? 2 : 1
+
 function linear!(::TileBackend, y::CuMatrix{S}, W::CuMatrix{T}, x::CuMatrix{T}) where {S,T}
     in, out = size(W)
     n = size(x, 2)
@@ -110,7 +115,8 @@ function linear!(::TileBackend, y::CuMatrix{S}, W::CuMatrix{T}, x::CuMatrix{T}) 
         @cuda backend = cuTile blocks = cld(out, TM) gemv_kernel(y, W, x, ct.Constant(TK), ct.Constant(TM))
     else
         TM, TN, TK = gemm_config(out, n)
-        @cuda backend = cuTile blocks = cld(out, TM) * cld(n, TN) gemm_kernel(
+        blocks = cld(out, TM) * cld(n, TN)
+        @cuda backend = cuTile blocks occupancy = gemm_occupancy(blocks) gemm_kernel(
             y, W, x, ct.Constant(TM), ct.Constant(TN), ct.Constant(TK))
     end
     return y
