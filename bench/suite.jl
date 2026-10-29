@@ -1,7 +1,8 @@
-# Benchmark suite: every op at the model's real shapes, at decode (1 token) and prefill
+# Benchmark suite: every op at a model's real shapes, at decode (1 token) and prefill
 # (64 and 512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
-# CUDA graph where the backend supports it), for every backend that implements them. Used
-# by bench/run.jl.
+# CUDA graph where the backend supports it), for every backend that implements them. Keys
+# start with the model ("Qwen3-4B/ops/linear_qkv/decode/tile"); bench/run.jl and
+# bench/profile.jl run the suite for each model of MODELS in turn.
 #
 # Each benchmark also records the bytes it must move and the FLOPs it must do, so results
 # can be read against the GPU's roofline. Op samples run OP_REPS calls back to back and
@@ -12,7 +13,14 @@ using BenchmarkTools: leaves
 using CUDA
 using BFloat16s: BFloat16
 using TileInfer
-using TileInfer: DecoderLM, PagedKVCache, RefBackend, TileBackend
+using TileInfer: DecoderLM, PagedKVCache, RefBackend, SamplingParams, TileBackend
+using Random: Xoshiro
+
+"Models benchmarked by default: a small one, dominated by per-kernel overheads, and a large one."
+const MODELS = ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B")
+
+"The first segment of a model's benchmark keys: the repo name without its owner."
+model_label(repo::AbstractString) = basename(repo)
 
 const OP_REPS = 20
 const PREFILL = 512
@@ -20,13 +28,51 @@ const SHORT = 64            # a short prompt, or a follow-up turn of a chat
 const CONTEXT = 1024        # cached positions seen by decode attention / decode steps
 const GEN = 64              # tokens per generation benchmark
 
+"""
+    OpArgs(make_args, copies)
+
+The argument tuples of an op benchmark: `copies` independent ones, cycled through OP_REPS
+calls. Allocated on first use and dropped by `free!` once the benchmark has run, so that
+only one benchmark's copies (≥ 2× L2, or one 200 MB weight) occupy the GPU at a time next
+to the model's weights.
+"""
+mutable struct OpArgs{F}
+    const make_args::F
+    const copies::Int
+    calls::Union{Nothing,Vector}
+end
+
+OpArgs(make_args, copies) = OpArgs(make_args, copies, nothing)
+
+function calls!(a::OpArgs)
+    if a.calls === nothing
+        argsets = [a.make_args() for _ in 1:a.copies]
+        a.calls = [argsets[mod1(i, a.copies)] for i in 1:OP_REPS]
+    end
+    return a.calls
+end
+
+free!(a::OpArgs) = (a.calls = nothing; a)
+
+# One op sample: OP_REPS calls back to back, then one sync. Behind a function barrier, so the
+# loop is compiled for the concrete type of `calls`.
+function run_calls(op, be, calls)
+    for args in calls
+        op(be, args...)
+    end
+    CUDA.synchronize()
+end
+
 "What a benchmark measures, for the report."
 struct Workload
     reps::Int               # calls per sample
     bytes::Float64          # minimum device memory traffic of one call
     flops::Float64          # arithmetic of one call
     tokens::Int             # tokens processed by one call (model benchmarks)
+    args::Union{Nothing,OpArgs}   # an op benchmark's arguments, freed after it has run
 end
+
+Workload(reps, bytes, flops, tokens) = Workload(reps, bytes, flops, tokens, nothing)
 
 const BACKENDS = (RefBackend(), TileBackend())
 
@@ -56,39 +102,37 @@ function add_op!(suite, info, filter, path, op, make_args; bytes, flops = 0.0)
     keys = [join([path..., backend_name(be)], "/") for be in BACKENDS]
     any(k -> occursin(filter, k), keys) || return
     copies = clamp(cld(2 * L2_BYTES, round(Int, bytes)), 1, OP_REPS)
-    argsets = [make_args() for _ in 1:copies]
-    calls = [argsets[mod1(i, copies)] for i in 1:OP_REPS]
+    argtypes = map(typeof, make_args())                 # one set, only for its types
+    args = OpArgs(make_args, copies)
     for be in BACKENDS
         key = [path..., backend_name(be)]
         # Skip backends without the op, and fallbacks that would only repeat another backend.
-        occursin(filter, join(key, "/")) && applicable(op, be, first(argsets)...) &&
+        occursin(filter, join(key, "/")) && hasmethod(op, Tuple{typeof(be), argtypes...}) &&
             TileInfer.has_kernel(be, op) || continue
-        setleaf!(suite, key, @benchmarkable begin
-            for args in $calls
-                $op($be, args...)
-            end
-            CUDA.synchronize()
-        end evals = 1)
-        info[join(key, "/")] = Workload(OP_REPS, bytes, flops, 0)
+        setleaf!(suite, key, @benchmarkable run_calls($op, $be, calls!($args)) evals = 1)
+        info[join(key, "/")] = Workload(OP_REPS, bytes, flops, 0, args)
     end
 end
 
 """
-    build_suite(model; filter = r"") -> (suite, info)
+    build_suite(model, label; filter = r"", sampling = SamplingParams()) -> (suite, info)
 
 Benchmarks for `model` (a DecoderLM; its backend is ignored), keyed
-"ops/<op>/<size>/<backend>" and "model/<step>/<backend>", restricted to keys matching
-`filter`. `info` maps keys to their [`Workload`](@ref).
+"<label>/ops/<op>/<size>/<backend>" and "<label>/model/<step>/<backend>", restricted to keys
+matching `filter`. `info` maps keys to their [`Workload`](@ref). `sampling` is the model's
+recommended sampling (see `TileInfer.generation_defaults`), for a sampled generation
+benchmark when it is not greedy.
 """
-function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
+function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex = r"",
+                     sampling::SamplingParams = SamplingParams()) where {T}
     cfg, w = model.config, model.weights
     H, I, D, nq, nkv = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
     eps, B = cfg.rms_norm_eps, sizeof(T)
     suite, info = BenchmarkGroup(), Dict{String,Workload}()
     rnd(dims...) = CUDA.rand(T, dims...)
 
-    for (label, n) in (("decode", 1), ("prefill$SHORT", SHORT), ("prefill$PREFILL", PREFILL))
-        ops(name) = ["ops", name, label]
+    for (size_label, n) in (("decode", 1), ("prefill$SHORT", SHORT), ("prefill$PREFILL", PREFILL))
+        ops(name) = [label, "ops", name, size_label]
         ids() = CuArray(rand(Int32(0):Int32(cfg.vocab_size - 1), n))
         # Reads one table column per token and writes it: the table is shared, not copied.
         add_op!(suite, info, filter, ops("embed"), TileInfer.embed, () -> (w.embed, ids()); bytes = 2.0 * H * n * B)
@@ -131,10 +175,13 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
     params = weights / sizeof(T)
     for be in BACKENDS
         name = backend_name(be)
-        prefill_keys = ("model/prefill$SHORT/$name", "model/prefill$PREFILL/$name")
-        decode_key = "model/decode_ctx$CONTEXT/$name"
-        graph_key = "model/decode_graph_ctx$CONTEXT/$name"           # through a ModelRunner
-        gen_keys = ("model/generate$(GEN)_ctx$CONTEXT/$name", "model/generate$(GEN)_unpipelined_ctx$CONTEXT/$name")
+        prefill_keys = ("$label/model/prefill$SHORT/$name", "$label/model/prefill$PREFILL/$name")
+        decode_key = "$label/model/decode_ctx$CONTEXT/$name"
+        graph_key = "$label/model/decode_graph_ctx$CONTEXT/$name"    # through a ModelRunner
+        # Greedy generation, pipelined and step by step, and with the model's sampling.
+        gen_modes = [("", SamplingParams(), true), ("_unpipelined", SamplingParams(), false)]
+        sampling.temperature > 0 && push!(gen_modes, ("_sampled", sampling, true))
+        gen_keys = ["$label/model/generate$(GEN)$(suffix)_ctx$CONTEXT/$name" for (suffix, _, _) in gen_modes]
         keys = TileInfer.supports_graphs(be) ? (prefill_keys..., decode_key, graph_key, gen_keys...) :
                                                (prefill_keys..., decode_key)
         any(k -> occursin(filter, k), keys) || continue
@@ -186,12 +233,14 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
                 end evals = 1)
                 info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
             end
-            # Greedy generation of GEN tokens (times are per call; tok/s per token), with the
-            # host one step behind the GPU and, for comparison, step by step.
-            for pipeline in (true, false)
-                key = "model/generate$(GEN)$(pipeline ? "" : "_unpipelined")_ctx$CONTEXT/$name"
+            # Generation of GEN tokens (times are per call; tok/s per token): greedy with the
+            # host one step behind the GPU, greedy step by step, and with the model's
+            # sampling (on the host, so step by step).
+            for (key, (_, sp, pipeline)) in zip(gen_keys, gen_modes)
                 occursin(filter, key) || continue
-                gen() = TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[], pipeline)
+                rng = Xoshiro(1)
+                gen() = TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[],
+                                            sampling = sp, rng, pipeline)
                 gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, CONTEXT - 1)
                 setleaf!(suite, split(key, "/"), @benchmarkable begin
                     $gen()
@@ -205,3 +254,21 @@ function build_suite(model::DecoderLM{T}; filter::Regex = r"") where {T}
 
     return suite, info
 end
+
+"""
+    run_suite(suite, info) -> results
+
+Warm up and run the benchmarks of `suite` one at a time, freeing each op benchmark's
+arguments once it has run (see [`OpArgs`](@ref)).
+"""
+function run_suite(suite, info)
+    results = BenchmarkGroup()
+    for (path, b) in leaves(suite)
+        warmup(b; verbose = false)
+        setleaf!(results, path, run(b))
+        free_args!(info[join(path, "/")])
+    end
+    return results
+end
+
+free_args!(w::Workload) = (w.args === nothing || free!(w.args); nothing)

@@ -24,15 +24,17 @@ read the output.
 
 ## The tuning loop
 
-Profile any benchmark of `bench/suite.jl` by the key `bench/run.jl` prints:
+Profile any benchmark of `bench/suite.jl` by the key `bench/run.jl` prints. Keys start with
+the model; `--model` loads only that one (otherwise every model of `MODELS` is loaded, and
+`-c 1` stops at the first matching kernel):
 
 ```sh
 ncu --profile-from-start off --set full -c 1 -o bench/results/down_before \
-    julia --project=bench bench/profile.jl ops/linear_down/decode/tile
+    julia --project=bench bench/profile.jl --model Qwen/Qwen3-4B Qwen3-4B/ops/linear_down/decode/tile
 python3 bench/ncu_summary.py bench/results/down_before.ncu-repz
 # ... change the kernel ...
 ncu --profile-from-start off --set full -c 1 -o bench/results/down_after \
-    julia --project=bench bench/profile.jl ops/linear_down/decode/tile
+    julia --project=bench bench/profile.jl --model Qwen/Qwen3-4B Qwen3-4B/ops/linear_down/decode/tile
 python3 bench/ncu_summary.py bench/results/down_after.ncu-repz --compare bench/results/down_before.ncu-repz
 ```
 
@@ -53,18 +55,18 @@ inside that range, so compilation and warm-up launches stay out of the report.
 
 ### Model steps
 
-`model/decode_ctx1024/tile` and `model/prefill512/tile` profile every kernel of a step. `ncu`
-replays each kernel (8 passes with the default set, ~45 with `--set full`) and saves and
-restores device memory around each pass, about 0.65 s per kernel even when the kernel is
-tiny. A decode step launches 543 kernels, about 6 minutes under `ncu`: per layer 14 cuTile
-kernels (4 GEMVs, 4 RMSNorms, 2 ropes, store_kv, silu_mul, attention decode + combine)
-plus 5 CUDA.jl copies and broadcasts (q/k/v slices of the fused projection, residual adds).
-Profile only the cuTile kernels with `-k`; add `-c 15` to stop after the embedding and the
-first layer (about a minute):
+`<model>/model/decode_ctx1024/tile` and `<model>/model/prefill512/tile` profile every kernel
+of a step. `ncu` replays each kernel (8 passes with the default set, ~45 with `--set full`)
+and saves and restores device memory around each pass, about 0.65 s per kernel even when the
+kernel is tiny. Every kernel of a step is a cuTile kernel: the embedding and the first
+RMSNorm, then 10 per layer (qkv GEMV, q inputs, kv inputs, attention decode + combine, o
+GEMV, add + RMSNorm, gate_up + SwiGLU GEMV, down GEMV, add + RMSNorm), then the lm_head GEMV:
+283 kernels for Qwen3-0.6B (28 layers, about 3 minutes under `ncu`) and 363 for Qwen3-4B (36
+layers). `-c 12` stops after the embedding and the first layer:
 
 ```sh
-ncu --profile-from-start off -k regex:'^(embed|rmsnorm|gemv|rope|store_kv|silu_mul|attention_\w+)_kernel' \
-    -o bench/results/decode julia --project=bench bench/profile.jl model/decode_ctx1024/tile
+ncu --profile-from-start off -c 12 -o bench/results/decode \
+    julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/model/decode_ctx1024/tile
 python3 bench/ncu_summary.py bench/results/decode.ncu-repz
 ```
 
@@ -91,7 +93,7 @@ Snapshot (Qwen3-0.6B, ~100-token context, decode through a graph): `replay step`
 of host time per token, `upload inputs` ≈ 16 µs, `sample` ≈ 3.1 ms (mostly the wait for the
 ~2.9 ms step).
 
-For per-kernel analysis with `ncu`, profile the eager `model/decode_ctx1024/tile` step,
+For per-kernel analysis with `ncu`, profile the eager `<model>/model/decode_ctx1024/tile` step,
 which launches the same kernels as the graph.
 
 ## Reading `ncu_summary.py`

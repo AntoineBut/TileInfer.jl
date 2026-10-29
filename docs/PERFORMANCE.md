@@ -1,27 +1,31 @@
 # Performance log
 
-What each milestone and each optimization bought, on Qwen3-0.6B in BF16 on the RTX 4080
-SUPER (736 GB/s). Newest last. Numbers that informed a decision but did not pan out are kept,
+What each milestone and each optimization bought, in BF16 on the RTX 4080 SUPER (736 GB/s):
+on Qwen3-0.6B up to the per-shape GEMM tiles, and on both Qwen3-0.6B and Qwen3-4B from then on (see "Two
+models"). Newest last. Numbers that informed a decision but did not pan out are kept,
 with the reason, so they are not retried blindly.
 
 ## How things are measured
 
 - **`bench/run.jl`** (see CLAUDE.md), minimum time over samples, `--seconds 2` for
   decisions; expect ±3–5 % between runs at the model level (the GPU also drives the desktop).
+  Keys start with the model (`Qwen3-4B/model/...`) since 2026-10-29; earlier keys were 0.6B.
   - `model/decode_ctx1024/<be>`: one eager decode step after 1,023 cached positions, synced.
   - `model/decode_graph_ctx1024/tile`: the same step replayed from a CUDA graph (M6+), synced.
-  - `model/generate64[_unpipelined]_ctx1024/tile`: 64 greedy tokens after 1,023 positions,
-    per token (perf branch). The pipelined variant overlaps host and GPU, so only it shows
-    the gaps between steps disappearing.
-  - `model/prefill512/<be>`: a 512-token prompt in one step.
+  - `model/generate64[_unpipelined|_sampled]_ctx1024/tile`: 64 tokens after 1,023 positions,
+    per token (perf branch). Greedy pipelined overlaps host and GPU, so only it shows the
+    gaps between steps disappearing; `_sampled` uses the model's recommended sampling
+    (Qwen3: temperature 0.6, top-k 20, top-p 0.95), which is what `tileinfer run`/`chat` do.
+  - `model/prefill{64,512}/<be>`: a 64- or 512-token prompt in one step.
 - **End-to-end race** (`bench/ref/tileinfer_race.jl`, `bench/ref/vllm_race.py`): 512-token
   prompt, 256 greedy tokens, prefill = latency of generating 1 token, decode =
   (256 − 1) / (latency(256) − latency(1)). Same prompt ids and the same first tokens on both
   engines.
 - **Kernel breakdowns**: `CUDA.@profile trace = true` over 20 generated tokens, summing
   kernel durations per name (the tracer adds ~5 % to wall time).
-- **Roofline for decode at 1,024 positions**: 1.19 GB of weights + 117 MB of KV cache per
-  token ≈ 1.78 ms, i.e. ~560 tok/s.
+- **Roofline for decode at 1,024 positions**: Qwen3-0.6B reads 1.19 GB of weights + 117 MB
+  of KV cache per token ≈ 1.78 ms, i.e. ~560 tok/s; Qwen3-4B 8.04 GB + 151 MB ≈ 11.1 ms,
+  ~90 tok/s.
 
 ## Summary
 
@@ -128,7 +132,7 @@ Prefill GEMM tiling for few tokens, and two ideas that did not pay on the 4080S:
 
 | Change | Result | Decision |
 |---|---|---|
-| **Per-shape GEMM tiles** (`gemm_config`): pick the tile minimizing waves × (TM TN)^0.7 among 6 shapes, instead of 64 or 128 rows × the next power of two ≥ n columns | Fitted to a sweep of 30 tile shapes × 8 layers (0.6B and 4B) × n = 2…1024: within 2 % of the best tile on average (worst 1.18×), 1.22× the old rule, 1.06× cuBLAS. `bench/run.jl` at n = 64: o 1.77×, down 1.98×, qkv and gate_up unchanged; **model/prefill64 3.62 → 3.00 ms (1.21×)**; n = 1 and 512 unchanged | **kept** |
+| **Per-shape GEMM tiles** (`gemm_config`): pick the tile minimizing waves × (TM TN)^0.7 among 6 shapes, instead of 64 or 128 rows × the next power of two ≥ n columns | Fitted to a sweep of 30 tile shapes × 8 layers (0.6B and 4B) × n = 2…1024: within 2 % of the best tile on average (worst 1.18×), 1.22× the old rule, 1.06× cuBLAS on average over n (ahead at small n, behind at n = 512: see "Two models"). `bench/run.jl` at n = 64: o 1.77×, down 1.98×, qkv and gate_up unchanged; **model/prefill64 3.62 → 3.00 ms (1.21×)**; n = 1 and 512 unchanged | **kept** |
 | Split-K GEMM (Float32 partials + reduce kernel) for few tokens | Never beat the best direct tile at n = 2…64 (e.g. down n = 8: 13.7 µs vs 12.2 µs). K ≤ 3072 here, and 32-row tiles already give enough blocks; split-K pays with longer K or more SMs | not kept |
 | Block-table entry of the next page read one page ahead in decode attention | 1.00× at 1k, 8k and 32k positions (n = 1 and 8): with 64-key pages and `ct.load` latency hints, long contexts already run at 600–660 GB/s. It matters with tiny pages, where every key is a gather | not kept |
 
@@ -172,4 +176,74 @@ TileInfer on this model: no kernel changes, and the same first tokens as vLLM.
 At 4B both engines decode at ~87 % of the bandwidth roofline (8.1 GB of weights and KV per
 token ≈ 11.1 ms, 90 tok/s): the per-kernel overheads that separated them at 0.6B are small
 next to 220 MB of weights per layer. Prefill is compute-bound here, where TileInfer's GEMM
-(0.7–0.9× cuBLAS at M4) is the gap; its prefill also has a wider spread (one run at 58 ms).
+is the gap (0.87–0.92× cuBLAS at n = 512, measured in "Two models" below); its prefill also
+has a wider spread (one run at 58 ms).
+
+## Two models in the benchmark suite (2026-10-29)
+
+`bench/run.jl` now runs every op and model benchmark on Qwen3-0.6B and Qwen3-4B (one model
+after the other, ~7 min with `--seconds 2`), and adds sampled generation. Baseline saved as
+`two-models` (commit 3763805 + the suite changes). The two models stress different things:
+0.6B has small layers (4–12 MB per GEMV), so per-kernel overheads and host work show; 4B has
+up to 100 MB per GEMV, so decode is a bandwidth test and prefill a tensor-core test. Same
+context (1,024 positions), same KV shape (8 KV heads of 128), so attention costs the same.
+
+### End to end
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| Decode, greedy pipelined (`generate64`) | 2.44 ms/token, 409 tok/s, **72.8 %** of roofline | 12.70 ms/token, 78.7 tok/s, **87.6 %** |
+| Decode, greedy step by step | 2.60 ms/token (1.06× slower) | 12.85 ms/token (1.01×) |
+| Decode, sampled (Qwen3 defaults) | 3.32 ms/token, 301 tok/s (**1.36× slower**) | 13.40 ms/token, 74.7 tok/s (1.05×) |
+| Decode step, graph / eager | 2.48 / 2.63 ms | 12.78 / 13.06 ms |
+| Prefill 64 tokens | 3.02 ms (54 % of DRAM: reads the weights once) | 14.6 ms (75 % of DRAM) |
+| Prefill 512 tokens | 9.00 ms, 56.9k tok/s | 47.6 ms, 10.8k tok/s |
+| Tile vs reference: decode / prefill 512 | 16.2× / 8.5× | 6.2× / 4.8× |
+
+- **The M8 target (≥ 80 % of the decode roofline) is met on 4B, not on 0.6B.** The fixed
+  costs that 0.6B still pays (kernel fill and drain, host sampling, graph launch) are
+  constant per token, so at 4B they are drowned by 5× more bytes per token.
+- **Sampled decoding costs a constant ~0.7–0.9 ms per token**: the logits (600 KB) are copied
+  to the host and sampled there, step by step, with the GPU idle meanwhile. That is 36 % of a
+  0.6B token and 5 % of a 4B token. Device top-k/top-p sampling inside the graph, pipelined
+  like greedy, removes it; it is also what M7's rejection sampler needs.
+- **Graphs matter little at 4B** (eager step 2 % slower vs 6 % at 0.6B): 363 launches cost
+  the same host time, but the GPU takes 5× longer per step, so enqueueing keeps ahead.
+
+### Decode step breakdown from the op benchmarks (per token, µs)
+
+| | Qwen3-0.6B (28 layers) | Qwen3-4B (36 layers) |
+|---|---|---|
+| GEMVs per layer: qkv + o + gate_up + down | 13.0 + 8.3 + 21.6 + 11.3 = 54 | 48.4 + 32.6 + 149.8 + 77.0 = 308 |
+| GEMVs, all layers + lm_head | 1,518 + 454 = 1,972 (81 % of the token) | 11,081 + 1,120 = 12,201 (96 %) |
+| GEMV bandwidth | 69–88 % of DRAM, lm_head 93 % | 87–90 %, lm_head 94.5 % |
+| Attention decode, all layers | 15.1 × 28 = 423 | 15.0 × 36 = 540 |
+
+(gate_up is the plain GEMV; the decode step uses the fused SwiGLU GEMV: 21.6 µs on 0.6B vs
+22.8 µs for GEMV + silu_mul, perf branch. The fused ops `attention_inputs!`, `add_rmsnorm!`, `linear_swiglu!` and
+`argmax_token!` have no op benchmarks yet, so these rows do not sum to the step.)
+
+At 4B the decode step is GEMVs at ~88 % of DRAM bandwidth. What is left: ~2–6 % by bringing
+the layer GEMVs to the lm_head's 94 %, and beyond that only fewer bytes (weight-only INT8
+halves them). Attention is latency-bound at 38 % of DRAM for both (one page per split at
+1,024 positions); it is 4 % of a 4B token.
+
+### Prefill GEMMs against cuBLAS
+
+| n | Qwen3-0.6B: qkv / o / gate_up / down | Qwen3-4B: qkv / o / gate_up / down |
+|---|---|---|
+| 64 | 1.06 / 1.42 / 0.84 / 1.45× | 0.99 / 1.03 / 1.03 / 1.12× |
+| 512 | 0.93 / 0.88 / 0.91 / **0.77×** | 0.88 / 0.92 / 0.87 / 0.91× |
+
+- **At n = 512 every GEMM is behind cuBLAS** (82–105 TFLOP/s for cuBLAS on 4B vs 72–96 for
+  ours). On 4B the four GEMMs are 1,188 µs per layer, 42.8 ms of the 47.6 ms prefill; at
+  cuBLAS speed they would be 37.8 ms, which is the ~10 % prefill gap to vLLM in the race.
+- **0.6B down at n = 512 (0.77×)**: `gemm_config` picks 64 × 128 tiles, i.e. 64 blocks for
+  80 SMs, each looping over K = 3,072. An under-filled GPU with a long K loop is the case
+  where split-K (or stream-K) pays, unlike the n ≤ 64 shapes where split-K lost (see "Per-shape GEMM tiles").
+- The cost model was fitted to an average over n = 2…1024, where small n (tile wins up to
+  1.45×) carries it. Tiles beyond 128 × 128, or deeper pipelining, are untested candidates for n ≥ 512.
+- Prefill SwiGLU is a separate `silu_mul` kernel: 49 µs × 36 = 1.8 ms of a 4B prefill (4 %)
+  and 13.5 µs × 28 = 0.4 ms on 0.6B. A SwiGLU epilogue in the gate_up GEMM, as in the GEMV,
+  saves the kernel and the round trip of the (2I, n) activations.
+

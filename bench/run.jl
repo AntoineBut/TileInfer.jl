@@ -2,12 +2,13 @@
 #
 #   julia --project=bench bench/run.jl [options]
 #
-#   --filter REGEX     only benchmarks whose key matches, e.g. "ops/linear", "decode", "/tile"
+#   --filter REGEX     only benchmarks whose key matches, e.g. "ops/linear", "4B/.*decode", "/tile"
 #   --save NAME        store results in bench/results/NAME.json (with git commit and GPU info)
 #   --compare NAME     compare against bench/results/NAME.json (minimum times; changes
 #                      within ±10 % are reported as invariant)
 #   --seconds S        time budget per benchmark (default 1)
-#   --model REPO       model whose shapes and weights are used (default Qwen/Qwen3-0.6B)
+#   --model REPO,...   models whose shapes and weights are used (default: Qwen/Qwen3-0.6B and
+#                      Qwen/Qwen3-4B, one after the other). Keys start with the model name.
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
@@ -36,11 +37,11 @@ end
 
 result_path(name) = joinpath(RESULTS, "$name.json")
 
-function environment()
+function environment(repos)
     commit = try readchomp(`git -C $(@__DIR__) rev-parse --short HEAD`) catch; "unknown" end
     dirty = try !isempty(readchomp(`git -C $(@__DIR__) status --porcelain`)) catch; false end
     return Dict("commit" => commit * (dirty ? "+dirty" : ""), "gpu" => CUDA.name(CUDA.device()),
-                "date" => string(round(Int, time())), "julia" => string(VERSION))
+                "date" => string(round(Int, time())), "julia" => string(VERSION), "models" => repos)
 end
 
 function save_results(name, results, env)
@@ -54,7 +55,13 @@ function load_results(name)
     isfile(path) || error("no saved results $path")
     env_path = joinpath(RESULTS, "$name.env.json")
     env = isfile(env_path) ? JSON.parsefile(env_path) : Dict()
-    return BenchmarkTools.load(path)[1], env
+    results = BenchmarkTools.load(path)[1]
+    # Results saved before keys started with the model were all for Qwen3-0.6B.
+    if haskey(results, "ops") || haskey(results, "model")
+        old, results = results, BenchmarkGroup()
+        results[model_label(first(MODELS))] = old
+    end
+    return results, env
 end
 
 # The baseline trial at `path`, or nothing. (Indexing a BenchmarkGroup with a missing key
@@ -72,7 +79,7 @@ format_time(t) = t < 1e3 ? @sprintf("%.0f ns", t) : t < 1e6 ? @sprintf("%.1f µs
 
 function report(results, info; baseline = nothing)
     rows = sort!(collect(leaves(results)); by = r -> join(first(r), "/"))
-    @printf("%-40s %10s %10s %9s %6s %8s %8s %7s", "benchmark", "min", "median", "GB/s", "%peak", "TFLOP/s", "tok/s", "x ref")
+    @printf("%-56s %10s %10s %9s %6s %8s %8s %7s", "benchmark", "min", "median", "GB/s", "%peak", "TFLOP/s", "tok/s", "x ref")
     baseline === nothing || @printf(" %9s  %s", "speedup", "vs baseline")
     println()
     for (path, trial) in rows
@@ -80,7 +87,7 @@ function report(results, info; baseline = nothing)
         w = info[key]
         tmin, tmed = minimum(trial).time / w.reps, median(trial).time / w.reps   # ns per call
         bandwidth = w.bytes / (tmin * 1e-9)
-        @printf("%-40s %10s %10s %9.1f %5.1f%% %8s %8s", key, format_time(tmin), format_time(tmed),
+        @printf("%-56s %10s %10s %9.1f %5.1f%% %8s %8s", key, format_time(tmin), format_time(tmed),
                 bandwidth / 1e9, 100 * bandwidth / PEAK_BANDWIDTH,
                 w.flops >= 1e9 ? @sprintf("%.2f", w.flops / (tmin * 1e-9) / 1e12) : "",
                 w.tokens > 0 ? @sprintf("%.1f", w.tokens / (tmin * 1e-9)) : "")
@@ -102,16 +109,28 @@ end
 
 function main(args)
     opts = parse_cli(args)
-    model = TileInfer.load_model(get(opts, "model", "Qwen/Qwen3-0.6B"); max_len = CONTEXT + PREFILL)
-    suite, info = build_suite(model; filter = Regex(get(opts, "filter", "")))
-    isempty(leaves(suite)) && error("no benchmark matches the filter")
+    repos = haskey(opts, "model") ? String.(split(opts["model"], ",")) : collect(MODELS)
+    filter = Regex(get(opts, "filter", ""))
     seconds = parse(Float64, get(opts, "seconds", "1"))
-    foreach(((_, b),) -> (b.params.seconds = seconds; b.params.samples = 10_000), leaves(suite))
+    env = environment(repos)
 
-    env = environment()
-    println("Running $(length(leaves(suite))) benchmarks on $(env["gpu"]) at $(env["commit"])...")
-    warmup(suite; verbose = false)
-    results = run(suite; verbose = false)
+    # One model at a time, so that only one set of weights is on the GPU.
+    results, info = BenchmarkGroup(), Dict{String,Workload}()
+    for repo in repos
+        model = TileInfer.load_model(repo; max_len = CONTEXT + PREFILL)
+        sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
+        label = model_label(repo)
+        suite, model_info = build_suite(model, label; filter, sampling)
+        if !isempty(leaves(suite))
+            foreach(((_, b),) -> (b.params.seconds = seconds; b.params.samples = 10_000), leaves(suite))
+            println("Running $(length(leaves(suite))) $label benchmarks on $(env["gpu"]) at $(env["commit"])...")
+            results[label] = run_suite(suite, model_info)[label]
+            merge!(info, model_info)
+        end
+        model = suite = nothing
+        GC.gc(true); CUDA.reclaim()
+    end
+    isempty(leaves(results)) && error("no benchmark matches the filter")
 
     baseline = nothing
     if haskey(opts, "compare")

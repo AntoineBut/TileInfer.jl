@@ -4,7 +4,8 @@ A single-GPU, single-client LLM inference engine in Julia. Every hot kernel is
 written in cuTile.jl. The goal is to learn how the engine works, so the code
 favours being clear and easy to instrument over supporting many features.
 
-Status: draft v0 (2026-10-26), M0 done. Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB).
+Status (2026-10-29): M0–M6 done, and the first M8 fusions; M7 (speculative decoding) is next.
+Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB). Benchmarked on Qwen3-0.6B and Qwen3-4B.
 External documentation and papers are listed in [REFERENCES.md](REFERENCES.md).
 
 ---
@@ -82,7 +83,10 @@ vLLM as the reference for the paged KV design.
 
 ---
 
-## 3. Module layout (proposed)
+## 3. Module layout
+
+As built so far; files for later milestones (scheduler, spec decoding, sampling kernels
+beyond greedy) are marked *(planned)*.
 
 ```
 TileInfer/
@@ -94,29 +98,29 @@ TileInfer/
 │   │   ├── store.jl            # pull/list/remove via HuggingFaceApi.jl
 │   │   └── loader.jl           # safetensors (mmap) → CuArray, name mapping
 │   ├── tokenizer/
-│   │   ├── bpe.jl              # tokenizer.json → BytePairEncoding.jl
-│   │   └── chat_template.jl    # Jinja subset / per-family templates
+│   │   ├── bpe.jl              # own byte-level BPE from tokenizer.json
+│   │   └── chat_template.jl    # per-family templates, ported by hand
 │   ├── model/
-│   │   ├── layers.jl           # Embedding, Linear, RMSNorm, RoPE, MLP, Attention
-│   │   ├── decoder.jl          # DecoderLayer, DecoderLM{T}, forward!
-│   │   └── families.jl         # llama / qwen2 / qwen3 / mistral flags
+│   │   ├── weights.jl          # ModelWeights / LayerWeights (fused qkv, gate_up)
+│   │   ├── rope.jl             # RotaryTable
+│   │   └── decoder.jl          # DecoderLM{T}, StepBuffers, prepare_step!, run_step!, forward!
 │   ├── kv/
 │   │   ├── paged_cache.jl      # PagedKVCache{T}: per-layer page pools
-│   │   └── block_manager.jl    # free list, block tables, truncate (spec rollback)
+│   │   └── block_manager.jl    # Sequence, free list, block tables, truncate (spec rollback)
 │   ├── engine/
-│   │   ├── sequence.jl         # Sequence, SamplingParams, status
-│   │   ├── scheduler.jl
-│   │   ├── model_runner.jl     # InputMetadata, static buffers, graph cache
-│   │   ├── sampler.jl
-│   │   ├── spec_decode.jl      # proposers + verifier
-│   │   └── engine.jl           # LLMEngine, generate / stream
+│   │   ├── runner.jl           # ModelRunner: CUDA graphs per token count, pipelined greedy decode
+│   │   ├── sampler.jl          # SamplingParams, host sampling
+│   │   ├── generate.jl         # generate!, generation defaults, TextStream
+│   │   ├── chat.jl             # ChatSession with prefix reuse
+│   │   └── spec_decode.jl      # proposers + verifier (planned, M7)
 │   ├── ops/
-│   │   ├── interface.jl        # abstract backend + op signatures
+│   │   ├── interface.jl        # abstract backend + op signatures, fused-op fallbacks
 │   │   ├── reference.jl        # RefBackend
 │   │   └── tile/               # TileBackend: one file per kernel family
 │   │       ├── norm.jl  elementwise.jl (rope, silu, kv_write, embed)  linear.jl (GEMV, GEMM)
+│   │       ├── fused.jl        # attention inputs: q/k norm + rope + KV write
 │   │       ├── attention.jl    # paged flash-attention: prefill, split-KV decode + combine
-│   │       └── sampling.jl     spec_verify.jl
+│   │       └── sampling.jl     # device argmax (top-k/top-p and spec_verify planned)
 │   └── cli.jl
 ├── test/                       # per-op tests vs reference; e2e vs HF logits
 ├── bench/                      # per-kernel + end-to-end tok/s, NVTX ranges
@@ -400,7 +404,7 @@ Versions are as of 2026-10-26, checked against the repos.
 | M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
 | M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
 | M7 | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report |
-| M8+ | Performance: fewer, fused kernels (q/k/v slice copies, q/k norm + rope, residual add + RMSNorm, Float32 logits from the lm_head, attention combine), pinned async uploads; then prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6) |
+| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant, multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see PERFORMANCE.md): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device argmax with pipelined greedy decode, per-shape GEMM tiles. Greedy decode is at 73 % of the roofline on 0.6B and 88 % on 4B (M8 target met on 4B only); sampled decoding still samples on the host (step by step). Not pursued: attention combine fused into the split kernel (slower) |
 
 ## 14. Open questions / spikes
 
@@ -423,8 +427,9 @@ Still open:
 
 3. Paged KV loads: a runtime-indexed `ct.load` per page vs sparse-view gather. M5 uses one
    runtime-indexed load per page; sparse views (several pages per load) are not measured yet.
-4. GEMV performance in cuTile at M = 1 (and M = k+1) vs cuBLAS. This decides
-   whether to keep a cuBLAS fallback for decode linears.
+4. ~~GEMV performance in cuTile at M = 1 vs cuBLAS.~~ Answered at M4: the cuTile GEMV is
+   1.0–1.3× cuBLAS, so decode linears have no cuBLAS fallback. M = k+1 (verify) uses the
+   GEMM with per-shape tiles; a split-K GEMM did not beat it at n = 2…64.
 
 Resolved in M1:
 
