@@ -30,6 +30,24 @@ with the reason, so they are not retried blindly.
 
 ## Summary
 
+Current, both models (2026-10-30, e765381, `bench/run.jl --filter /model/ --seconds 2`,
+baseline `summary-2026-10-30`; decode after 1,023 cached positions, per token of 64):
+
+| | Qwen3-0.6B | Qwen3-4B |
+|---|---|---|
+| Decode, greedy pipelined | 2.53 ms, **395 tok/s** (70 % of roofline) | 12.97 ms, **77.1 tok/s** (86 %) |
+| Decode, sampled (Qwen3 defaults, pipelined) | 2.49 ms, 402 tok/s | 12.86 ms, 77.8 tok/s |
+| Decode, greedy step by step / eager step | 2.58 / 2.72 ms | 13.11 / 13.15 ms |
+| Prefill 64 tokens | 2.75 ms, 23k tok/s | 14.6 ms, 4.4k tok/s |
+| Prefill 512 tokens | 8.85 ms, **58k tok/s** (69 TFLOP/s) | 45.3 ms, **11.3k tok/s** (91 TFLOP/s) |
+| Speculative decoding, best proposer (4B: DFlash k = 15, sampled) | — | 1.8× (story) to 3.2× (document) on open prompts, 8.4× on a code rename: 140–660 tok/s |
+
+0.6B greedy decode reads 2–3 % slower than the 2.44 ms of 2026-10-29, within the run-to-run
+spread (the sampled run, the same kernels plus sampling, measured 2.49 ms). The M8 target
+(≥ 80 % of the decode roofline) holds on 4B, not on 0.6B.
+
+History on Qwen3-0.6B:
+
 | Stage | Decode step | Decode tok/s | Prefill 512 | Prefill tok/s | What changed |
 |---|---|---|---|---|---|
 | M3 (reference ops, paged KV) | 38.89 ms | 26 | 76.3 ms | 6.7k | cuBLAS + broadcasts |
@@ -39,6 +57,7 @@ with the reason, so they are not retried blindly.
 | perf branch | 2.47 ms (pipelined) | 405 | 9.0 ms | 57k | fusions, device greedy sampling, host/GPU overlap |
 | device sampling | 2.46 ms (sampled) | 407 | 9.0 ms | 57k | top-k/top-p sampling in the graph: sampled decode as fast as greedy |
 | GEMM occupancy | 2.46 ms (sampled) | 407 | 8.8 ms | 58k | two GEMM blocks per SM on large grids (4B prefill 512: 1.06×) |
+| M7 (speculative decoding) | 2.49 ms (sampled) | 402 | 8.85 ms | 58k | plain decoding unchanged (re-measured); n-gram, draft-model, EAGLE-3, DFlash proposers and p/q verification on top |
 
 From M3: decode 15.7× faster, prefill 8.5×. Race: **418 tok/s decode, 53k tok/s prefill**,
 3.6 % faster end to end than vLLM on the same machine (see the end).
