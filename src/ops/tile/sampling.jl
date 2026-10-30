@@ -44,10 +44,10 @@ function topk_chunks_kernel(Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Flo
     return nothing
 end
 
-function topk_sample_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
-                            Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
-                            Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
-                            K::Int, N::Int)
+# The survivors among the chunks' candidates `Ids`: their 1-based ids (best first, 0 past
+# top_k), their probabilities under temperature and top-k, zeroed outside the top-p prefix,
+# and the mask of survivors.
+@inline function survivors(Ids, Logits, Params, State, K::Int, N::Int)
     k = State[Int32(1)] % Int32
     # Candidate ids, chunk after chunk; 0 (and ids past the vocabulary) gather -Inf.
     cand = ct.load(Ids; index = Int32(1), shape = (N,), padding_mode = ct.PaddingMode.Zero)
@@ -59,13 +59,72 @@ function topk_sample_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{I
     p = w ./ sum(w; dims = 1)
     # The smallest prefix whose mass reaches top_p: tokens whose better ones hold less.
     keep = (slot .<= k) .& ((slot .== Int32(1)) .| (top_p >= 1f0) .| ((cumsum(p; dims = 1) .- p) .< top_p))
-    q = ifelse.(keep, p, 0f0)
+    return ids, ifelse.(keep, p, 0f0), keep
+end
+
+# The id at the first slot whose cumulative weight reaches u × the total, among the slots
+# with positive weight (the last of them on round-off), as `pick_host`.
+@inline function pick(ids, w, u, K::Int)
+    slot = ct.arange((K,))
+    live = w .> 0f0
+    target = u .* sum(w; dims = 1)
+    first = minimum(ifelse.(live .& (cumsum(w; dims = 1) .>= target), slot, Int32(K + 1)); dims = 1)
+    chosen = min.(first, maximum(ifelse.(live, slot, Int32(0)); dims = 1))
+    return sum(ifelse.(slot .== chosen, ids, Int32(0)))
+end
+
+function topk_sample_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
+                            Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
+                            Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
+                            K::Int, N::Int)
+    ids, q, _ = survivors(Ids, Logits, Params, State, K, N)
     counter = State[Int32(3)]
-    target = sampling_uniform(State[Int32(2)], counter) .* sum(q; dims = 1)
-    # The first survivor whose cumulative mass reaches the target (the last on round-off).
-    first = minimum(ifelse.(keep .& (cumsum(q; dims = 1) .>= target), slot, Int32(K + 1)); dims = 1)
-    chosen = min.(first, count(keep; dims = 1))
-    token = sum(ifelse.(slot .== chosen, ids, Int32(0))) - Int32(1)
+    token = pick(ids, q, sampling_uniform(State[Int32(2)], counter), K) - Int32(1)
+    Token[Int32(1)] = token
+    Mirror[Int32(1)] = token
+    State[Int32(3)] = counter + UInt32(1)
+    return nothing
+end
+
+# `topk_sample_kernel` that also writes the distribution it samples from: the survivors'
+# 0-based ids (-1 past them) and their probabilities.
+function topk_sample_dist_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
+                                 QIds::ct.TileArray{Int32,1}, QProbs::ct.TileArray{Float32,1},
+                                 Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
+                                 Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
+                                 K::Int, N::Int)
+    ids, q, keep = survivors(Ids, Logits, Params, State, K, N)
+    ct.store(QIds; index = Int32(1), tile = ifelse.(keep, ids .- Int32(1), Int32(-1)))
+    ct.store(QProbs; index = Int32(1), tile = q ./ sum(q; dims = 1))
+    counter = State[Int32(3)]
+    token = pick(ids, q, sampling_uniform(State[Int32(2)], counter), K) - Int32(1)
+    Token[Int32(1)] = token
+    Mirror[Int32(1)] = token
+    State[Int32(3)] = counter + UInt32(1)
+    return nothing
+end
+
+# The token emitted at a position drafted as Draft[1] from the distribution (QIds, QProbs),
+# as `accept_host`: the draft with probability min(1, p/q), else a sample of max(p - q, 0).
+function accept_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
+                       Draft::ct.TileArray{Int32,1}, QIds::ct.TileArray{Int32,1}, QProbs::ct.TileArray{Float32,1},
+                       Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
+                       Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
+                       K::Int, N::Int)
+    ids, w, keep = survivors(Ids, Logits, Params, State, K, N)
+    p = w ./ sum(w; dims = 1)
+    tokens = ifelse.(keep, ids .- Int32(1), Int32(-1))
+    q_ids = ct.load(QIds; index = Int32(1), shape = (K,))
+    q_probs = ct.load(QProbs; index = Int32(1), shape = (K,))
+    d = Draft[Int32(1)]
+    pd = sum(ifelse.(tokens .== d, p, 0f0))
+    qd = sum(ifelse.(q_ids .== d, q_probs, 0f0))
+    # q at each of p's survivors: a (K, K) comparison of the two id lists.
+    q_at = sum(ifelse.(reshape(tokens, (K, 1)) .== reshape(q_ids, (1, K)), reshape(q_probs, (1, K)), 0f0); dims = 2)
+    r = max.(p .- reshape(q_at, (K,)), 0f0)
+    seed, counter = State[Int32(2)], State[Int32(3)]
+    accept = (accept_uniform(seed, counter) * qd < pd) | (sum(r) <= 0f0)
+    token = ifelse(accept, d, pick(ids, r, sampling_uniform(seed, counter), K) - Int32(1))
     Token[Int32(1)] = token
     Mirror[Int32(1)] = token
     State[Int32(3)] = counter + UInt32(1)
@@ -75,15 +134,37 @@ end
 "Scratch for [`sample_token!`](@ref): the top-k candidate ids of every vocabulary chunk."
 sample_scratch(vocab::Integer) = CuVector{Int32}(undef, cld(vocab, SAMPLE_CHUNK) * MAX_TOP_K)
 
-function sample_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, logits::CuMatrix{Float32},
-                       s)
+# The candidates of every chunk of the vocabulary, into the sampler's scratch.
+function topk_chunks!(logits, s)
     cand = s.scratch
     chunks = length(cand) ÷ MAX_TOP_K
     @assert chunks <= SAMPLE_PARTS
     @cuda backend = cuTile blocks = chunks topk_chunks_kernel(cand, vec(logits), s.state, ct.Constant(SAMPLE_CHUNK),
                                                               ct.Constant(MAX_TOP_K))
+    return cand
+end
+
+function sample_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, logits::CuMatrix{Float32},
+                       s)
+    cand = topk_chunks!(logits, s)
     @cuda backend = cuTile topk_sample_kernel(ids, mirror, cand, vec(logits), s.params, s.state,
                                               ct.Constant(MAX_TOP_K), ct.Constant(MAX_TOP_K * SAMPLE_PARTS))
+    return ids
+end
+
+function sample_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, logits::CuMatrix{Float32},
+                       s, (q_ids, q_probs))
+    cand = topk_chunks!(logits, s)
+    @cuda backend = cuTile topk_sample_dist_kernel(ids, mirror, q_ids, q_probs, cand, vec(logits), s.params, s.state,
+                                                   ct.Constant(MAX_TOP_K), ct.Constant(MAX_TOP_K * SAMPLE_PARTS))
+    return ids
+end
+
+function accept_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, logits::CuMatrix{Float32},
+                       s, draft::CuVector{Int32}, (q_ids, q_probs))
+    cand = topk_chunks!(logits, s)
+    @cuda backend = cuTile accept_kernel(ids, mirror, draft, q_ids, q_probs, cand, vec(logits), s.params, s.state,
+                                         ct.Constant(MAX_TOP_K), ct.Constant(MAX_TOP_K * SAMPLE_PARTS))
     return ids
 end
 
@@ -98,5 +179,18 @@ end
 
 function map_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, offsets::CuVector{Int32})
     @cuda backend = cuTile map_token_kernel(ids, mirror, offsets)
+    return ids
+end
+
+function map_dist_kernel(QIds::ct.TileArray{Int32,1}, Offsets::ct.TileArray{Int32,1}, K::Int)
+    q = ct.load(QIds; index = Int32(1), shape = (K,))
+    ct.store(QIds; index = Int32(1), tile = q .+ ct.gather(Offsets, q .+ Int32(1); padding_value = Int32(0)))
+    return nothing
+end
+
+function map_token!(be::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, offsets::CuVector{Int32},
+                    (q_ids, _))
+    map_token!(be, ids, mirror, offsets)
+    @cuda backend = cuTile map_dist_kernel(q_ids, offsets, ct.Constant(MAX_TOP_K))
     return ids
 end

@@ -516,3 +516,36 @@ method: both read the target's hidden states, but EAGLE-3 pays one pass per draf
 one pass per block. Candidates: write the drafts on the device straight into the verify
 step's ids (the host now waits for them in between); one batched argmax instead of 15
 sampling launches.
+
+## Sampled drafts, the p/q rule (2026-10-30)
+
+`DraftProposer(…; sample = true)` (also `Eagle3Proposer`, `DFlashProposer`; CLI
+`--sample-drafts`): when the target samples, the drafter samples its drafts with the target's
+parameters on its own logits, under a seed of its own, and records each draft's filtered
+distribution q (its ≤ 64 survivors' ids and probabilities, written by the sampling kernel
+itself). The verify step then runs `accept_token!` at each drafted position: accept d with
+probability min(1, p(d)/q(d)), else sample from max(p − q, 0) (a (64, 64) comparison of the
+two survivor lists), with a uniform stream of its own for the acceptance; the bonus position
+samples as before. A rejected position never emits the draft, so the host's accept loop is
+unchanged. The tokens follow the target's distribution, but are no longer plain decoding's.
+The new kernels share the candidate selection with the plain sampler (`survivors`, `pick`),
+which measured the same after the refactor (16.8 µs).
+
+Greedy drafts are accepted with probability p(argmax q), sampled ones with Σ min(p, q). With
+Qwen3's recommended sampling (T 0.6, top-k 20, top-p 0.95) the distributions are peaked and
+the two are close. `bench/speculative.jl --sampled [--pq]`, 4B target, 256 tokens; best k of
+each method, speedup over sampled plain decoding (greedy drafts → sampled drafts):
+
+| Prompt | 0.6B draft | EAGLE-3 | DFlash | acceptance, draft k = 4 |
+|---|---|---|---|---|
+| rename | 3.35× → 3.34× | 2.25× → 2.19× | 8.42× → 7.57× | 0.96 → 0.96 |
+| document | 1.92× → 1.82× | 1.82× → 1.77× | 3.17× → 2.78× | 0.62 → 0.57 |
+| explain | 1.48× → **1.59×** | 1.46× → **1.58×** | 2.30× → 2.29× | 0.38 → 0.44 |
+| story | 1.42× → 1.42× | 1.57× → 1.48× | 1.76× → **1.88×** (k = 4) | 0.37 → 0.39 |
+
+Speedups follow tokens per step: the p/q verify costs no more than plain sampling per
+column. Sampled drafts pay on the open "explain" prompt at every k (draft model k = 7: 1.13×
+→ 1.33×) and lose 3–12 % on the code-documenting one; each row is a single sampled reply,
+so a difference of one step moves it by several percent (DFlash k = 15 on rename: 10 → 11
+steps). Greedy drafts stay the default. Sampled drafts should gain more at higher
+temperatures, where p(argmax q) falls faster than Σ min(p, q).

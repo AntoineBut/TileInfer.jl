@@ -16,9 +16,12 @@
 # samples each position with the device sampler and the counter plain decoding would use for
 # that token (`sampling_uniform(seed, counter)`): the drafts are accepted with probability
 # p(d), and the tokens are those of plain sampled decoding, up to round-off. Greedy decoding
-# is the case p = one-hot on the argmax. The proposers here all draft deterministically (the
-# draft model and EAGLE greedily), so this rule is exact for them; a proposer that samples
-# its drafts from a non-degenerate q would need the general one.
+# is the case p = one-hot on the argmax. Model proposers draft greedily by default, so this
+# rule is exact for them too. With `sample = true` they sample their drafts from their own
+# filtered distribution q (the target's sampling parameters on the drafter's logits) and
+# record it (`DraftDists`); the verify step then applies the general rule at each draft
+# position (`accept_token!`), and the target's own sample only at the bonus position. The
+# tokens are then distributed as plain sampled decoding's, but are no longer the same.
 #
 # Proposers: n-gram (prompt) lookup below, where the drafts are the tokens that followed the
 # latest earlier occurrence of the sequence's last n tokens; a draft model (end of this
@@ -89,24 +92,61 @@ end
 
 acceptance_rate(s::SpecStats) = s.drafted == 0 ? NaN : s.accepted / s.drafted
 
+"""
+    DraftDists(k)
+
+The distributions q that up to `k` sampled drafts were drawn from: column j holds the
+0-based ids of draft j's candidates (-1 past them) and their probabilities, as
+`sample_token!(…, q)` writes them.
+"""
+struct DraftDists
+    ids::CuMatrix{Int32}             # (MAX_TOP_K, k)
+    probs::CuMatrix{Float32}
+end
+
+DraftDists(k::Integer) = DraftDists(CuMatrix{Int32}(undef, MAX_TOP_K, k), CuMatrix{Float32}(undef, MAX_TOP_K, k))
+
+"Draft j's distribution, as the `q` argument of `sample_token!` and `accept_token!`."
+column(d::DraftDists, j) = (view(d.ids, :, j), view(d.probs, :, j))
+
+"""
+    draft_dists(proposer, runner) -> Union{DraftDists,Nothing}
+
+The distributions of the drafts `proposer` samples for the target of `runner`, or nothing
+when its drafts are a function of the context (then verification compares them with the
+target's own samples).
+"""
+draft_dists(::Any, ::ModelRunner) = nothing
+
+# Whether a proposer that can sample its drafts does so for `runner`: only when the target
+# samples (with greedy decoding, both draft and target take the argmax).
+samples_for(sample::Bool, r::ModelRunner) = sample && r.sampler.sampling.temperature > 0
+
+# Reset a drafter's sampler for a generation of `runner`'s: the target's parameters when it
+# samples its drafts, greedy otherwise.
+reset_draft_sampler!(s::TokenSampler, sample::Bool, r::ModelRunner) =
+    reset_sampler!(s, samples_for(sample, r) ? r.sampler.sampling : SamplingParams(), draft_seed(r.sampler.seed))
+
 "Verify steps take up to this many tokens (a DFlash block); all are captured in CUDA graphs."
 const MAX_VERIFY_TOKENS = 16
 
 # A step that returns the token the target model samples after each of its n inputs: the
 # forward step with the logits of every token, then the runner's sampler on each column
-# (counters c, c + 1, …), all captured together in a CUDA graph. The tokens land in
-# host-mapped memory.
+# (counters c, c + 1, …), all captured together in a CUDA graph. With the distributions of
+# sampled drafts, the columns of drafted positions apply the p/q rule instead. The tokens
+# land in host-mapped memory.
 mutable struct VerifyStep{T}
     buffers::StepBuffers{T}
+    dists::Union{Nothing,DraftDists}
     graph::Union{Nothing,CUDA.CuGraphExec}
     targets::CuVector{Int32}         # device copies (`sample_token!` writes both)
     mirror::CuVector{Int32}          # host-mapped
     mirror_host::Vector{Int32}
 end
 
-function VerifyStep(r::ModelRunner{T}, n::Integer) where {T}
+function VerifyStep(r::ModelRunner{T}, n::Integer, dists) where {T}
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, n)
-    return VerifyStep{T}(StepBuffers(r.model, r.cache, n; all_logits = true, r.aux_layers), nothing,
+    return VerifyStep{T}(StepBuffers(r.model, r.cache, n; all_logits = true, r.aux_layers), dists, nothing,
                          CuVector{Int32}(undef, n),
                          mirror, unsafe_wrap(Array, mirror))
 end
@@ -114,23 +154,35 @@ end
 function run_verify_step!(r::ModelRunner, v::VerifyStep)
     b, be = v.buffers, r.model.backend
     run_step!(r.model, r.cache, b)
-    for j in 1:num_tokens(b)
-        sample_token!(be, view(v.targets, j:j), view(v.mirror, j:j), view(b.logits, :, j:j), r.sampler)
+    n = num_tokens(b)
+    for j in 1:n
+        ids, mirror, logits = view(v.targets, j:j), view(v.mirror, j:j), view(b.logits, :, j:j)
+        if v.dists === nothing || j == n
+            sample_token!(be, ids, mirror, logits, r.sampler)
+        else                         # the position drafted as input j + 1
+            accept_token!(be, ids, mirror, logits, r.sampler, view(b.ids, j+1:j+1), column(v.dists, j))
+        end
     end
 end
 
 """
-    verify!(runner, seq, ids, counter) -> Vector{Int}
+    verify!(runner, seq, ids, counter; dists = nothing) -> Vector{Int}
 
 Run the 0-based token `ids` (the last sampled token, then the drafts) through the model,
 appending them to `seq`, and return the token the runner's sampler picks after each of them,
-with counters `counter`, `counter + 1`, … (the argmax when greedy). Steps of each length, up
-to $MAX_VERIFY_TOKENS tokens, are captured in a CUDA graph like [`forward!`](@ref) steps.
+with counters `counter`, `counter + 1`, … (the argmax when greedy). When the drafts were
+sampled from the distributions `dists` (column j for draft j), the token after each input
+but the last follows the p/q rule instead ([`accept_token!`](@ref)): the next draft if
+accepted, else a different token. Steps of each length, up to $MAX_VERIFY_TOKENS tokens, are
+captured in a CUDA graph like [`forward!`](@ref) steps.
 """
-function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}, counter::Integer) where {T}
+function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}, counter::Integer;
+                 dists::Union{Nothing,DraftDists} = nothing) where {T}
     n = length(ids)
     1 <= n <= MAX_VERIFY_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_VERIFY_TOKENS tokens, got $n"))
-    v = get!(() -> VerifyStep(r, n), r.verify_steps, n)::VerifyStep{T}
+    dists === nothing || n - 1 <= size(dists.ids, 2) || throw(ArgumentError("$(n - 1) drafts but $(size(dists.ids, 2)) distributions"))
+    key = (n, dists === nothing ? UInt(0) : objectid(dists))
+    v = get!(() -> VerifyStep(r, n, dists), r.verify_steps, key)::VerifyStep{T}
     r.last_step, r.last_start = v.buffers, length(seq)
     NVTX.@range "upload inputs" begin
         prepare_step!(v.buffers, r.model, r.cache, seq, ids)
@@ -156,8 +208,9 @@ end
 [`generate!`](@ref) with the runner's sampler (set it with [`reset_sampler!`](@ref)) and drafts
 from `proposer` checked by [`verify!`](@ref): the same tokens as plain decoding with that
 sampler up to near-ties (a verify step of k + 1 tokens runs other kernels than a decode
-step, so the logits differ in the last bits), and `seq` ends in the same state. Counts steps
-and accepted drafts in `stats`.
+step, so the logits differ in the last bits), and `seq` ends in the same state. A proposer
+that samples its drafts ([`draft_dists`](@ref)) yields tokens with the same distribution
+instead, not the same tokens. Counts steps and accepted drafts in `stats`.
 """
 function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer}, proposer;
                                max_new_tokens::Integer, stop_ids, on_token = nothing,
@@ -165,6 +218,7 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
     generated = Int[]
     max_new_tokens > 0 || return generated
     attach!(proposer, r)
+    dists = draft_dists(proposer, r)
     logits = forward!(r, seq, ids)
     # Sampled with counter 0, not yet in the cache.
     last = Int(Array(sample_token!(r.model.backend, r.token, r.token, logits, r.sampler))[1])
@@ -180,7 +234,8 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
         drafts = remaining > 1 ? propose(proposer, context, min(proposer.k, remaining - 1)) : Int[]
         start = length(seq)
         # The token after `last` is generated token number length(generated) (0-based).
-        targets = verify!(r, seq, [last; drafts], length(generated))
+        targets = verify!(r, seq, [last; drafts], length(generated); dists)
+        # (With sampled drafts, a rejected draft's position holds a token that differs from it.)
         accepted = 0
         while accepted < length(drafts) && drafts[accepted+1] == targets[accepted+1]
             accepted += 1
@@ -223,20 +278,24 @@ end
 # the ids of step i + 1 and into host-mapped memory, so the host enqueues the whole chain
 # and synchronizes once.
 #
-# The draft decodes greedily, even when the target samples: a greedy draft is a function of
-# the context, so the verification above stays exact. (The general rule, where the draft
-# samples from its q and drafts are accepted with probability min(1, p/q), needs q at every
-# position and accepts more often at high temperatures.)
+# The draft decodes greedily by default, even when the target samples: a greedy draft is a
+# function of the context, so the verification above stays exact. With `sample = true` and
+# a sampling target, it samples with the target's parameters instead and records each
+# draft's q for the general rule.
 
 """
-    DraftProposer(draft_model; k = 4, max_tokens = max_length(draft_model),
+    DraftProposer(draft_model; k = 4, sample = false, max_tokens = max_length(draft_model),
                   graphs = supports_graphs(draft_model.backend))
 
 Proposes the next `k` tokens that `draft_model` decodes greedily, on a KV cache of its own
-for up to `max_tokens` positions. The draft model must share the target's vocabulary.
+for up to `max_tokens` positions; or, with `sample` and a target that samples, that it
+samples with the target's sampling parameters, verified by the p/q rule. The draft model
+must share the target's vocabulary.
 """
 mutable struct DraftProposer{R<:ModelRunner,T}
     const k::Int
+    const sample::Bool
+    const dists::DraftDists                      # of the drafts, when sampled
     const runner::R
     const seq::Sequence
     const buffers::Vector{StepBuffers{T}}        # step i runs draft i, for i in 1:k-1
@@ -246,21 +305,28 @@ mutable struct DraftProposer{R<:ModelRunner,T}
     const mirror_host::Vector{Int32}
 end
 
-function DraftProposer(m::DecoderLM{T}; k::Integer = 4, max_tokens::Integer = max_length(m),
+function DraftProposer(m::DecoderLM{T}; k::Integer = 4, sample::Bool = false, max_tokens::Integer = max_length(m),
                        graphs::Bool = supports_graphs(m.backend)) where {T}
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("k must be in 1:$(MAX_GRAPH_TOKENS - 1)"))
     cache = PagedKVCache(m; max_tokens = min(max_tokens, max_length(m)))
     r = ModelRunner(m, cache; graphs)
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, k)
-    return DraftProposer{typeof(r),T}(k, r, new_sequence(cache), [StepBuffers(m, cache, 1) for _ in 1:k-1],
+    return DraftProposer{typeof(r),T}(k, sample, DraftDists(k), r, new_sequence(cache), [StepBuffers(m, cache, 1) for _ in 1:k-1],
                                       fill!(Vector{Union{Nothing,CUDA.CuGraphExec}}(undef, k - 1), nothing),
                                       CuVector{Int32}(undef, 1), mirror, unsafe_wrap(Array, mirror))
 end
 
+attach!(p::DraftProposer, r::ModelRunner) = (reset_draft_sampler!(p.runner.sampler, p.sample, r); p)
+draft_dists(p::DraftProposer, r::ModelRunner) = samples_for(p.sample, r) ? p.dists : nothing
+
 # Where the sample of chain step i (or of the forward step before the chain, i = 0) goes.
+# A proposer that can sample always records q (one-hot when greedy), so that its captured
+# chain serves greedy and sampled generations alike.
 next_ids(p::DraftProposer, i) = i < p.k - 1 ? p.buffers[i+1].ids : p.sink
-sample_draft!(p::DraftProposer, i, logits) =
-    sample_token!(p.runner.model.backend, next_ids(p, i), view(p.mirror, i+1:i+1), logits, p.runner.sampler)
+function sample_draft!(p::DraftProposer, i, logits)
+    args = (p.runner.model.backend, next_ids(p, i), view(p.mirror, i+1:i+1), logits, p.runner.sampler)
+    return p.sample ? sample_token!(args..., column(p.dists, i + 1)) : sample_token!(args...)
+end
 
 function run_draft_step!(p::DraftProposer, i)
     r, b = p.runner, p.buffers[i]

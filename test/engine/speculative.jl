@@ -97,6 +97,33 @@ if test_model_dir() !== nothing
             @test all(speculative(n, Int[]; sampling = sampled) == plain(n, Int[]; sampling = sampled) for n in 1:12)
         end
 
+        # Sampled drafts (p/q rule): the tokens are no longer plain decoding's, so check what holds
+        # for any accepted drafts: the budget, the cache (a greedy continuation in the same cache
+        # equals one after a fresh prefill of the same tokens), the drafts' recorded q,
+        # reproducibility, and greedy targets left to plain greedy decoding.
+        function check_sampled_drafts(proposer; min_rate, max_rate = 1)
+            gen(r, s, ids; kw...) = TileInfer.generate!(r, s, ids; stop_ids = Int[], rng = Xoshiro(1), kw...)
+            c = new_cache()
+            r, s = TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c)
+            stats = TileInfer.SpecStats()
+            out = gen(r, s, prompt; max_new_tokens = 60, sampling = sampled, speculative = proposer, spec_stats = stats)
+            @test length(out) == 60 && s.tokens == [prompt; out[1:end-1]]
+            @test min_rate < TileInfer.acceptance_rate(stats) <= max_rate
+            @test length(unique(out)) > 5
+            dists = TileInfer.draft_dists(proposer, r)
+            drafts = TileInfer.propose(proposer, [prompt; out], proposer.k)
+            q_ids, q_probs = Array(dists.ids), Array(dists.probs)
+            @test all(drafts[j] in q_ids[:, j] for j in eachindex(drafts))
+            @test all(sum(q_probs[:, j]) ≈ 1 for j in eachindex(drafts))
+            more = gen(r, s, out[end:end]; max_new_tokens = 8, pipeline = false)
+            c = new_cache()
+            @test more == gen(TileInfer.ModelRunner(m, c), TileInfer.new_sequence(c), [prompt; out];
+                              max_new_tokens = 8, pipeline = false)
+            @test speculative(60, Int[]; sampling = sampled, proposer)[1] == out
+            @test speculative(60, Int[]; proposer) == plain(60, Int[])
+            @test TileInfer.draft_dists(proposer, TileInfer.ModelRunner(m, new_cache())) === nothing   # greedy
+        end
+
         @testset "draft-model proposer" begin
             # The target drafts for itself on a cache of its own: nearly every draft is accepted.
             continuation(ctx, n) = (c = new_cache();
@@ -127,6 +154,11 @@ if test_model_dir() !== nothing
                 @test speculative(30, [stop]; proposer) == plain(30, [stop])
             end
             @test all(speculative(n, Int[]; proposer) == plain(n, Int[]) for n in 1:10)   # one proposer, rewound each time
+
+            # The target drafting for itself samples from q ≈ p: nearly every draft is accepted.
+            @testset "sampled drafts, k = $k" for k in (1, 4, 7)
+                check_sampled_drafts(TileInfer.DraftProposer(m; k, sample = true, max_tokens = 512); min_rate = 0.9)
+            end
         end
 
         eagle_dir = try TileInfer.model_dir(EAGLE_TEST_HEAD) catch; nothing end
@@ -163,6 +195,10 @@ if test_model_dir() !== nothing
                 @test speculative(30, [stop]; proposer) == plain(30, [stop])
             end
             @test all(speculative(n, Int[]; proposer) == plain(n, Int[]) for n in 1:10)
+            @testset "sampled drafts, k = $k" for k in (1, 4)
+                check_sampled_drafts(TileInfer.Eagle3Proposer(d; k, sample = true, max_tokens = 512); min_rate = 0.2,
+                                     max_rate = 0.98)
+            end
 
             @testset "continuing a sequence, as chat turns do" begin
                 function turns(proposer)

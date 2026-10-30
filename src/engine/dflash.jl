@@ -109,16 +109,20 @@ DFlashStep(d::DFlashDrafter{T}, cache::PagedKVCache{T}, c::Integer) where {T} =
                   CuMatrix{T}(undef, size(d.fc, 1), c))
 
 """
-    DFlashProposer(drafter; k = drafter.block_size - 1, max_tokens = max_length(drafter),
+    DFlashProposer(drafter; k = drafter.block_size - 1, sample = false, max_tokens = max_length(drafter),
                    graphs = supports_graphs(drafter.backend))
 
 Proposes the first `k` of the `block_size - 1` tokens that the DFlash `drafter` (see
 [`load_dflash`](@ref)) drafts in one pass, on a KV cache of its own for up to `max_tokens`
-positions. Like [`Eagle3Proposer`](@ref), reads the hidden states of the target's latest
+positions: the argmax at each block position, or, when `sample` and the target samples, a
+sample with the target's parameters (each position independently: the block's positions do
+not see each other's drafts, so q of draft j is the drafter's distribution at position j). Like [`Eagle3Proposer`](@ref), reads the hidden states of the target's latest
 step, which generation enables on the target's runner.
 """
 mutable struct DFlashProposer{D<:DFlashDrafter,T}
     const k::Int
+    const sample::Bool
+    const dists::DraftDists                      # of the drafts, when sampled
     const drafter::D
     const cache::PagedKVCache{T}
     const seq::Sequence                          # the context positions the cache holds
@@ -130,17 +134,18 @@ mutable struct DFlashProposer{D<:DFlashDrafter,T}
     const sink::CuVector{Int32}                  # device copies of the drafts
     const mirror::CuVector{Int32}                # host-mapped: the drafts
     const mirror_host::Vector{Int32}
-    const sampler::TokenSampler                  # greedy
+    const sampler::TokenSampler
     target::Any                                  # the target's ModelRunner
 end
 
-function DFlashProposer(d::DFlashDrafter{T}; k::Integer = d.block_size - 1, max_tokens::Integer = max_length(d),
+function DFlashProposer(d::DFlashDrafter{T}; k::Integer = d.block_size - 1, sample::Bool = false,
+                        max_tokens::Integer = max_length(d),
                         graphs::Bool = supports_graphs(d.backend)) where {T}
     B, H, V = d.block_size, d.config.hidden_size, d.config.vocab_size
     1 <= k < B || throw(ArgumentError("k must be in 1:$(B - 1)"))
     cache = PagedKVCache{T}(d.config, cld(min(max_tokens + B, max_length(d)), DEFAULT_PAGE_SIZE))
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, B - 1)
-    return DFlashProposer{typeof(d),T}(k, d, cache, new_sequence(cache), graphs, Dict{Int,Any}(),
+    return DFlashProposer{typeof(d),T}(k, sample, DraftDists(B - 1), d, cache, new_sequence(cache), graphs, Dict{Int,Any}(),
                                        CuMatrix{T}(undef, H, B), CuMatrix{T}(undef, H, B),
                                        CuMatrix{Float32}(undef, V, B - 1), CuVector{Int32}(undef, B - 1), mirror,
                                        unsafe_wrap(Array, mirror), TokenSampler(V), nothing)
@@ -150,9 +155,12 @@ function attach!(p::DFlashProposer, r::ModelRunner)
     size(p.drafter.fc, 1) == length(p.drafter.aux_layers) * r.model.config.hidden_size ||
         throw(ArgumentError("the DFlash drafter does not fit this target model"))
     enable_aux!(r, p.drafter.aux_layers)
+    reset_draft_sampler!(p.sampler, p.sample, r)
     p.target = r
     return p
 end
+
+draft_dists(p::DFlashProposer, r::ModelRunner) = samples_for(p.sample, r) ? p.dists : nothing
 
 # The drafter on a prepared step whose aux holds the target's context states; leaves the
 # logits of block positions 2:B in p.logits.
@@ -183,7 +191,8 @@ function dflash_step!(p::DFlashProposer{<:DFlashDrafter{T}}, s::DFlashStep{T}) w
     end
     linear!(be, p.logits, d.lm_head, view(p.h, :, 2:B))
     for j in 1:B-1
-        sample_token!(be, view(p.sink, j:j), view(p.mirror, j:j), view(p.logits, :, j:j), p.sampler)
+        args = (be, view(p.sink, j:j), view(p.mirror, j:j), view(p.logits, :, j:j), p.sampler)
+        p.sample ? sample_token!(args..., column(p.dists, j)) : sample_token!(args...)   # see DraftProposer
     end
 end
 

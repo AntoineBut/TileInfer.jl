@@ -87,6 +87,16 @@ else
         @test all(gen(p; n) == gen(nothing; n) for n in (1, 2, 17))
         sampled = TileInfer.SamplingParams(temperature = 0.7, top_k = 20, top_p = 0.8)
         @test gen(p; sampling = sampled) == gen(nothing; sampling = sampled)
+        # Sampled drafts (p/q rule): other tokens than plain decoding's, and the cache consistent
+        # with them.
+        ps = TileInfer.DFlashProposer(d; sample = true, max_tokens = 512)
+        stats = TileInfer.SpecStats()
+        out, tokens = gen(ps; sampling = sampled, stats)
+        @test length(out) == 40 && tokens == [prompt; out[1:end-1]]
+        @test 0.2 < TileInfer.acceptance_rate(stats) < 1
+        @test gen(ps; sampling = sampled) == (out, tokens)                   # reproducible
+        @test gen(ps) == plain                                               # greedy target
+        @test all(sum(Array(ps.dists.probs); dims = 1) .≈ 1)                 # q of every block position
 
         @testset "continuing a sequence, as chat turns do" begin
             function turns(proposer)

@@ -27,7 +27,7 @@ mutable struct ModelRunner{T,M<:DecoderLM{T},C<:PagedKVCache{T}}
     const cache::C
     const graphs::Bool
     const steps::Dict{Int,CapturedStep{T}}
-    const verify_steps::Dict{Int,Any}   # VerifyStep{T} by token count, see `verify!`
+    const verify_steps::Dict{Tuple{Int,UInt},Any}   # VerifyStep{T} by token count and drafts' q, see `verify!`
     const sampler::TokenSampler      # device sampling state, see `sample_token!`
     const token::CuVector{Int32}     # the token sampled by a step-by-step generation
     pipeline::Any                    # DecodePipeline, created on first use
@@ -40,7 +40,7 @@ function ModelRunner(model::DecoderLM{T}, cache::PagedKVCache{T};
                      graphs::Bool = supports_graphs(model.backend)) where {T}
     graphs && !supports_graphs(model.backend) &&
         throw(ArgumentError("$(nameof(typeof(model.backend))) steps cannot be captured in CUDA graphs"))
-    return ModelRunner(model, cache, graphs, Dict{Int,CapturedStep{T}}(), Dict{Int,Any}(), TokenSampler(model.config.vocab_size),
+    return ModelRunner(model, cache, graphs, Dict{Int,CapturedStep{T}}(), Dict{Tuple{Int,UInt},Any}(), TokenSampler(model.config.vocab_size),
                        CuVector{Int32}(undef, 1), nothing, Int[], nothing, 0)
 end
 

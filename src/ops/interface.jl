@@ -151,6 +151,40 @@ function sample_token!(::Backend, ids, mirror, logits, s)
 end
 
 """
+    sample_token!(backend, ids, mirror, logits, sampler, (q_ids, q_probs))
+
+[`sample_token!`](@ref) that also writes the distribution the token is sampled from, for
+speculative sampling ([`accept_token!`](@ref)): the 0-based ids of the
+[`filtered_dist`](@ref) survivors, best first, into `q_ids` (-1 past them) and their
+probabilities into `q_probs` (0 past them), vectors of `MAX_TOP_K` entries.
+"""
+function sample_token!(be::Backend, ids, mirror, logits, s, (q_ids, q_probs))
+    t, q = filtered_dist(vec(Array(logits)), s.sampling)
+    pad = length(q_ids) - length(t)
+    copyto!(q_ids, [Int32.(t .- 1); fill(Int32(-1), pad)])
+    copyto!(q_probs, [Float32.(q); zeros(Float32, pad)])
+    return sample_token!(be, ids, mirror, logits, s)
+end
+
+"""
+    accept_token!(backend, ids, mirror, logits, sampler, draft, (q_ids, q_probs))
+
+The token a verify step emits at a position drafted as `draft[1]` from the distribution
+`(q_ids, q_probs)` (see [`accept_host`](@ref)): `draft[1]` with probability
+min(1, p/q) under the sampler's parameters, else a token from max(p - q, 0) that differs
+from it. Uses and advances the sampler's counter like [`sample_token!`](@ref).
+"""
+function accept_token!(::Backend, ids, mirror, logits, s, draft, (q_ids, q_probs))
+    state = Array(s.state)
+    token = Int32[accept_host(vec(Array(logits)), s.sampling, Array(draft)[1], Array(q_ids), Array(q_probs),
+                              accept_uniform(s.seed, state[3]), sampling_uniform(s.seed, state[3]))]
+    copyto!(ids, token)
+    copyto!(mirror, token)
+    copyto!(s.state, UInt32[state[1], state[2], state[3] + 1])
+    return ids
+end
+
+"""
     map_token!(backend, ids, mirror, offsets)
 
 Map the 0-based token `ids[1]` of a reduced vocabulary to `ids[1] + offsets[ids[1] + 1]`, into
@@ -162,6 +196,13 @@ function map_token!(::Backend, ids, mirror, offsets)
     copyto!(ids, token)
     copyto!(mirror, token)
     return ids
+end
+
+# With the distribution the token was sampled from, whose ids are mapped too.
+function map_token!(be::Backend, ids, mirror, offsets, (q_ids, _))
+    q, off = Array(q_ids), Array(offsets)
+    copyto!(q_ids, [t < 0 ? t : t + off[t+1] for t in q])
+    return map_token!(be, ids, mirror, offsets)
 end
 
 """

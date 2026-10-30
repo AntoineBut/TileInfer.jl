@@ -5,12 +5,13 @@
 # open-ended ones.
 #
 #   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--eagle REPO|none]
-#       [--dflash REPO|none] [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled] [--filter REGEX]
+#       [--dflash REPO|none] [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled [--pq]] [--filter REGEX]
 #
 # Defaults: Qwen/Qwen3-4B drafted by Qwen/Qwen3-0.6B, AngelSlim/Qwen3-4B_eagle3 and
 # z-lab/Qwen3-4B-DFlash-b16 (the last two for Qwen3-4B; none otherwise), k = 2, 4, 7,
 # 256 new tokens, greedy
-# (--sampled: the model's recommended sampling, same seed for every method). Decode tok/s
+# (--sampled: the model's recommended sampling, same seed for every method; --pq: the model
+# proposers sample their drafts too, verified by the p/q rule). Decode tok/s
 # runs from the first new token to the last, so it excludes the target's prefill but includes
 # the draft model's (it prefills during the first proposal). Each case is the best of
 # `trials` runs after a warm-up run that compiles and captures every step.
@@ -48,7 +49,7 @@ const PROMPTS = [
 const MAX_TOKENS = 2048
 
 function main(args)
-    _, opts = TileInfer.parse_args(args; flags = ("sampled",))
+    _, opts = TileInfer.parse_args(args; flags = ("sampled", "pq"))
     target_name = get(opts, "model", "Qwen/Qwen3-4B")
     draft_name = get(opts, "draft", "Qwen/Qwen3-0.6B")
     eagle_name = get(opts, "eagle", target_name == "Qwen/Qwen3-4B" ? "AngelSlim/Qwen3-4B_eagle3" : "none")
@@ -74,21 +75,26 @@ function main(args)
     dflash_runner = dflash === nothing ? nothing : aux_runner()
 
     methods = Tuple{String,Any,Any}[("plain", nothing, runner)]
+    sample = haskey(opts, "pq")
+    sample && sampling.temperature == 0 && throw(ArgumentError("--pq needs --sampled"))
+    pq = sample ? " pq" : ""
     for k in ks
         push!(methods, ("ngram k=$k", NgramProposer(; k), runner))
-        draft === nothing || push!(methods, ("draft k=$k", DraftProposer(draft; k, max_tokens = MAX_TOKENS), runner))
-        eagle === nothing || push!(methods, ("eagle k=$k", Eagle3Proposer(eagle; k, max_tokens = MAX_TOKENS), eagle_runner))
+        draft === nothing ||
+            push!(methods, ("draft$pq k=$k", DraftProposer(draft; k, sample, max_tokens = MAX_TOKENS), runner))
+        eagle === nothing ||
+            push!(methods, ("eagle$pq k=$k", Eagle3Proposer(eagle; k, sample, max_tokens = MAX_TOKENS), eagle_runner))
     end
     if dflash !== nothing
         for k in unique!([[k for k in ks if k < dflash.block_size]; dflash.block_size - 1])
-            push!(methods, ("dflash k=$k", DFlashProposer(dflash; k, max_tokens = MAX_TOKENS), dflash_runner))
+            push!(methods, ("dflash$pq k=$k", DFlashProposer(dflash; k, sample, max_tokens = MAX_TOKENS), dflash_runner))
         end
     end
 
     println("target $target_name, draft $draft_name, EAGLE-3 $eagle_name, DFlash $dflash_name, ",
-            sampling.temperature == 0 ? "greedy" : "sampled $sampling",
+            sampling.temperature == 0 ? "greedy" : "sampled $sampling", sample ? ", sampled drafts" : "",
             ", $n tokens, best of $trials")
-    @printf("%-9s %-11s %8s %7s %6s %6s %8s %11s\n", "prompt", "method", "tok/s", "speedup", "out", "steps",
+    @printf("%-9s %-14s %8s %7s %6s %6s %8s %11s\n", "prompt", "method", "tok/s", "speedup", "out", "steps",
             "accept", "tokens/step")
     for (name, text) in PROMPTS
         occursin(filter, name) || continue
@@ -111,7 +117,7 @@ function main(args)
             best = maximum(first(run()) for _ in 1:trials)
             _, out, stats = run()
             proposer === nothing && (base = best)
-            @printf("%-9s %-11s %8.1f %6.2f× %6d %6s %8s %11s\n", name, method, best, best / base, length(out),
+            @printf("%-9s %-14s %8.1f %6.2f× %6d %6s %8s %11s\n", name, method, best, best / base, length(out),
                     proposer === nothing ? "" : string(stats.steps),
                     proposer === nothing ? "" : @sprintf("%.2f", TileInfer.acceptance_rate(stats)),
                     proposer === nothing ? "" : @sprintf("%.2f", length(out) / stats.steps))

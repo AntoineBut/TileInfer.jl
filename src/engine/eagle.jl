@@ -128,16 +128,20 @@ function eagle_layer!(d::Eagle3Drafter{T}, cache::PagedKVCache{T}, s::EagleStep{
 end
 
 """
-    Eagle3Proposer(drafter; k = 4, max_tokens = max_length(drafter),
+    Eagle3Proposer(drafter; k = 4, sample = false, max_tokens = max_length(drafter),
                    graphs = supports_graphs(drafter.backend))
 
 Proposes the next `k` tokens that the EAGLE-3 `drafter` decodes greedily (see
-[`load_eagle3`](@ref)), on a KV cache of its own for up to `max_tokens` positions. Reads the
+[`load_eagle3`](@ref)), or samples with the target's parameters when `sample` and the target
+samples (see [`DraftProposer`](@ref)), on a KV cache of its own for up to `max_tokens`
+positions. Reads the
 hidden states of the target's latest step: generation enables them on the target's runner
 ([`enable_aux!`](@ref)).
 """
 mutable struct Eagle3Proposer{D<:Eagle3Drafter,T}
     const k::Int
+    const sample::Bool
+    const dists::DraftDists                      # of the drafts, when sampled
     const drafter::D
     const cache::PagedKVCache{T}
     const seq::Sequence                          # tokens[p + 1]: the token read at position p
@@ -148,16 +152,16 @@ mutable struct Eagle3Proposer{D<:Eagle3Drafter,T}
     const sink::CuVector{Int32}                  # ids written by the last step
     const mirror::CuVector{Int32}                # host-mapped: the drafts
     const mirror_host::Vector{Int32}
-    const sampler::TokenSampler                  # greedy, over the draft vocabulary
+    const sampler::TokenSampler                  # over the draft vocabulary
     target::Any                                  # the target's ModelRunner
 end
 
-function Eagle3Proposer(d::Eagle3Drafter{T}; k::Integer = 4, max_tokens::Integer = max_length(d),
+function Eagle3Proposer(d::Eagle3Drafter{T}; k::Integer = 4, sample::Bool = false, max_tokens::Integer = max_length(d),
                         graphs::Bool = supports_graphs(d.backend)) where {T}
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("k must be in 1:$(MAX_GRAPH_TOKENS - 1)"))
     cache = PagedKVCache{T}(d.config, cld(min(max_tokens, max_length(d)), DEFAULT_PAGE_SIZE))
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, k)
-    return Eagle3Proposer{typeof(d),T}(k, d, cache, new_sequence(cache), graphs, Dict{Int,Any}(),
+    return Eagle3Proposer{typeof(d),T}(k, sample, DraftDists(k), d, cache, new_sequence(cache), graphs, Dict{Int,Any}(),
                                        [EagleStep(d, cache, 1) for _ in 1:k-1],
                                        fill!(Vector{Union{Nothing,CUDA.CuGraphExec}}(undef, k - 1), nothing),
                                        CuVector{Int32}(undef, 1), mirror, unsafe_wrap(Array, mirror),
@@ -168,9 +172,12 @@ function attach!(p::Eagle3Proposer, r::ModelRunner)
     size(p.drafter.fc, 1) == length(p.drafter.aux_layers) * r.model.config.hidden_size ||
         throw(ArgumentError("the EAGLE drafter does not fit this target model"))
     enable_aux!(r, p.drafter.aux_layers)
+    reset_draft_sampler!(p.sampler, p.sample, r)
     p.target = r
     return p
 end
+
+draft_dists(p::Eagle3Proposer, r::ModelRunner) = samples_for(p.sample, r) ? p.dists : nothing
 
 # Sample the draft of step i (i = 0: the first pass) from step s into the next chain step's
 # inputs: its token, and r of the last position as its hin.
@@ -179,8 +186,14 @@ function sample_eagle!(p::Eagle3Proposer, i, s::EagleStep)
     last = i < p.k - 1 ? p.chain[i+1] : nothing
     ids = last === nothing ? p.sink : last.b.ids
     mirror = view(p.mirror, i+1:i+1)
-    sample_token!(be, ids, mirror, b.logits, p.sampler)
-    map_token!(be, ids, mirror, p.drafter.d2t)
+    if p.sample                                  # q too (see DraftProposer), mapped like the token
+        q = column(p.dists, i + 1)
+        sample_token!(be, ids, mirror, b.logits, p.sampler, q)
+        map_token!(be, ids, mirror, p.drafter.d2t, q)
+    else
+        sample_token!(be, ids, mirror, b.logits, p.sampler)
+        map_token!(be, ids, mirror, p.drafter.d2t)
+    end
     if last !== nothing
         H, n = size(b.x)
         copyto!(last.b.x, 1, b.x, (n - 1) * H + 1, H)

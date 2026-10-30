@@ -202,5 +202,59 @@ using Random: randperm
         @test Array(s.state)[3] == 1
     end
 
+    # Speculative sampling: a drafter's sample with its distribution q, and the verifier's
+    # p/q decision, against the host reference with the same uniform numbers.
+    @testset "sample_token with q, accept_token (vocab = $V)" for V in (151936, 5000)
+        K = TileInfer.MAX_TOP_K
+        ids, mirror, draft = CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1)
+        q_ids, q_probs = CUDA.zeros(Int32, K), CUDA.zeros(Float32, K)
+        s, sq = TileInfer.TokenSampler(V), TileInfer.TokenSampler(V)
+        checked = skipped = accepted = 0
+        for case in 1:4, (temperature, top_k, top_p) in ((0, 0, 1), (1, 2, 1), (0.6, 20, 0.95), (1.5, 64, 1))
+            p = TileInfer.SamplingParams(; temperature, top_k, top_p)
+            seed = rand(UInt32)
+            TileInfer.reset_sampler!(s, p, seed)
+            TileInfer.reset_sampler!(sq, p, TileInfer.draft_seed(seed))
+            for counter in UInt32(0):UInt32(4)
+                # The draft's logits: the target's, perturbed (case 1: equal; case 4: unrelated).
+                logits = randn(Float32, V) .* 3
+                qlogits = case == 1 ? logits : case == 4 ? randn(Float32, V) .* 3 : logits .+ randn(Float32, V) .* case
+                TileInfer.sample_token!(tile, draft, mirror, CuArray(reshape(qlogits, V, 1)), sq, (q_ids, q_probs))
+                t, q = TileInfer.filtered_dist(qlogits, p)
+                @test Array(q_ids) == [t .- 1; fill(-1, K - length(t))]
+                @test Array(q_probs) ≈ [q; zeros(K - length(q))] atol = 1e-5
+                d = Array(draft)[1]
+                @test d == Array(mirror)[1] && d + 1 in t
+                TileInfer.accept_token!(tile, ids, mirror, CuArray(reshape(logits, V, 1)), s, draft, (q_ids, q_probs))
+                @test Array(ids)[1] == Array(mirror)[1]
+                ua, u = TileInfer.accept_uniform(seed, counter), TileInfer.sampling_uniform(seed, counter)
+                expected = TileInfer.accept_host(logits, p, d, Array(q_ids), Array(q_probs), ua, u)
+                # Skip decisions Float32 round-off could move, as for sample_token.
+                if any(TileInfer.accept_host(logits, p, d, Array(q_ids), Array(q_probs), clamp(a, 0, 1), clamp(b, 0, 1)) != expected
+                       for (a, b) in ((ua - 1f-5, u), (ua + 1f-5, u), (ua, u - 1f-5), (ua, u + 1f-5)))
+                    skipped += 1
+                    continue
+                end
+                checked += 1
+                accepted += expected == d
+                Array(ids)[1] == expected || @test Array(ids)[1] == expected
+            end
+            @test Array(s.state)[3] == Array(sq.state)[3] == 5
+        end
+        @test skipped < checked ÷ 10
+        @test 0 < accepted < checked                     # both branches exercised
+        # The fallbacks run the host reference itself.
+        logits = CUDA.randn(Float32, V, 1) .* 3
+        p = TileInfer.SamplingParams(temperature = 0.6, top_k = 20, top_p = 0.95)
+        TileInfer.reset_sampler!(s, p, UInt32(5))
+        TileInfer.sample_token!(ref, draft, mirror, logits, s, (q_ids, q_probs))
+        t, q = TileInfer.filtered_dist(vec(Array(logits)), p)
+        @test Array(q_ids)[1:length(t)] == t .- 1 && Array(q_probs)[1:length(q)] ≈ q
+        @test Array(draft)[1] == TileInfer.sample_host(vec(Array(logits)), p, TileInfer.sampling_uniform(UInt32(5), UInt32(0)))
+        TileInfer.accept_token!(ref, ids, mirror, logits, s, draft, (q_ids, q_probs))
+        @test Array(ids)[1] == Array(draft)[1]           # q = p: always accepted
+        @test Array(s.state)[3] == 2
+    end
+
     @test TileInfer.has_kernel(tile, TileInfer.attention)
 end

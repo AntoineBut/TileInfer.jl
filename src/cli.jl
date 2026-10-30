@@ -26,6 +26,8 @@ const USAGE = """
       --eagle <drafter>     an EAGLE-3 drafter trained for the model drafts (K = 4 by default)
       --dflash <drafter>    a DFlash drafter trained for the model drafts a block in one pass
                             (K up to the block size - 1, all of it by default)
+      --sample-drafts       with a drafter and a temperature > 0: the drafter samples its drafts
+                            too, which are accepted by the p/q rule (default: greedy drafts)
     """
 
 # Splits `args` into positionals and `--name value` options; names in `flags` take no
@@ -95,7 +97,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft", "eagle", "dflash")
+                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -119,23 +121,25 @@ end
 # The proposer of --speculate / --draft / --eagle / --dflash, or nothing.
 function load_proposer(model::DecoderLM, options)
     drafters = filter(o -> haskey(options, o), ["draft", "eagle", "dflash"])
+    sample = haskey(options, "sample-drafts")
+    sample && isempty(drafters) && throw(ArgumentError("--sample-drafts needs --draft, --eagle or --dflash"))
     haskey(options, "speculate") || !isempty(drafters) || return nothing
     length(drafters) > 1 && throw(ArgumentError("use only one of --draft, --eagle and --dflash"))
     if haskey(options, "dflash")
         d = load_dflash(options["dflash"], model)
         k = parse_option(Int, options, "speculate", d.block_size - 1)
         1 <= k < d.block_size || throw(ArgumentError("--speculate expects 1 to $(d.block_size - 1) drafts with DFlash, got $k"))
-        return DFlashProposer(d; k)
+        return DFlashProposer(d; k, sample)
     end
     k = parse_option(Int, options, "speculate", 4)
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("--speculate expects 1 to $(MAX_GRAPH_TOKENS - 1) drafts, got $k"))
-    haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k)
+    haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k, sample)
     haskey(options, "draft") || return NgramProposer(; k)
     draft = load_model(model_dir(options["draft"]); T = eltype(model), backend = model.backend,
                        max_len = max_length(model))
     draft.config.vocab_size == model.config.vocab_size ||
         throw(ArgumentError("the draft model's vocabulary ($(draft.config.vocab_size)) differs from the model's ($(model.config.vocab_size))"))
-    return DraftProposer(draft; k)
+    return DraftProposer(draft; k, sample)
 end
 
 # Streams tokens to `io` and records when the first two arrived.
@@ -233,7 +237,7 @@ end
 
 const COMMANDS = Dict("pull" => cmd_pull, "ls" => cmd_ls, "rm" => cmd_rm, "run" => cmd_run,
                       "chat" => cmd_chat)
-const FLAGS = ("raw",)
+const FLAGS = ("raw", "sample-drafts")
 
 "Run the CLI on `args`; returns the process exit code."
 function cli(args::Vector{String})

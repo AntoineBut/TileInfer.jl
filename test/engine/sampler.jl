@@ -29,6 +29,42 @@ using Random: Xoshiro
         @test host(tied, P(temperature = 1.0, top_k = 2), 0.99) == 3
     end
 
+    @testset "filtered_dist" begin
+        ids, probs = TileInfer.filtered_dist(logits, P(temperature = 1.0, top_k = 2))
+        @test ids == [2, 4] && probs ≈ [1, exp(-0.5)] ./ (1 + exp(-0.5))
+        @test TileInfer.filtered_dist(logits, P()) == ([2], [1.0])
+        @test TileInfer.filtered_dist(logits, P(temperature = 1.0, top_p = 0.7))[1] == [2, 4]
+    end
+
+    # Speculative sampling: whatever q the drafts come from, the emitted tokens are distributed
+    # as the target's p, and a rejected draft is never emitted.
+    @testset "accept_host (q from $name)" for (name, qlogits, qp) in (
+            ("another model", Float32[2.0, 0.5, 1.0, 2.5, 0.0], P(temperature = 1.0, top_k = 4)),
+            ("the target", logits, P(temperature = 0.8, top_k = 3, top_p = 0.9)),
+            ("a greedy draft", Float32[0, 0, 0, 0, 1], P()))
+        p = P(temperature = 0.8, top_k = 3, top_p = 0.9)
+        q_ids, q_probs = TileInfer.filtered_dist(qlogits, qp)
+        q_ids .-= 1
+        rng = Xoshiro(3)
+        n = 200_000
+        counts = zeros(Int, length(logits))
+        accepted = 0
+        for _ in 1:n
+            d = TileInfer.sample_host(qlogits, qp, rand(rng))
+            t = TileInfer.accept_host(logits, p, d, q_ids, q_probs, rand(rng), rand(rng))
+            counts[t+1] += 1
+            accepted += t == d
+        end
+        ids, probs = TileInfer.filtered_dist(logits, p)
+        expected = zeros(length(logits))
+        expected[ids] .= probs
+        @test counts ./ n ≈ expected atol = 4e-3
+        # The acceptance rate is Σ min(p, q).
+        qfull = zeros(length(logits))
+        qfull[q_ids .+ 1] .= q_probs
+        @test accepted / n ≈ sum(min.(expected, qfull)) atol = 4e-3
+    end
+
     @testset "sampling_uniform" begin
         u = [TileInfer.sampling_uniform(UInt32(seed), UInt32(c)) for seed in 1:20 for c in 0:999]
         @test all(x -> 0 <= x < 1, u)

@@ -54,25 +54,76 @@ function top_candidates(logits::AbstractVector{<:Real}, k::Integer)
 end
 
 """
-    sample_host(logits, p, u) -> Int
+    filtered_dist(logits, p) -> (ids, probs)
 
-The 0-based token sampled from `logits` with `p` by the uniform number `u` ∈ [0, 1): the
-reference for the device samplers. Temperature, then top-k, then top-p (nucleus) over the
-renormalized survivors, as in transformers' default logits-processor order; then inverse
-transform sampling over the survivors, best first.
+The distribution [`sample_host`](@ref) samples from: the 1-based ids of the tokens that
+survive temperature, then top-k, then top-p (nucleus) over the renormalized survivors, as in
+transformers' default logits-processor order, best first, and their probabilities. Greedy
+decoding keeps only the argmax.
 """
-function sample_host(logits::AbstractVector{<:Real}, p::SamplingParams, u::Real)
-    p.temperature == 0 && return argmax(logits) - 1
+function filtered_dist(logits::AbstractVector{<:Real}, p::SamplingParams)
+    p.temperature == 0 && return [argmax(logits)], [1.0]
     ids = top_candidates(logits, p.top_k == 0 ? length(logits) : min(p.top_k, length(logits)))
     scaled = Float64.(logits[ids]) ./ p.temperature
     probs = exp.(scaled .- scaled[1])
     probs ./= sum(probs)
-    cum = cumsum(probs)
     if p.top_p < 1
         # Keep the smallest prefix whose mass reaches top_p (always at least one token).
-        cum = cum[1:something(findfirst(>=(p.top_p), cum), length(cum))]
+        n = something(findfirst(>=(p.top_p), cumsum(probs)), length(probs))
+        ids, probs = ids[1:n], probs[1:n] ./ sum(probs[1:n])
     end
-    return ids[something(findfirst(>=(u * cum[end]), cum), length(cum))] - 1
+    return ids, probs
+end
+
+# Inverse transform sampling over weights `w` (best first) by u ∈ [0, 1): the first entry whose
+# cumulative weight reaches u × the total, among those with positive weight (the last of them
+# on round-off).
+function pick_host(w::AbstractVector{<:Real}, u::Real)
+    cum = cumsum(w)
+    return something(findfirst(i -> w[i] > 0 && cum[i] >= u * cum[end], eachindex(w)), findlast(>(0), w))
+end
+
+"""
+    sample_host(logits, p, u) -> Int
+
+The 0-based token sampled from `logits` with `p` by the uniform number `u` ∈ [0, 1): the
+reference for the device samplers. Inverse transform sampling over
+[`filtered_dist`](@ref), best first.
+"""
+function sample_host(logits::AbstractVector{<:Real}, p::SamplingParams, u::Real)
+    ids, probs = filtered_dist(logits, p)
+    return ids[pick_host(probs, u)] - 1
+end
+
+# Speculative sampling with drafts sampled from a proposer's distribution q (Leviathan et
+# al., Chen et al.): the draft d is accepted with probability min(1, p(d) / q(d)), where p
+# is the target's filtered distribution; otherwise the token is sampled from the residual
+# max(p - q, 0), renormalized. Either way it is distributed as p, and a resampled token
+# never equals d (its residual is 0 when it is rejected). Acceptance draws its uniform
+# number from a stream of its own, and drafters sample under a seed of their own.
+
+"The uniform number that decides whether the `counter`-th token accepts its draft."
+@inline accept_uniform(seed::UInt32, counter::UInt32) = sampling_uniform(xor(seed, 0x3c6ef372), counter)
+
+"The seed a drafter samples its drafts with, for a generation sampled under `seed`."
+draft_seed(seed::UInt32) = xor(seed, 0x9e3779b9)
+
+"""
+    accept_host(logits, p, draft, q_ids, q_probs, ua, u) -> Int
+
+The 0-based token emitted at a position drafted as `draft` (0-based), drawn from a
+distribution q (0-based `q_ids` with probabilities `q_probs`; other ids have probability
+0): `draft` when `ua * q(draft) < p(draft)`, else a token sampled by `u` from max(p - q, 0),
+renormalized over p's survivors best first. The reference for the device verifier.
+"""
+function accept_host(logits::AbstractVector{<:Real}, p::SamplingParams, draft::Integer,
+                     q_ids::AbstractVector{<:Integer}, q_probs::AbstractVector{<:Real}, ua::Real, u::Real)
+    ids, probs = filtered_dist(logits, p)
+    q(t) = sum(q_probs[i] for i in eachindex(q_ids) if q_ids[i] == t; init = 0.0)
+    pd = sum(probs[i] for i in eachindex(ids) if ids[i] == draft + 1; init = 0.0)
+    r = [max(probs[i] - q(ids[i] - 1), 0.0) for i in eachindex(ids)]
+    (ua * q(draft) < pd || sum(r) <= 0) && return Int(draft)
+    return ids[pick_host(r, u)] - 1
 end
 
 """

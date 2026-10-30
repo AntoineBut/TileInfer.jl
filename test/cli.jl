@@ -56,6 +56,13 @@ end
             @test occursin("Paris", out)
             @test occursin("tokens per step", err)
         end
+        # Sampled drafts, with the model drafting for itself.
+        code, out, err = run_cli("run", TEST_MODEL, "The capital of France is", "--raw", "--temperature", "0.6",
+                                 "--top-k", "20", "--max-tokens", "12", "--max-context", "256", "--draft", TEST_MODEL,
+                                 "--sample-drafts")
+        @test code == 0 && occursin("tokens per step", err)
+        code, _, err = run_cli("run", TEST_MODEL, "hi", "--sample-drafts")
+        @test code == 1 && occursin("--sample-drafts needs", err)
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--speculate", "8")
         @test code == 1 && occursin("--speculate expects 1 to 7", err)
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--draft", TEST_MODEL, "--dflash", TEST_MODEL)
