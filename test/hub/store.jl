@@ -10,6 +10,18 @@
         @test !TileInfer.wanted_file("onnx/model.safetensors")
     end
 
+    @testset "skipped shards" begin
+        weight_map = Dict("lm_head.weight" => "model-apertus-model-00003-of-00004.safetensors",
+                          "model.language_model.norm.weight" => "model-apertus-model-00004-of-00004.safetensors",
+                          "model.vision_tokenizer.encoder.conv_in.weight" => "model-vision_tokenizer-model.safetensors",
+                          "model.audio_tokenizer.encoder.conv.weight" => "model-wavtokenizer-model.safetensors",
+                          # a skipped tensor in a shard that is needed anyway
+                          "model.vision_tokenizer.quantize.embedding.weight" => "model-apertus-model-00004-of-00004.safetensors")
+        @test TileInfer.skipped_shards(weight_map) ==
+              Set(["model-vision_tokenizer-model.safetensors", "model-wavtokenizer-model.safetensors"])
+        @test isempty(TileInfer.skipped_shards(Dict("model.norm.weight" => "model.safetensors")))
+    end
+
     @testset "local directory" begin
         mktempdir() do dir
             @test TileInfer.model_dir(dir) == abspath(dir)

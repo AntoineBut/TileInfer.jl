@@ -11,17 +11,33 @@ function wanted_file(name::AbstractString)
     return endswith(name, ".safetensors") || endswith(name, ".json") || name == "merges.txt"
 end
 
+# Tensors of multimodal checkpoints that TileInfer does not run: Apertus 1.5's image and
+# audio tokenizers, in shards of their own.
+const SKIPPED_TENSOR_PREFIXES = ("model.vision_tokenizer.", "model.audio_tokenizer.")
+
+"Shards of a `model.safetensors.index.json` weight map holding only skipped tensors."
+function skipped_shards(weight_map::AbstractDict)
+    needed = Set(file for (name, file) in weight_map if !any(startswith(name, p) for p in SKIPPED_TENSOR_PREFIXES))
+    return setdiff(Set(values(weight_map)), needed)
+end
+
 """
     pull(repo_id; revision = "main") -> snapshot directory
 
 Download the inference files of `repo_id` into the hub cache and return the directory of
-the snapshot. Files already in the cache are not downloaded again.
+the snapshot. Files already in the cache are not downloaded again. Gated repos need an
+access token in `HF_TOKEN` or `~/.cache/huggingface/token`.
 """
 function pull(repo_id::AbstractString; revision::AbstractString = "main")
     files = filter(wanted_file, HuggingFaceApi.list_model_files(repo_id; revision))
     any(endswith(".safetensors"), files) ||
         error("$repo_id has no safetensors weights; only safetensors checkpoints are supported")
     "config.json" in files || error("$repo_id has no config.json")
+    index = "model.safetensors.index.json"
+    if index in files
+        weight_map = JSON.parsefile(hf_hub_download(repo_id, index; revision))["weight_map"]
+        setdiff!(files, skipped_shards(weight_map))
+    end
     # config.json last: `model_dir` resolves a model through it, so an interrupted pull is
     # never mistaken for a complete one.
     sort!(files; by = ==("config.json"))

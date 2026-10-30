@@ -24,6 +24,7 @@ function load_model(model::AbstractString; T::Type = BFloat16, backend::Backend 
                     max_len::Integer = 4096)
     dir = model_dir(model)
     cfg = load_config(dir)
+    cfg.hidden_act == :silu || error("the $(cfg.hidden_act) MLP of $(cfg.model_type) is not implemented yet")
     max_len = min(max_len, cfg.max_position_embeddings)
     return DecoderLM(cfg, load_weights(T, cfg, dir), RotaryTable{T}(cfg, max_len), backend)
 end

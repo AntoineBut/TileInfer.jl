@@ -1,10 +1,11 @@
 # Model hyperparameters, parsed from a Hugging Face config.json. One struct covers the
-# Llama-style decoder family; per-family differences are flags.
+# Llama-style decoder family (and Apertus, whose MLP is ungated); per-family differences
+# are flags.
 
 using JSON: JSON
 using BFloat16s: BFloat16
 
-const SUPPORTED_MODEL_TYPES = ("llama", "mistral", "qwen2", "qwen3")
+const SUPPORTED_MODEL_TYPES = ("llama", "mistral", "qwen2", "qwen3", "apertus", "apertus1p5")
 
 "Llama 3.x frequency-dependent RoPE scaling (`rope_type = \"llama3\"`)."
 struct Llama3RopeScaling
@@ -22,7 +23,7 @@ Hyperparameters of a Llama-style decoder. Build from a model directory with
 """
 Base.@kwdef struct ModelConfig
     model_type::String
-    vocab_size::Int
+    vocab_size::Int            # rows of lm_head; Apertus 1.5's embedding has more (image/audio codes)
     hidden_size::Int
     intermediate_size::Int
     num_layers::Int
@@ -35,7 +36,8 @@ Base.@kwdef struct ModelConfig
     max_position_embeddings::Int
     tie_word_embeddings::Bool
     qkv_bias::Bool             # Qwen2
-    qk_norm::Bool              # Qwen3: RMSNorm over head_dim on q and k before RoPE
+    qk_norm::Bool              # Qwen3, Apertus: RMSNorm over head_dim on q and k before RoPE
+    hidden_act::Symbol         # :silu (gated SwiGLU MLP) or :xielu (Apertus: ungated xIELU MLP)
     dtype::DataType            # checkpoint element type
     bos_token_id::Union{Nothing,Int}
     eos_token_ids::Vector{Int}
@@ -50,7 +52,12 @@ function parse_config(c::AbstractDict)
     model_type = c["model_type"]
     model_type in SUPPORTED_MODEL_TYPES ||
         error("unsupported model_type \"$model_type\"; supported: $(join(SUPPORTED_MODEL_TYPES, ", "))")
-    get(c, "hidden_act", "silu") == "silu" || error("unsupported hidden_act \"$(c["hidden_act"])\"")
+    # Apertus 1.5 is multimodal: the decoder's settings are nested, and its image and audio
+    # tokenizers (which TileInfer does not run) are configured beside them.
+    model_type == "apertus1p5" && (c = c["text_config"])
+    hidden_act = get(c, "hidden_act", "silu")
+    hidden_act in ("silu", "xielu") || error("unsupported hidden_act \"$hidden_act\"")
+    get(c, "post_norm", false) && error("Apertus post-norm layers are not supported")
     sliding = get(c, "use_sliding_window", model_type == "mistral") &&
               get(c, "sliding_window", nothing) !== nothing
     sliding && error("sliding-window attention is not supported yet")
@@ -68,7 +75,8 @@ function parse_config(c::AbstractDict)
 
     return ModelConfig(;
         model_type,
-        vocab_size = c["vocab_size"],
+        # Apertus 1.5 embeds image and audio codes but only predicts text tokens.
+        vocab_size = something(get(c, "output_vocab_size", nothing), c["vocab_size"]),
         hidden_size = c["hidden_size"],
         intermediate_size = c["intermediate_size"],
         num_layers = c["num_hidden_layers"],
@@ -81,7 +89,8 @@ function parse_config(c::AbstractDict)
         max_position_embeddings = c["max_position_embeddings"],
         tie_word_embeddings = get(c, "tie_word_embeddings", false),
         qkv_bias = model_type == "qwen2" || get(c, "attention_bias", false),
-        qk_norm = model_type == "qwen3",
+        qk_norm = get(c, "qk_norm", model_type == "qwen3"),
+        hidden_act = Symbol(hidden_act),
         dtype = DTYPES[dtype_name],
         bos_token_id = get(c, "bos_token_id", nothing),
         eos_token_ids = eos === nothing ? Int[] : eos isa Integer ? [eos] : collect(Int, eos),
