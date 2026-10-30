@@ -85,6 +85,8 @@ Speculative decoding
 - Medusa: https://arxiv.org/abs/2401.10774
 - EAGLE / EAGLE-2 / EAGLE-3: https://arxiv.org/abs/2401.15077 · https://arxiv.org/abs/2406.16858 · https://arxiv.org/abs/2503.01840
 - Multi-token prediction (MTP) in DeepSeek-V3: https://arxiv.org/abs/2412.19437
+- DFlash (block-diffusion drafter): https://arxiv.org/abs/2602.06036 · https://github.com/z-lab/dflash ·
+  drafter checkpoints with the reference `dflash.py`: https://huggingface.co/z-lab/Qwen3-4B-DFlash-b16
 
 Model building blocks
 - RoPE: https://arxiv.org/abs/2104.09864

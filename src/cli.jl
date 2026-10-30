@@ -24,6 +24,8 @@ const USAGE = """
                             n-gram lookup in the conversation, or by --draft
       --draft <model>       a smaller model with the same vocabulary drafts (K = 4 by default)
       --eagle <drafter>     an EAGLE-3 drafter trained for the model drafts (K = 4 by default)
+      --dflash <drafter>    a DFlash drafter trained for the model drafts a block in one pass
+                            (K up to the block size - 1, all of it by default)
     """
 
 # Splits `args` into positionals and `--name value` options; names in `flags` take no
@@ -93,7 +95,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft", "eagle")
+                            "backend", "speculate", "draft", "eagle", "dflash")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -114,10 +116,17 @@ function load_for_generation(model_name, options)
             speculative = load_proposer(model, options))
 end
 
-# The proposer of --speculate / --draft, or nothing.
+# The proposer of --speculate / --draft / --eagle / --dflash, or nothing.
 function load_proposer(model::DecoderLM, options)
-    any(o -> haskey(options, o), ("speculate", "draft", "eagle")) || return nothing
-    haskey(options, "draft") && haskey(options, "eagle") && throw(ArgumentError("use either --draft or --eagle"))
+    drafters = filter(o -> haskey(options, o), ["draft", "eagle", "dflash"])
+    haskey(options, "speculate") || !isempty(drafters) || return nothing
+    length(drafters) > 1 && throw(ArgumentError("use only one of --draft, --eagle and --dflash"))
+    if haskey(options, "dflash")
+        d = load_dflash(options["dflash"], model)
+        k = parse_option(Int, options, "speculate", d.block_size - 1)
+        1 <= k < d.block_size || throw(ArgumentError("--speculate expects 1 to $(d.block_size - 1) drafts with DFlash, got $k"))
+        return DFlashProposer(d; k)
+    end
     k = parse_option(Int, options, "speculate", 4)
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("--speculate expects 1 to $(MAX_GRAPH_TOKENS - 1) drafts, got $k"))
     haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k)

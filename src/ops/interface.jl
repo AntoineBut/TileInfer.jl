@@ -62,12 +62,14 @@ see [`slots`](@ref)): slot s is offset `(s - 1) % page_size` of page `(s - 1) ÷
 function store_kv! end
 
 """
-    attention(backend, q, k_pages, v_pages, block_table, positions, scale) -> (head_dim, heads, n)
+    attention(backend, q, k_pages, v_pages, block_table, positions, scale; causal = true) -> (head_dim, heads, n)
 
 Causal grouped-query attention of the queries `q` (head_dim, heads, n) of one sequence, at
 the consecutive 0-based `positions` (a device vector of n `Int32`), over its first
 `positions[end] + 1` cached positions. The sequence's keys and values are in the pages
 listed by `block_table` (a device vector, which may be padded past the sequence's pages).
+With `causal = false`, every query sees all `positions[end] + 1` positions, including those
+of the later queries of the step (a DFlash drafter's block).
 """
 function attention end
 
@@ -77,7 +79,7 @@ function attention end
     linear!(backend, y, W, x)
     rope!(backend, y, x, cos, sin, positions)
     silu_mul!(backend, y, gate_up)
-    attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale)
+    attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale; causal = true)
 
 In-place forms of the ops, writing into the preallocated `y` (or `out`) and returning it.
 TileBackend writes directly and allocates nothing, so a step made of these calls can be
@@ -89,7 +91,7 @@ rmsnorm!(be::Backend, y, args...) = copyto!(y, rmsnorm(be, args...))
 linear!(be::Backend, y, args...) = copyto!(y, linear(be, args...))
 rope!(be::Backend, y, args...) = copyto!(y, rope(be, args...))
 silu_mul!(be::Backend, y, args...) = copyto!(y, silu_mul(be, args...))
-attention!(be::Backend, out, workspace, args...) = copyto!(out, attention(be, args...))
+attention!(be::Backend, out, workspace, args...; kw...) = copyto!(out, attention(be, args...; kw...))
 
 """
     attention_inputs!(backend, q, k_pages, v_pages, qkv, q_norm, k_norm, table, positions, slots, eps)

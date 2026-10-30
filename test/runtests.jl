@@ -29,6 +29,7 @@ const TESTS = [
     "engine/sampler.jl",
     "engine/runner.jl",
     "engine/speculative.jl",
+    "engine/dflash.jl",     # Qwen3-4B + DFlash drafter, when pulled
     "engine/chat.jl",
     "cli.jl",
     "smoke/examples.jl",    # ~40 s: compiles all cuTile examples

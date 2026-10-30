@@ -58,5 +58,7 @@ end
         end
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--speculate", "8")
         @test code == 1 && occursin("--speculate expects 1 to 7", err)
+        code, _, err = run_cli("run", TEST_MODEL, "hi", "--draft", TEST_MODEL, "--dflash", TEST_MODEL)
+        @test code == 1 && occursin("only one of --draft, --eagle and --dflash", err)
     end
 end

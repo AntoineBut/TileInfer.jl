@@ -479,3 +479,40 @@ and decays quickly along the chain, so k = 2 is best. `bench/speculative.jl`, 4B
 (n-gram at k = 7 stays best on the rename prompt: 3.92×.) EAGLE-3 trades acceptance for
 cheap drafts and ends up level with the 0.6B draft model; this head was trained for two
 drafts. The tests use GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge with Qwen3-0.6B.
+
+## DFlash drafting (2026-10-30)
+
+`DFlashProposer(load_dflash("z-lab/Qwen3-4B-DFlash-b16", target))`: five Qwen3 layers read
+the residual stream after target layers 2, 10, 18, 26 and 34. One drafter step runs the
+positions the target just verified (their keys and values, from `fc` of those states, stay in
+the drafter's cache) and a block of [next token, 15 masks] that attends without the causal
+mask (`attention(…; causal = false)`, a constant in both kernels); the target's lm_head over
+the block gives 15 drafts at once. Verify steps now take up to 16 tokens (`MAX_VERIFY_TOKENS`).
+The drafts match a Float32 transcription of z-lab's `dflash.py` (test/engine/dflash.jl), and
+its acceptance on the "explain a hash map" prompt is the reference's (2.78 vs 2.76 tokens per
+step over 128 tokens).
+
+Costs at 400 positions: drafter step 3.17 ms whatever the context count (GEMMs 2.85 ms at
+~650 GB/s for 1.85 GB of weights, 0.78 GB of which is the lm_head; 15 per-column sampling
+launches 0.11 ms), verify of 16 tokens 13.3 ms against 12.7 ms for one token. A step costs
+~1.3 decode steps, so DFlash pays from 1.3 tokens per step on. `bench/speculative.jl`, 4B
+target, best k of each method (k = 15 for DFlash in every row):
+
+| Prompt | plain | n-gram | 0.6B draft | EAGLE-3 | DFlash | DFlash tokens per step |
+|---|---|---|---|---|---|---|
+| rename (greedy) | 78 tok/s | 3.92× | 3.36× | 2.25× | **8.50×** | 11.0 |
+| document | 80 | 1.55× | 1.80× | 1.75× | **3.00×** | 3.94 |
+| explain | 80 | 1.12× | 1.63× | 1.58× | **2.50×** | 3.24 |
+| story | 80 | 1.04× | 1.39× | 1.45× | **1.92×** | 2.51 |
+| *sampled:* document | 80 | 1.54× | 1.92× | 1.82× | **3.17×** | 4.20 |
+| explain | 80 | 1.10× | 1.48× | 1.46× | **2.30×** | 3.01 |
+| story | 80 | 1.03× | 1.42× | 1.57× | **1.75×** | 2.31 |
+
+Unlike the chained drafters, whose acceptance falls along the chain so that k = 2 to 4 is
+best, a longer DFlash block costs nothing more to draft and little more to verify, so the
+whole block always wins: per-draft acceptance drops (0.67 at k = 2 to 0.15 at k = 15 on
+explain) while tokens per step keep rising. The contrast with EAGLE-3 is the point of the
+method: both read the target's hidden states, but EAGLE-3 pays one pass per draft and DFlash
+one pass per block. Candidates: write the drafts on the device straight into the verify
+step's ids (the host now waits for them in between); one batched argmax instead of 15
+sampling launches.

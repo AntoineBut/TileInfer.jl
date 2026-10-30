@@ -124,28 +124,31 @@ using Random: randperm
             @test host(TileInfer.linear(tile, W, x, b)) ≈ host(TileInfer.linear(ref, W, x, b)) rtol = 1e-2
         end
 
-        # (head_dim, heads, kv_heads, page_size, start, n): decode and verify (split-KV, a
-        # step that crosses a page boundary so some splits see no key of a query), prefill
-        # with and without cached context, group 4, and a group of 3 (prefill kernel only).
-        @testset "attention $case" for case in ((128, 16, 8, 64, 0, 1), (128, 16, 8, 64, 1023, 1),
-                                                 (128, 16, 8, 64, 63, 2), (128, 16, 8, 64, 100, 8),
-                                                 (128, 16, 8, 64, 0, 37), (128, 16, 8, 64, 0, 512),
-                                                 (128, 16, 8, 64, 200, 300), (128, 32, 8, 64, 700, 3),
-                                                 (64, 12, 4, 16, 40, 5))
-            D, H, KVH, P, start, n = case
+        # (head_dim, heads, kv_heads, page_size, start, n, causal): decode and verify (split-KV,
+        # a step that crosses a page boundary so some splits see no key of a query), prefill
+        # with and without cached context, group 4, and a group of 3 (prefill kernel only);
+        # non-causal (DFlash blocks) on both kernels, with a partial last page.
+        @testset "attention $case" for case in ((128, 16, 8, 64, 0, 1, true), (128, 16, 8, 64, 1023, 1, true),
+                                                 (128, 16, 8, 64, 63, 2, true), (128, 16, 8, 64, 100, 8, true),
+                                                 (128, 16, 8, 64, 0, 37, true), (128, 16, 8, 64, 0, 512, true),
+                                                 (128, 16, 8, 64, 200, 300, true), (128, 32, 8, 64, 700, 3, true),
+                                                 (64, 12, 4, 16, 40, 5, true),
+                                                 (128, 16, 8, 64, 60, 4, false), (128, 16, 8, 64, 0, 20, false),
+                                                 (128, 32, 8, 64, 300, 30, false), (128, 16, 8, 64, 10, 100, false))
+            D, H, KVH, P, start, n, causal = case
             len = start + n
             pages = cld(len, P) + 2
             # Fragmented, out of order, and zero-padded to 16 entries as forward! does.
             table = CuArray([Int32.(randperm(pages)[1:cld(len, P)]); zeros(Int32, 16 - cld(len, P))])
             positions = CuArray(Int32.(start:start+n-1))
             q, k_pages, v_pages = rnd(D, H, n), rnd(D, P, KVH, pages), rnd(D, P, KVH, pages)
-            y = TileInfer.attention(tile, q, k_pages, v_pages, table, positions, 1 / sqrt(D))
+            y = TileInfer.attention(tile, q, k_pages, v_pages, table, positions, 1 / sqrt(D); causal)
             @test size(y) == size(q)
             # Exact attention of the same inputs. The reference rounds scores and
             # probabilities to T as PyTorch's eager attention does (up to ~12 BFloat16 ulps
             # from exact); the flash kernels keep them in Float32 until the PV product.
             f32(x) = CuArray(host(x))
-            exact = TileInfer.attention(ref, f32(q), f32(k_pages), f32(v_pages), table, positions, 1 / sqrt(D))
+            exact = TileInfer.attention(ref, f32(q), f32(k_pages), f32(v_pages), table, positions, 1 / sqrt(D); causal)
             if T == BFloat16
                 @test ulps(exact, y, T) <= 5      # ≤ 3.5 over 30 seeds at n = 512
             else

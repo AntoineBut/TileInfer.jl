@@ -94,27 +94,8 @@ Read the checkpoint in `dir` onto the GPU with element type `T`, fusing q/k/v an
 """
 function load_weights(::Type{T}, cfg::ModelConfig, dir::AbstractString) where {T}
     c = Checkpoint(dir)
-    H, I, D = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim
-    qkv = (cfg.num_heads + 2cfg.num_kv_heads) * D
-
-    layers = map(0:cfg.num_layers-1) do i
-        p = "model.layers.$i."
-        attn = p * "self_attn."
-        qkv_names = [attn * "$(x)_proj.weight" for x in ("q", "k", "v")]
-        LayerWeights(
-            check_size(upload(T, c, p * "input_layernorm.weight"), (H,), "attn_norm"),
-            check_size(upload_fused(T, c, qkv_names), (H, qkv), "wqkv"),
-            cfg.qkv_bias ? upload_fused(T, c, replace.(qkv_names, "weight" => "bias")) : nothing,
-            cfg.qk_norm ? check_size(upload(T, c, attn * "q_norm.weight"), (D,), "q_norm") : nothing,
-            cfg.qk_norm ? check_size(upload(T, c, attn * "k_norm.weight"), (D,), "k_norm") : nothing,
-            check_size(upload(T, c, attn * "o_proj.weight"), (cfg.num_heads * D, H), "wo"),
-            check_size(upload(T, c, p * "post_attention_layernorm.weight"), (H,), "mlp_norm"),
-            check_size(upload_fused(T, c, [p * "mlp.gate_proj.weight", p * "mlp.up_proj.weight"]),
-                       (H, 2I), "w_gate_up"),
-            check_size(upload(T, c, p * "mlp.down_proj.weight"), (I, H), "w_down"),
-        )
-    end
-
+    H = cfg.hidden_size
+    layers = [load_layer(T, c, cfg, "model.layers.$i.") for i in 0:cfg.num_layers-1]
     embed = check_size(upload(T, c, "model.embed_tokens.weight"), (H, cfg.vocab_size), "embed")
     # Some tied checkpoints (Qwen3-0.6B) still store a copy of lm_head; like transformers,
     # ignore it rather than spend a second vocab × hidden matrix of memory.
@@ -125,4 +106,23 @@ function load_weights(::Type{T}, cfg::ModelConfig, dir::AbstractString) where {T
     end
     norm = check_size(upload(T, c, "model.norm.weight"), (H,), "norm")
     return ModelWeights(embed, layers, norm, lm_head)
+end
+
+"The weights of the decoder layer whose tensors are named `prefix * \"self_attn.q_proj.weight\"`, …"
+function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractString) where {T}
+    H, I, D = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim
+    attn = p * "self_attn."
+    qkv_names = [attn * "$(x)_proj.weight" for x in ("q", "k", "v")]
+    return LayerWeights(
+        check_size(upload(T, c, p * "input_layernorm.weight"), (H,), "attn_norm"),
+        check_size(upload_fused(T, c, qkv_names), (H, (cfg.num_heads + 2cfg.num_kv_heads) * D), "wqkv"),
+        cfg.qkv_bias ? upload_fused(T, c, replace.(qkv_names, "weight" => "bias")) : nothing,
+        cfg.qk_norm ? check_size(upload(T, c, attn * "q_norm.weight"), (D,), "q_norm") : nothing,
+        cfg.qk_norm ? check_size(upload(T, c, attn * "k_norm.weight"), (D,), "k_norm") : nothing,
+        check_size(upload(T, c, attn * "o_proj.weight"), (cfg.num_heads * D, H), "wo"),
+        check_size(upload(T, c, p * "post_attention_layernorm.weight"), (H,), "mlp_norm"),
+        check_size(upload_fused(T, c, [p * "mlp.gate_proj.weight", p * "mlp.up_proj.weight"]),
+                   (H, 2I), "w_gate_up"),
+        check_size(upload(T, c, p * "mlp.down_proj.weight"), (I, H), "w_down"),
+    )
 end

@@ -69,7 +69,8 @@ end
 # Eager attention, per KV head over its group of query heads at once:
 #   S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
 function attention(::RefBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
-                   block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real) where {T}
+                   block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real;
+                   causal::Bool = true) where {T}
     D, heads, n = size(q)
     start = Int(Array(view(positions, 1:1))[1])              # host sync: not graph-capturable
     kv_heads = size(k_pages, 3)
@@ -77,8 +78,9 @@ function attention(::RefBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages
     len = start + n
     q_by_head = permutedims(q, (1, 3, 2))                    # (D, n, heads)
     out = similar(q_by_head)
-    # Key i is visible to query j (position start + j) iff i <= start + j.
-    visible = CuArray([i <= start + j for i in 1:len, j in 1:n])
+    # Key i is visible to query j (position start + j) iff i <= start + j, or always when
+    # not causal.
+    visible = CuArray([!causal || i <= start + j for i in 1:len, j in 1:n])
     for h in 1:kv_heads
         heads_h = (h-1)*group+1:h*group
         K = Float32.(gather_pages(k_pages, block_table, h, len))   # (D, len)

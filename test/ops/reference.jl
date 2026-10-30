@@ -67,7 +67,7 @@ using LinearAlgebra: dot
         @test all(iszero, pool[:, :, :, [1, 3]])      # pages not in the table are untouched
     end
 
-    @testset "attention (GQA, causal, start = $start)" for start in (0, 5)
+    @testset "attention (GQA, causal = $causal, start = $start)" for start in (0, 5), causal in (true, false)
         D, H, KVH, n, P = 16, 4, 2, 3, 4
         len = start + n
         q = randn(Float32, D, H, n)
@@ -77,10 +77,10 @@ using LinearAlgebra: dot
         scale = 1 / sqrt(D)
         positions = CuArray(Int32.(start:start+n-1))
         padded = CuArray([table; zeros(Int32, 5)])  # entries past the sequence's pages are ignored
-        o = Array(TileInfer.attention(be, CuArray(q), k_pool, v_pool, padded, positions, scale))
+        o = Array(TileInfer.attention(be, CuArray(q), k_pool, v_pool, padded, positions, scale; causal))
         for h in 1:H, t in 1:n
             g = cld(h, H ÷ KVH)                        # query heads share KV heads in blocks
-            keys = 1:start+t                           # causal: up to the query's own position
+            keys = causal ? (1:start+t) : (1:len)      # causal: up to the query's own position
             s = [dot(kc[:, i, g], q[:, h, t]) * scale for i in keys]
             p = exp.(s .- maximum(s)); p ./= sum(p)
             @test o[:, h, t] ≈ vc[:, keys, g] * p

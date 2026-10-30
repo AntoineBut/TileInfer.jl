@@ -187,14 +187,6 @@ function sample_eagle!(p::Eagle3Proposer, i, s::EagleStep)
     end
 end
 
-# Run `step` (eagerly, then as a captured graph when graphs are on).
-function run_captured!(step, p::Eagle3Proposer, graph)
-    p.graphs || return (step(); nothing)
-    graph === nothing || (CUDA.launch(graph); return graph)
-    step()
-    return CUDA.instantiate(CUDA.capture(step))
-end
-
 function propose(p::Eagle3Proposer, context::AbstractVector{<:Integer}, k::Integer)
     k = min(k, p.k)
     k >= 1 || return Int[]

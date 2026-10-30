@@ -67,6 +67,15 @@ Prepare `proposer` to draft for the target model of `runner`, before a generatio
 """
 attach!(::Any, ::ModelRunner) = nothing
 
+# Run a proposer's `step`: replay `graph`, or run it eagerly and capture it when the proposer
+# uses graphs. Returns the graph.
+function run_captured!(step, p, graph)
+    p.graphs || return (step(); nothing)
+    graph === nothing || (CUDA.launch(graph); return graph)
+    step()
+    return CUDA.instantiate(CUDA.capture(step))
+end
+
 """
     SpecStats()
 
@@ -79,6 +88,9 @@ Base.@kwdef mutable struct SpecStats
 end
 
 acceptance_rate(s::SpecStats) = s.drafted == 0 ? NaN : s.accepted / s.drafted
+
+"Verify steps take up to this many tokens (a DFlash block); all are captured in CUDA graphs."
+const MAX_VERIFY_TOKENS = 16
 
 # A step that returns the token the target model samples after each of its n inputs: the
 # forward step with the logits of every token, then the runner's sampler on each column
@@ -112,12 +124,12 @@ end
 
 Run the 0-based token `ids` (the last sampled token, then the drafts) through the model,
 appending them to `seq`, and return the token the runner's sampler picks after each of them,
-with counters `counter`, `counter + 1`, … (the argmax when greedy). Steps of each length are
-captured in a CUDA graph like [`forward!`](@ref) steps.
+with counters `counter`, `counter + 1`, … (the argmax when greedy). Steps of each length, up
+to $MAX_VERIFY_TOKENS tokens, are captured in a CUDA graph like [`forward!`](@ref) steps.
 """
 function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}, counter::Integer) where {T}
     n = length(ids)
-    1 <= n <= MAX_GRAPH_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_GRAPH_TOKENS tokens, got $n"))
+    1 <= n <= MAX_VERIFY_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_VERIFY_TOKENS tokens, got $n"))
     v = get!(() -> VerifyStep(r, n), r.verify_steps, n)::VerifyStep{T}
     r.last_step, r.last_start = v.buffers, length(seq)
     NVTX.@range "upload inputs" begin
