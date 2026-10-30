@@ -1,4 +1,4 @@
-# Llama-style decoder (Llama 3, Mistral, Qwen2, Qwen3) as plain structs plus an explicit
+# Llama-style decoder (Llama 3, Mistral, Qwen2, Qwen3, Apertus) as plain structs plus an explicit
 # forward pass over backend ops. Per-family differences are ModelConfig flags.
 
 """
@@ -24,7 +24,6 @@ function load_model(model::AbstractString; T::Type = BFloat16, backend::Backend 
                     max_len::Integer = 4096)
     dir = model_dir(model)
     cfg = load_config(dir)
-    cfg.hidden_act == :silu || error("the $(cfg.hidden_act) MLP of $(cfg.model_type) is not implemented yet")
     max_len = min(max_len, cfg.max_position_embeddings)
     return DecoderLM(cfg, load_weights(T, cfg, dir), RotaryTable{T}(cfg, max_len), backend)
 end
@@ -73,7 +72,7 @@ struct StepBuffers{T}
     attn::CuArray{T,3}              # attention output (head_dim, heads, n)
     attn_workspace::Union{Nothing,CuArray{Float32,3}}
     proj::CuMatrix{T}               # output of wo or w_down (hidden, n)
-    gate_up::CuMatrix{T}            # (2 intermediate, n)
+    gate_up::CuMatrix{T}            # (2 intermediate, n); (0, n) for an ungated MLP
     act::CuMatrix{T}                # (intermediate, n)
     logits::CuMatrix{Float32}
     aux_layers::Vector{Int}
@@ -102,7 +101,8 @@ function StepBuffers{T}(cfg::ModelConfig, backend::Backend, cache::PagedKVCache{
                           view(meta, 2a+1:2a+n), view(meta, 3a+1:3a+table_len),
                           dev(T, H, n), dev(T, H, n), dev(T, (nq + 2nkv) * D, n),
                           q, dev(T, D, nq, n),
-                          attention_workspace(backend, q, first(cache.k)), dev(T, H, n), dev(T, 2I, n),
+                          attention_workspace(backend, q, first(cache.k)), dev(T, H, n),
+                          dev(T, cfg.hidden_act == :silu ? 2I : 0, n),
                           dev(T, I, n), dev(Float32, vocab, m_out), collect(Int, aux_layers),
                           isempty(aux_layers) ? nothing : dev(T, length(aux_layers) * H, n))
 end
@@ -165,7 +165,11 @@ function run_step!(model::DecoderLM{T}, cache::PagedKVCache{T}, b::StepBuffers{T
         linear!(be, b.proj, layer.wo, flat(b.attn))
         add_rmsnorm!(be, b.x, b.h, b.proj, layer.mlp_norm, eps)    # x += proj; h = norm(x)
 
-        linear_swiglu!(be, b.act, b.gate_up, layer.w_gate_up, b.h)
+        if layer.xielu === nothing
+            linear_swiglu!(be, b.act, b.gate_up, layer.w_gate_up, b.h)
+        else
+            linear_xielu!(be, b.act, layer.w_gate_up, b.h, layer.xielu)
+        end
         linear!(be, b.proj, layer.w_down, b.act)
         # The next layer's input norm, or the final norm after the last layer.
         add_rmsnorm!(be, b.x, b.h, b.proj, l < length(w.layers) ? w.layers[l+1].attn_norm : w.norm, eps)

@@ -5,6 +5,7 @@
         @test TileInfer.wanted_file("model.safetensors.index.json")
         @test TileInfer.wanted_file("tokenizer.json")
         @test TileInfer.wanted_file("merges.txt")
+        @test TileInfer.wanted_file("chat_template.jinja")
         @test !TileInfer.wanted_file("pytorch_model.bin")
         @test !TileInfer.wanted_file("README.md")
         @test !TileInfer.wanted_file("onnx/model.safetensors")

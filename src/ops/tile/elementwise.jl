@@ -1,5 +1,5 @@
-# Element-wise and data-movement kernels: rotary embedding, SwiGLU, KV-cache writes and
-# embedding lookup. All are memory-bound; each rounds to T where the reference does.
+# Element-wise and data-movement kernels: rotary embedding, SwiGLU, xIELU, KV-cache writes
+# and embedding lookup. All are memory-bound; each rounds to T where the reference does.
 
 # Rotary embedding, one block per token over all heads. The two halves of head_dim are
 # loaded as separate tiles (tile index 1 and 2 along the first axis), which is exactly the
@@ -60,6 +60,45 @@ end
 
 silu_mul(be::TileBackend, gate_up::CuMatrix{T}) where {T} =
     silu_mul!(be, similar(gate_up, size(gate_up, 1) ÷ 2, size(gate_up, 2)), gate_up)
+
+# expm1 without exp(x) - 1's cancellation (Kahan): with u = exp(x) rounded, (u - 1) x / log(u)
+# is accurate to a few ulps, since u's rounding error cancels between the two factors.
+# Below -20, expm1 is -1 in Float32 (and log(u) underflows further down).
+@inline function expm1_tile(x)
+    u = exp.(x)
+    um1 = u .- 1.0f0
+    return ifelse.(x .< -20.0f0, -1.0f0, ifelse.(um1 .== 0.0f0, x, um1 .* x ./ log.(u)))
+end
+
+# xIELU of a Float32 tile, rounding to T after each operation as the reference does.
+@inline function xielu_tile(::Type{T}, x, alpha_p, alpha_n, beta, eps) where {T}
+    rnd(tile) = convert(ct.Tile{Float32}, convert(ct.Tile{T}, tile))
+    bx = rnd(beta .* x)
+    pos = rnd(rnd(rnd(alpha_p .* x) .* x) .+ bx)
+    neg = rnd(rnd(rnd(rnd(expm1_tile(min.(x, eps))) .- x) .* alpha_n) .+ bx)
+    return ifelse.(x .> 0.0f0, pos, neg)
+end
+
+# xIELU, grid (tiles along the rows, tokens). The scalars are per layer and fixed, so
+# launch arguments are fine inside a CUDA graph.
+function xielu_kernel(Y::ct.TileArray{T,2}, X::ct.TileArray{T,2}, alpha_p::Float32, alpha_n::Float32,
+                      beta::Float32, eps::Float32, TILE::Int) where {T}
+    i, t = ct.bid(1), ct.bid(2)
+    x = convert(ct.Tile{Float32}, ct.load(X; index = (i, t), shape = (TILE, 1)))
+    ct.store(Y; index = (i, t), tile = convert(ct.Tile{T}, xielu_tile(T, x, alpha_p, alpha_n, beta, eps)))
+    return nothing
+end
+
+xielu_args(a::XIELU) = (Float32(a.alpha_p), Float32(a.alpha_n), Float32(a.beta), Float32(a.eps))
+
+function xielu!(::TileBackend, y::CuMatrix{T}, x::CuMatrix{T}, a::XIELU{T}) where {T}
+    I, n = size(y)
+    tile = min(nextpow(2, I), ELEMENTWISE_TILE)
+    @cuda backend = cuTile blocks = (cld(I, tile), n) xielu_kernel(y, x, xielu_args(a)..., ct.Constant(tile))
+    return y
+end
+
+xielu(be::TileBackend, x::CuMatrix{T}, a::XIELU{T}) where {T} = xielu!(be, similar(x), x, a)
 
 # KV-cache write, one block per token. Arrays are 2-D views, which keeps the launch under
 # 32 kernel parameters: the pools as (head_dim, page_size × kv_heads × pages), whose column

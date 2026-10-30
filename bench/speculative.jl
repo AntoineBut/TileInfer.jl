@@ -98,7 +98,8 @@ function main(args)
             "accept", "tokens/step")
     for (name, text) in PROMPTS
         occursin(filter, name) || continue
-        ids = encode(tok, chat_prompt(target.config.model_type, [ChatMessage("user", text)]; enable_thinking = false))
+        ids = encode(tok, chat_prompt(target.config.model_type, [ChatMessage("user", text)]; enable_thinking = false);
+                     add_special_tokens = false)
         base = NaN
         for (method, proposer, runner) in methods
             cache = runner.cache

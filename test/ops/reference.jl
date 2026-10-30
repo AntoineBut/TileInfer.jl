@@ -46,6 +46,19 @@ using LinearAlgebra: dot
         @test Array(TileInfer.silu_mul(be, CuArray(gu))) ≈ g ./ (1 .+ exp.(-g)) .* u
     end
 
+    @testset "xielu" begin
+        a = TileInfer.XIELU{Float32}(1.3f0, 0.9f0, 0.5f0, -1f-6)
+        x = Float32[-30, -2, -0.1, -1f-3, -1f-7, 0, 1f-7, 0.5, 3]
+        f(x) = x > 0 ? 1.3 * x^2 + 0.5x : (expm1(min(Float64(x), -1e-6)) - x) * 0.9 + 0.5x
+        @test Array(TileInfer.xielu(be, CuArray(x), a)) ≈ f.(x) rtol = 1e-6
+        # In BFloat16 every operation rounds, as in PyTorch.
+        b = TileInfer.XIELU{BFloat16}(1.3, 0.9, 0.5, -1e-6)
+        xb = BFloat16.(x)
+        stepwise(x) = x > 0 ? BFloat16(BFloat16(BFloat16(1.3) * x) * x) + BFloat16(0.5) * x :
+                      BFloat16(BFloat16(BFloat16(expm1(Float32(min(x, BFloat16(-1e-6))))) - x) * BFloat16(0.9)) + BFloat16(0.5) * x
+        @test Array(TileInfer.xielu(be, CuArray(xb), b)) == stepwise.(xb)
+    end
+
     # Pages of a (head_dim, len, kv_heads) contiguous KV tensor, scattered over a pool in the
     # order given by `table`, through store_kv!.
     function paged(kv::Array{Float32,3}, table::Vector{Int32}, page_size::Integer, num_pages::Integer)

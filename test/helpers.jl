@@ -19,11 +19,14 @@ const TEST_MODEL = "Qwen/Qwen3-0.6B"
 # An EAGLE-3 drafter for TEST_MODEL; its tests are skipped when it is not pulled.
 const EAGLE_TEST_HEAD = "GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge"
 
-function test_model_dir()
+# Apertus 1.5, for its tokenizer only: the model does not fit the GPU in BFloat16.
+const APERTUS_TEST_MODEL = "swiss-ai/Apertus-v1.5-8B"
+
+function test_model_dir(repo = TEST_MODEL)
     try
-        return TileInfer.model_dir(TEST_MODEL)
+        return TileInfer.model_dir(repo)
     catch
-        @info "$TEST_MODEL not pulled; skipping tests that need it (tileinfer pull $TEST_MODEL)"
+        @info "$repo not pulled; skipping tests that need it (tileinfer pull $repo)"
         return nothing
     end
 end

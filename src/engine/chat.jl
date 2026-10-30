@@ -63,7 +63,7 @@ conversation. On error (e.g. the cache is full) the conversation is left unchang
 function reply!(s::ChatSession, text::AbstractString; max_new_tokens::Integer = 1024, on_token = nothing)
     messages = [s.messages; ChatMessage("user", text)]
     prompt = encode(s.tokenizer, chat_prompt(s.model.config.model_type, messages;
-                                             enable_thinking = s.enable_thinking))
+                                             enable_thinking = s.enable_thinking); add_special_tokens = false)
     # Reuse the cached prefix, but always run at least one token to get logits.
     reused = min(common_prefix(s.seq.tokens, prompt), length(prompt) - 1)
     truncate!(s.cache, s.seq, reused)

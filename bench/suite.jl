@@ -157,7 +157,12 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         add_op!(suite, info, filter, ops("rope"), TileInfer.rope,
                 () -> (rnd(D, nq, n), model.rope.cos, model.rope.sin, positions());
                 bytes = (2.0 * D * nq * n + 2.0 * D * n) * B)
-        add_op!(suite, info, filter, ops("silu_mul"), TileInfer.silu_mul, () -> (rnd(2I, n),); bytes = 3.0 * I * n * B)
+        layer = first(w.layers)
+        if layer.xielu === nothing
+            add_op!(suite, info, filter, ops("silu_mul"), TileInfer.silu_mul, () -> (rnd(2I, n),); bytes = 3.0 * I * n * B)
+        else
+            add_op!(suite, info, filter, ops("xielu"), TileInfer.xielu, () -> (rnd(I, n), layer.xielu); bytes = 2.0 * I * n * B)
+        end
 
         # One layer's page pools, holding `len` positions of a single sequence.
         start = n == 1 ? CONTEXT - 1 : 0
@@ -178,14 +183,19 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         # The fused ops of a step, in place as run_step! calls them (decode: 10 kernels per
         # layer, of which 6 are these). Their bytes are the unfused minimum, so % peak shows
         # what the fusion achieves.
-        layer = first(w.layers)
         add_op!(suite, info, filter, ops("add_rmsnorm"), TileInfer.add_rmsnorm!,
                 () -> (rnd(H, n), rnd(H, n), rnd(H, n), rnd(H), eps);
                 bytes = (4.0 * H * n + H) * B)                   # read x, delta; write x, h
         let (in, out) = size(layer.w_gate_up)
-            add_op!(suite, info, filter, ops("linear_swiglu"), TileInfer.linear_swiglu!,
-                    () -> (rnd(out ÷ 2, n), rnd(out, n), rnd(in, out), rnd(in, n));
-                    bytes = (in * out + (in + out ÷ 2) * n) * B, flops = 2.0 * in * out * n)
+            if layer.xielu === nothing
+                add_op!(suite, info, filter, ops("linear_swiglu"), TileInfer.linear_swiglu!,
+                        () -> (rnd(out ÷ 2, n), rnd(out, n), rnd(in, out), rnd(in, n));
+                        bytes = (in * out + (in + out ÷ 2) * n) * B, flops = 2.0 * in * out * n)
+            else
+                add_op!(suite, info, filter, ops("linear_xielu"), TileInfer.linear_xielu!,
+                        () -> (rnd(out, n), rnd(in, out), rnd(in, n), layer.xielu);
+                        bytes = (in * out + (in + out) * n) * B, flops = 2.0 * in * out * n)
+            end
         end
         # q/k norm + rope from the fused qkv, keys and values into the pools.
         add_op!(suite, info, filter, ops("attention_inputs"), TileInfer.attention_inputs!,

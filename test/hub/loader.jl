@@ -70,7 +70,6 @@ using SafeTensors: SafeTensors
             @test l.xielu.alpha_n ≈ 0.5f0 + 0.3f0 rtol = 1e-4
             @test (l.xielu.beta, l.xielu.eps) == (0.5f0, -1f-6)
             @test TileInfer.load_weights(BFloat16, cfg, dir).layers[1].xielu isa TileInfer.XIELU{BFloat16}
-            @test_throws ErrorException TileInfer.load_model(dir)    # xIELU MLP not implemented yet
         end
     end
 

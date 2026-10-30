@@ -44,6 +44,15 @@ end
 
 silu(x) = x / (1 + exp(-x))
 
+# XIELUActivation._xielu_python, one PyTorch op per T operation (each rounds to T):
+#   where(x > 0, αp x x + β x, (expm1(min(x, ε)) - x) αn + β x)
+xielu(::RefBackend, x::CuArray{T}, a::XIELU{T}) where {T} = xielu_scalar.(x, a.alpha_p, a.alpha_n, a.beta, a.eps)
+
+function xielu_scalar(x::T, alpha_p::T, alpha_n::T, beta::T, eps::T) where {T}
+    bx = beta * x
+    return x > 0 ? alpha_p * x * x + bx : (T(expm1(Float32(min(x, eps)))) - x) * alpha_n + bx
+end
+
 # Scatter through a flat column view of the pools: the column of (offset o, head h, page p),
 # all 0-based, in (head_dim, page_size × kv_heads × num_pages) is o + P h + P H p + 1.
 function store_kv!(::RefBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},

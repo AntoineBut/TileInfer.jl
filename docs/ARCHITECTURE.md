@@ -163,13 +163,23 @@ also what cuTile.jl's FMHA example does):
 One generic `DecoderLM{T}` covers the Llama-style family. Per-family
 differences are config flags:
 
-| Flag                  | Llama 3.x | Qwen2.5 | Qwen3 | Mistral |
-|-----------------------|-----------|---------|-------|---------|
-| QKV bias              |           | ✓       |       |         |
-| q/k RMSNorm           |           |         | ✓     |         |
-| tied embeddings       | small     | small   | small |         |
-| RoPE scaling          | llama3    | (yarn)  |       |         |
-| sliding window        |           |         |       | (v0.1)  |
+| Flag                  | Llama 3.x | Qwen2.5 | Qwen3 | Mistral | Apertus |
+|-----------------------|-----------|---------|-------|---------|---------|
+| QKV bias              |           | ✓       |       |         |         |
+| q/k RMSNorm           |           |         | ✓     |         | ✓       |
+| MLP                   | SwiGLU    | SwiGLU  | SwiGLU | SwiGLU | xIELU, ungated |
+| tied embeddings       | small     | small   | small |         |         |
+| RoPE scaling          | llama3    | (yarn)  |       |         | llama3  |
+| sliding window        |           |         |       | (v0.1)  |         |
+
+Apertus (swiss-ai) uses xIELU, an activation with learned scalars per layer
+(`up → xIELU → down`, no gate projection). Apertus 1.5 is multimodal, so only its decoder
+is loaded: the decoder settings are nested under `text_config`, its tensors sit under
+`model.language_model.`, and the embedding rows past the 131,072 text tokens (image and
+audio codes) are skipped. `pull` leaves out the image and audio tokenizer shards. Its
+tokenizer has 136k added tokens and a normalizer that rewrites reasoning markers. The 8B
+needs 16.1 GB in BFloat16, so it waits on weight-only quantization; correctness is checked
+on a tiny random Apertus (`scripts/gen_apertus_fixtures.py`).
 
 Suggested targets on 16 GB in BF16: **Qwen3-0.6B / 1.7B / 4B**, and
 **Llama-3.2-1B / 3B**. For speculative decoding: Qwen3-4B target with

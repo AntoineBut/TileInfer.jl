@@ -40,6 +40,15 @@ using Random: randperm
             @test host(TileInfer.silu_mul(tile, gu)) == host(TileInfer.silu_mul(ref, gu))
         end
 
+        @testset "xielu $dims" for dims in ((21504, 1), (21504, 5), (200, 3))
+            x = rnd(dims...; scale = 3)
+            copyto!(x, 1, CuArray(T[-30, -1f-7, 0, 1f-7]), 1, 4)
+            a = TileInfer.XIELU{T}(1.3, 0.9, 0.5, -1e-6)
+            # Bit-identical in BFloat16 up to expm1, which is Kahan's form here and CUDA's
+            # expm1f in the reference (a few Float32 ulps apart, about 1 in 1000 roundings).
+            @test ulps(TileInfer.xielu(ref, x, a), TileInfer.xielu(tile, x, a), T) <= (T == BFloat16 ? 1 : 8)
+        end
+
         @testset "store_kv" begin
             D, P, H, pages, n = 128, 4, 8, 6, 9
             k, v = rnd(D, H, n), rnd(D, H, n)
@@ -111,6 +120,17 @@ using Random: randperm
             # Same as GEMV then silu_mul; bit-identical when both use the same column tile
             # (as at Qwen3 sizes), else the reductions may round differently.
             @test ulps(y_unfused, y, T) <= (T == BFloat16 ? 1 : 8)
+        end
+
+        @testset "linear_xielu ($in, $I) n = $n" for (in, I) in ((4096, 21504), (200, 100)), n in (1, 3)
+            W, x = rnd(in, I; scale = 1 / 30), rnd(in, n)
+            a = TileInfer.XIELU{T}(18.1, 1.2, 0.5, -1e-6)
+            y, y_unfused = CuMatrix{T}(undef, I, n), CuMatrix{T}(undef, I, n)
+            TileInfer.linear_xielu!(tile, y, W, x, a)
+            invoke(TileInfer.linear_xielu!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 4)...}, tile, y_unfused, W, x, a)
+            @test ulps(y_unfused, y, T) <= (T == BFloat16 ? 1 : 8)    # same as GEMV, then xielu
+            y_ref = TileInfer.xielu(ref, TileInfer.linear(ref, W, x), a)
+            @test ulps(y_ref, y, T) <= (T == BFloat16 ? 2 : 1000) # the linear's 1 ulp, through αp x²
         end
 
         @testset "linear into Float32 n = $n" for n in (1, 17)

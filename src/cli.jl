@@ -181,10 +181,10 @@ function cmd_run(positional, options)
     length(positional) == 2 || throw(ArgumentError("run takes a model and a prompt"))
     model_name, prompt = positional
     g = load_for_generation(model_name, options)
-    text = haskey(options, "raw") ? prompt :
-        chat_prompt(g.model.config.model_type, [ChatMessage("user", prompt)];
-                    enable_thinking = g.enable_thinking)
-    ids = encode(g.tok, text)
+    # A chat prompt already starts with the BOS token, if the model uses one.
+    ids = haskey(options, "raw") ? encode(g.tok, prompt) :
+        encode(g.tok, chat_prompt(g.model.config.model_type, [ChatMessage("user", prompt)];
+                                  enable_thinking = g.enable_thinking); add_special_tokens = false)
     stream = TimedStream(g.tok, stdout)
     spec = SpecStats()
     generated = generate(g.model, ids; max_new_tokens = parse_option(Int, options, "max-tokens", 512),

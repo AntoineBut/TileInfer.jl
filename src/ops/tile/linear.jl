@@ -50,6 +50,26 @@ function gemv_swiglu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.Ti
     return nothing
 end
 
+# GEMV with an xIELU epilogue (Apertus' up projection): the plain GEMV, then xielu_tile on
+# the rounded sums, as xielu_kernel computes after it.
+function gemv_xielu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.TileArray{T,2},
+                           alpha_p::Float32, alpha_n::Float32, beta::Float32, eps::Float32,
+                           TK::Int, TM::Int) where {T}
+    bid = ct.bid(1)
+    acc = zeros(Float32, (TK, TM))
+    for k in Int32(1):ct.num_tiles(W, 1, (TK, TM))
+        w = convert(ct.Tile{Float32}, ct.load(W; index = (k, bid), shape = (TK, TM),
+                                              padding_mode = ct.PaddingMode.Zero))
+        x = convert(ct.Tile{Float32}, ct.load(X; index = (k, Int32(1)), shape = (TK, 1),
+                                              padding_mode = ct.PaddingMode.Zero))
+        acc = acc .+ w .* x
+    end
+    u = convert(ct.Tile{Float32}, convert(ct.Tile{T}, sum(acc; dims = 1)))
+    y = xielu_tile(T, u, alpha_p, alpha_n, beta, eps)
+    ct.store(Y; index = (bid, Int32(1)), tile = reshape(convert(ct.Tile{T}, y), (TM, 1)))
+    return nothing
+end
+
 # 1-based (block row, block column) of block `bid`, walking groups of GROUP block rows
 # column by column so that consecutive blocks share W and X tiles in L2.
 function swizzle_2d(M, N, TM, TN, GROUP, bid)
@@ -139,4 +159,16 @@ function linear_swiglu!(be::TileBackend, y::CuMatrix{T}, gate_up::CuMatrix{T}, W
         return y
     end
     return silu_mul!(be, y, linear!(be, gate_up, W, x))
+end
+
+# xIELU of the up projection: fused into the GEMV for one token, otherwise a GEMM followed
+# by xielu! in place.
+function linear_xielu!(be::TileBackend, y::CuMatrix{T}, W::CuMatrix{T}, x::CuMatrix{T}, a::XIELU{T}) where {T}
+    if size(x, 2) == 1
+        TK, TM = gemv_config(size(W)...)
+        @cuda backend = cuTile blocks = cld(size(W, 2), TM) gemv_xielu_kernel(
+            y, W, x, xielu_args(a)..., ct.Constant(TK), ct.Constant(TM))
+        return y
+    end
+    return xielu!(be, y, linear!(be, y, W, x), a)
 end

@@ -4,11 +4,12 @@
 
 using HuggingFaceApi: HuggingFaceApi, hf_hub_download
 
-# Top-level files needed for inference: weights, configs, tokenizer. Everything else
-# (pytorch_model.bin, onnx/, gguf, README, …) is skipped.
+# Top-level files needed for inference: weights, configs, tokenizer, chat template (which
+# newer repos ship as chat_template.jinja). Everything else (pytorch_model.bin, onnx/, gguf,
+# README, …) is skipped.
 function wanted_file(name::AbstractString)
     occursin('/', name) && return false
-    return endswith(name, ".safetensors") || endswith(name, ".json") || name == "merges.txt"
+    return endswith(name, ".safetensors") || endswith(name, ".json") || name in ("merges.txt", "chat_template.jinja")
 end
 
 # Tensors of multimodal checkpoints that TileInfer does not run: Apertus 1.5's image and

@@ -14,7 +14,8 @@ if dir !== nothing
         @test stats2.reused > 0
 
         # The second reply is what a fresh run on the full re-rendered prompt produces.
-        prompt = TileInfer.encode(tok, TileInfer.chat_prompt("qwen3", s.messages[1:3]; enable_thinking = false))
+        prompt = TileInfer.encode(tok, TileInfer.chat_prompt("qwen3", s.messages[1:3]; enable_thinking = false);
+                                  add_special_tokens = false)
         @test stats2.reused + stats2.prefilled == length(prompt)
         @test TileInfer.decode(tok, TileInfer.generate(m, prompt; max_new_tokens = 16)) == reply2
 

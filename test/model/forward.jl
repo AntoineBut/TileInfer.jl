@@ -88,3 +88,51 @@ if dir !== nothing
         loaded = nothing; GC.gc(); CUDA.reclaim()
     end
 end
+
+# A tiny random Apertus in Apertus 1.5's checkpoint layout (scripts/gen_apertus_fixtures.py,
+# transformers' ApertusForCausalLM): ungated xIELU MLP, q/k norms, llama3 RoPE, an embedding
+# with input-only rows. Needs no pulled model.
+@testset "Apertus (tiny, random) vs transformers" begin
+    dir = fixture("apertus", "tiny")
+    cases = TileInfer.JSON.parsefile(fixture("logits", "apertus-tiny.json"))["cases"]
+    @testset "$T $(nameof(typeof(backend)))" for T in (Float32, BFloat16), backend in (RefBackend(), TileBackend())
+        loaded = TileInfer.load_model(dir; T, backend, max_len = 256)
+        @test loaded.config.vocab_size == 512 && size(loaded.weights.embed, 2) == 512
+        for (name, case) in cases
+            ids = Int.(case["ids"])
+            cache = TileInfer.PagedKVCache(loaded)
+            logits = Array(TileInfer.forward!(loaded, cache, TileInfer.new_sequence(cache), ids; all_logits = true))
+            if T == Float32
+                maxdiff, mismatches = compare_logits(logits, case["float32"]; tie = 0)
+                @test maxdiff < 1e-4
+                @test mismatches == 0
+                @test TileInfer.generate(loaded, ids; max_new_tokens = 24, stop_ids = Int[]) == case["float32"]["greedy"]
+            else
+                maxdiff, mismatches = compare_logits(logits, case["bfloat16"]; tie = 0.25)
+                @test maxdiff < 0.1          # 1–2 ulps at |logit| ≈ 4
+                @test mismatches == 0
+            end
+        end
+    end
+
+    @testset "CUDA graph decode" begin
+        m = TileInfer.load_model(dir; backend = TileBackend(), max_len = 256)
+        ids = Int.(cases["medium"]["ids"])
+        cache, eager_cache = TileInfer.PagedKVCache(m), TileInfer.PagedKVCache(m)
+        runner = TileInfer.ModelRunner(m, cache)
+        seq, eager_seq = TileInfer.new_sequence(cache), TileInfer.new_sequence(eager_cache)
+        logits = Array(TileInfer.forward!(runner, seq, ids))
+        @test logits == Array(TileInfer.forward!(m, eager_cache, eager_seq, ids))
+        same = true
+        for _ in 1:20
+            id = argmax(vec(logits)) - 1
+            logits = Array(TileInfer.forward!(runner, seq, [id]))
+            same &= logits == Array(TileInfer.forward!(m, eager_cache, eager_seq, [id]))
+        end
+        @test same
+        b = runner.steps[1].buffers
+        TileInfer.prepare_step!(b, m, cache, seq, [42])
+        TileInfer.run_step!(m, cache, b)
+        @test CUDA.@allocated(TileInfer.run_step!(m, cache, b)) == 0
+    end
+end

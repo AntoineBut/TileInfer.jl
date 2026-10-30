@@ -10,7 +10,8 @@ Usage (uv creates an isolated environment with the dependencies above):
 
 `tokenizer` writes test/fixtures/tokenizer/<name>.json: token ids for TEXTS, encoded with
 and without special tokens. `chat` writes test/fixtures/chat/<name>.json: CONVERSATIONS
-rendered with the model's own Jinja chat template, as transformers renders it.
+rendered with the model's own Jinja chat template, as transformers renders it, or the
+template's error for a conversation it rejects.
 """
 
 import json
@@ -24,7 +25,8 @@ FIXTURES = Path(__file__).resolve().parent.parent / "test" / "fixtures"
 
 # Chosen to hit every stage of a byte-level BPE pipeline: contractions and casing in the
 # split regex, digit grouping, whitespace runs, NFC normalization, multi-byte UTF-8, and
-# added tokens written inline.
+# added tokens written inline (Qwen's and Apertus', including the strings Apertus 1.5's
+# normalizer rewrites and its normalized tokens).
 TEXTS = [
     "",
     "Hello, world!",
@@ -47,6 +49,11 @@ TEXTS = [
     "!!!??? ... ,,, ;;; ::: ---",
     "https://huggingface.co/Qwen/Qwen3-0.6B?x=1&y=2#frag",
     "x" * 300,
+    "<s><|system_start|>Be brief.<|system_end|><|user_start|>Hi<|user_end|><|assistant_start|>",
+    "<|inner_prefix|>let me think<|inner_suffix|>   The answer is 4.<|assistant_end|>",
+    "<think>plan</think> done <thought>more</thought><answer>42</answer>",
+    "<|channel>thought\n  idea<channel|>after <image> and <audio> and <|image|>",
+    "[INST] old style [/INST] <unk> <pad> </s>",
 ]
 
 
@@ -67,11 +74,22 @@ CONVERSATIONS = [
     ],
     [{"role": "user", "content": "a"}, {"role": "system", "content": "late system"},
      {"role": "user", "content": "b"}],
+    [
+        {"role": "user", "content": "Why?"},
+        {"role": "assistant", "content": "<|inner_prefix|>Because.<|inner_suffix|>It is so."},
+        {"role": "assistant", "content": " More."},
+        {"role": "user", "content": "Thanks"},
+    ],
 ]
 
 
 def chat_fixture(model_dir: str, name: str) -> None:
     config = json.loads((Path(model_dir) / "tokenizer_config.json").read_text())
+    # Newer repos ship the template as its own file.
+    jinja = Path(model_dir) / "chat_template.jinja"
+    source = jinja.read_text() if jinja.exists() else config["chat_template"]
+    bos = config.get("bos_token")
+    bos = bos.get("content") if isinstance(bos, dict) else bos
 
     def raise_exception(message):
         raise ValueError(message)
@@ -80,20 +98,24 @@ def chat_fixture(model_dir: str, name: str) -> None:
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     env.filters["tojson"] = lambda x, **kw: json.dumps(x, ensure_ascii=False, **kw)
     env.globals["raise_exception"] = raise_exception
-    template = env.from_string(config["chat_template"])
+    template = env.from_string(source)
 
     cases = []
     for messages in CONVERSATIONS:
         for add_generation_prompt in (True, False):
             for enable_thinking in (True, False):
-                cases.append({
+                case = {
                     "messages": messages,
                     "add_generation_prompt": add_generation_prompt,
                     "enable_thinking": enable_thinking,
-                    "prompt": template.render(messages=messages,
-                                              add_generation_prompt=add_generation_prompt,
-                                              enable_thinking=enable_thinking),
-                })
+                }
+                try:
+                    case["prompt"] = template.render(messages=messages, bos_token=bos,
+                                                     add_generation_prompt=add_generation_prompt,
+                                                     enable_thinking=enable_thinking)
+                except ValueError as e:      # the template rejects the conversation
+                    case["error"] = str(e)
+                cases.append(case)
     write_fixture("chat", name, cases)
 
 

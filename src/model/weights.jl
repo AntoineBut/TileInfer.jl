@@ -2,20 +2,6 @@
 # a linear layer is stored (in, out) and applied as y = Wᵀx. Projections that read the
 # same input are fused into one matrix at load time (q/k/v, gate/up).
 
-"""
-    XIELU{T}
-
-The learned scalars of a layer's xIELU activation (Apertus, arXiv:2411.13010), in the form
-transformers applies them, each rounded to `T` as there:
-`x > 0 ? αp x² + β x : (expm1(min(x, ε)) - x) αn + β x`.
-"""
-struct XIELU{T}
-    alpha_p::T                   # softplus(alpha_p) of the checkpoint
-    alpha_n::T                   # β + softplus(alpha_n) of the checkpoint
-    beta::T
-    eps::T
-end
-
 struct LayerWeights{T,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     attn_norm::V                 # (hidden,)
     wqkv::M                      # (hidden, (heads + 2 kv_heads) * head_dim): q | k | v columns

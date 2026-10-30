@@ -1,0 +1,460 @@
+{
+ "cases": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hi!<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hi!<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hi!<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hi!<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are terse.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>2+2?<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are terse.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>2+2?<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are terse.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>2+2?<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are terse.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>2+2?<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Pick a number.<|user_end|><|assistant_start|><think>\nAny will do.\n</think>\n\n7<|assistant_end|><|user_start|>Another one.<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Pick a number.<|user_end|><|assistant_start|><think>\nAny will do.\n</think>\n\n7<|assistant_end|><|user_start|>Another one.<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Pick a number.<|user_end|><|assistant_start|><think>\nAny will do.\n</think>\n\n7<|assistant_end|><|user_start|>Another one.<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Pick a number."
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nAny will do.\n</think>\n\n7"
+    },
+    {
+     "role": "user",
+     "content": "Another one."
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Pick a number.<|user_end|><|assistant_start|><think>\nAny will do.\n</think>\n\n7<|assistant_end|><|user_start|>Another one.<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>Be nice.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hello<|user_end|><|assistant_start|>Hi there<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|><think>short</think>Goodbye!<|assistant_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>Be nice.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hello<|user_end|><|assistant_start|>Hi there<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|><think>short</think>Goodbye!<|assistant_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>Be nice.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hello<|user_end|><|assistant_start|>Hi there<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|><think>short</think>Goodbye!<|assistant_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be nice."
+    },
+    {
+     "role": "user",
+     "content": "Hello"
+    },
+    {
+     "role": "assistant",
+     "content": "Hi there"
+    },
+    {
+     "role": "user",
+     "content": "Bye"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>short</think>Goodbye!"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>Be nice.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Hello<|user_end|><|assistant_start|>Hi there<|assistant_end|><|user_start|>Bye<|user_end|><|assistant_start|><think>short</think>Goodbye!<|assistant_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "error": "Invalid message role"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "error": "Invalid message role"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "error": "Invalid message role"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "system",
+     "content": "late system"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "error": "Invalid message role"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Why?"
+    },
+    {
+     "role": "assistant",
+     "content": "<|inner_prefix|>Because.<|inner_suffix|>It is so."
+    },
+    {
+     "role": "assistant",
+     "content": " More."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Why?<|user_end|><|assistant_start|><|inner_prefix|>Because.<|inner_suffix|>It is so. More.<|assistant_end|><|user_start|>Thanks<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Why?"
+    },
+    {
+     "role": "assistant",
+     "content": "<|inner_prefix|>Because.<|inner_suffix|>It is so."
+    },
+    {
+     "role": "assistant",
+     "content": " More."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "add_generation_prompt": true,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Why?<|user_end|><|assistant_start|><|inner_prefix|>Because.<|inner_suffix|>It is so. More.<|assistant_end|><|user_start|>Thanks<|user_end|><|assistant_start|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Why?"
+    },
+    {
+     "role": "assistant",
+     "content": "<|inner_prefix|>Because.<|inner_suffix|>It is so."
+    },
+    {
+     "role": "assistant",
+     "content": " More."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": true,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: enabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Why?<|user_end|><|assistant_start|><|inner_prefix|>Because.<|inner_suffix|>It is so. More.<|assistant_end|><|user_start|>Thanks<|user_end|>"
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Why?"
+    },
+    {
+     "role": "assistant",
+     "content": "<|inner_prefix|>Because.<|inner_suffix|>It is so."
+    },
+    {
+     "role": "assistant",
+     "content": " More."
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "add_generation_prompt": false,
+   "enable_thinking": false,
+   "prompt": "<s><|system_start|>You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text.<|system_end|><|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|><|user_start|>Why?<|user_end|><|assistant_start|><|inner_prefix|>Because.<|inner_suffix|>It is so. More.<|assistant_end|><|user_start|>Thanks<|user_end|>"
+  }
+ ]
+}

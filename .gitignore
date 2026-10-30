@@ -3,3 +3,4 @@ bench/results/
 *.cov
 coverage/
 bench/ref/
+__pycache__/

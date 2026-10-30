@@ -53,6 +53,28 @@ SwiGLU activation `silu(gate) .* up`, where `gate_up` stacks gate rows over up r
 function silu_mul end
 
 """
+    XIELU{T}
+
+The learned scalars of a layer's xIELU activation (Apertus, arXiv:2411.13010), in the form
+transformers applies them, each rounded to `T` as there:
+`x > 0 ? αp x² + β x : (expm1(min(x, ε)) - x) αn + β x`.
+"""
+struct XIELU{T}
+    alpha_p::T                   # softplus(alpha_p) of the checkpoint
+    alpha_n::T                   # β + softplus(alpha_n) of the checkpoint
+    beta::T
+    eps::T
+end
+
+"""
+    xielu(backend, x, act::XIELU) -> same shape
+
+The xIELU activation of an ungated MLP (Apertus) with a layer's scalars `act`, rounding to
+T after each operation as transformers' XIELUActivation does.
+"""
+function xielu end
+
+"""
     store_kv!(backend, k_pages, v_pages, k, v, slots)
 
 Write the keys and values (head_dim, kv_heads, n) of n tokens into the page pools
@@ -79,6 +101,7 @@ function attention end
     linear!(backend, y, W, x)
     rope!(backend, y, x, cos, sin, positions)
     silu_mul!(backend, y, gate_up)
+    xielu!(backend, y, x, act)
     attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale; causal = true)
 
 In-place forms of the ops, writing into the preallocated `y` (or `out`) and returning it.
@@ -91,6 +114,7 @@ rmsnorm!(be::Backend, y, args...) = copyto!(y, rmsnorm(be, args...))
 linear!(be::Backend, y, args...) = copyto!(y, linear(be, args...))
 rope!(be::Backend, y, args...) = copyto!(y, rope(be, args...))
 silu_mul!(be::Backend, y, args...) = copyto!(y, silu_mul(be, args...))
+xielu!(be::Backend, y, args...) = copyto!(y, xielu(be, args...))
 attention!(be::Backend, out, workspace, args...; kw...) = copyto!(out, attention(be, args...; kw...))
 
 """
@@ -121,6 +145,14 @@ end
 backend can fuse it; `gate_up` is scratch for backends that cannot. Returns `y`.
 """
 linear_swiglu!(be::Backend, y, gate_up, W, x) = silu_mul!(be, y, linear!(be, gate_up, W, x))
+
+"""
+    linear_xielu!(backend, y, W, x, act)
+
+`y = xielu(linear(W, x), act)` for the up weight `W` of an ungated MLP, in one op where the
+backend can fuse it. Returns `y`.
+"""
+linear_xielu!(be::Backend, y, W, x, act) = xielu!(be, y, linear!(be, y, W, x), act)
 
 """
     add_rmsnorm!(backend, x, h, delta, w, eps)
