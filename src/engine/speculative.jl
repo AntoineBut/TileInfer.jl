@@ -16,11 +16,13 @@
 # samples each position with the device sampler and the counter plain decoding would use for
 # that token (`sampling_uniform(seed, counter)`): the drafts are accepted with probability
 # p(d), and the tokens are those of plain sampled decoding, up to round-off. Greedy decoding
-# is the case p = one-hot on the argmax. A proposer with a non-degenerate q (a draft model)
-# will need the general rule.
+# is the case p = one-hot on the argmax. The proposers here all draft deterministically (the
+# draft model and EAGLE greedily), so this rule is exact for them; a proposer that samples
+# its drafts from a non-degenerate q would need the general one.
 #
-# The proposer here is n-gram (prompt) lookup: no draft model, the drafts are the tokens
-# that followed the latest earlier occurrence of the sequence's last n tokens.
+# Proposers: n-gram (prompt) lookup below, where the drafts are the tokens that followed the
+# latest earlier occurrence of the sequence's last n tokens; a draft model (end of this
+# file); EAGLE-3 (eagle.jl).
 
 """
     NgramProposer(; k = 4, max_ngram = 3, min_ngram = 1)
@@ -59,6 +61,13 @@ function propose(p::NgramProposer, tokens::AbstractVector{<:Integer}, k::Integer
 end
 
 """
+    attach!(proposer, runner)
+
+Prepare `proposer` to draft for the target model of `runner`, before a generation.
+"""
+attach!(::Any, ::ModelRunner) = nothing
+
+"""
     SpecStats()
 
 Counters of a speculative generation: verify steps, drafted and accepted tokens.
@@ -85,7 +94,8 @@ end
 
 function VerifyStep(r::ModelRunner{T}, n::Integer) where {T}
     mirror = CuArray{Int32,1,CUDA.HostMemory}(undef, n)
-    return VerifyStep{T}(StepBuffers(r.model, r.cache, n; all_logits = true), nothing, CuVector{Int32}(undef, n),
+    return VerifyStep{T}(StepBuffers(r.model, r.cache, n; all_logits = true, r.aux_layers), nothing,
+                         CuVector{Int32}(undef, n),
                          mirror, unsafe_wrap(Array, mirror))
 end
 
@@ -109,6 +119,7 @@ function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer
     n = length(ids)
     1 <= n <= MAX_GRAPH_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_GRAPH_TOKENS tokens, got $n"))
     v = get!(() -> VerifyStep(r, n), r.verify_steps, n)::VerifyStep{T}
+    r.last_step, r.last_start = v.buffers, length(seq)
     NVTX.@range "upload inputs" begin
         prepare_step!(v.buffers, r.model, r.cache, seq, ids)
         set_counter!(r.sampler, counter)
@@ -141,6 +152,7 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
                                stats::SpecStats = SpecStats())
     generated = Int[]
     max_new_tokens > 0 || return generated
+    attach!(proposer, r)
     logits = forward!(r, seq, ids)
     # Sampled with counter 0, not yet in the cache.
     last = Int(Array(sample_token!(r.model.backend, r.token, r.token, logits, r.sampler))[1])

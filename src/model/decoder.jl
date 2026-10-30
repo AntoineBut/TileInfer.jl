@@ -41,11 +41,13 @@ PagedKVCache(m::DecoderLM{T}; max_tokens::Integer = max_length(m),
     PagedKVCache{T}(m.config, cld(max_tokens, page_size); page_size)
 
 """
-    StepBuffers(model, cache, n; all_logits = false)
+    StepBuffers(model, cache, n; all_logits = false, aux_layers = Int[])
 
 Device memory for one forward step of `n` tokens: the step's inputs (token ids, positions,
 cache slots and a block table long enough for every page of the pool), every intermediate
-activation, and the logits of the last token, or of all tokens with `all_logits`. A step
+activation, and the logits of the last token, or of all tokens with `all_logits`. With
+`aux_layers`, the step also keeps the residual stream after each of those layers (1-based),
+stacked in `aux`, for an EAGLE drafter (see [`Eagle3Proposer`](@ref)). A step
 that only writes into these buffers allocates nothing, so on a backend that
 [`supports_graphs`](@ref) it can be captured in a CUDA graph and replayed (see
 [`ModelRunner`](@ref)).
@@ -73,10 +75,16 @@ struct StepBuffers{T}
     gate_up::CuMatrix{T}            # (2 intermediate, n)
     act::CuMatrix{T}                # (intermediate, n)
     logits::CuMatrix{Float32}
+    aux_layers::Vector{Int}
+    aux::Union{Nothing,CuMatrix{T}}  # (length(aux_layers) hidden, n): the layers' outputs, stacked
 end
 
-function StepBuffers(m::DecoderLM{T}, cache::PagedKVCache{T}, n::Integer; all_logits::Bool = false) where {T}
-    cfg = m.config
+StepBuffers(m::DecoderLM{T}, cache::PagedKVCache{T}, n::Integer; kwargs...) where {T} =
+    StepBuffers{T}(m.config, m.backend, cache, n; kwargs...)
+
+# From a configuration, for drafters that are not a DecoderLM; `vocab` sizes the logits.
+function StepBuffers{T}(cfg::ModelConfig, backend::Backend, cache::PagedKVCache{T}, n::Integer;
+                        all_logits::Bool = false, aux_layers = Int[], vocab::Integer = cfg.vocab_size) where {T}
     H, D, nq, nkv, I = cfg.hidden_size, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate_size
     m_out = all_logits ? n : 1
     dev(S, dims...) = CuArray{S}(undef, dims...)
@@ -93,8 +101,9 @@ function StepBuffers(m::DecoderLM{T}, cache::PagedKVCache{T}, n::Integer; all_lo
                           view(meta, 2a+1:2a+n), view(meta, 3a+1:3a+table_len),
                           dev(T, H, n), dev(T, H, n), dev(T, (nq + 2nkv) * D, n),
                           q, dev(T, D, nq, n),
-                          attention_workspace(m.backend, q, first(cache.k)), dev(T, H, n), dev(T, 2I, n),
-                          dev(T, I, n), dev(Float32, cfg.vocab_size, m_out))
+                          attention_workspace(backend, q, first(cache.k)), dev(T, H, n), dev(T, 2I, n),
+                          dev(T, I, n), dev(Float32, vocab, m_out), collect(Int, aux_layers),
+                          isempty(aux_layers) ? nothing : dev(T, length(aux_layers) * H, n))
 end
 
 num_tokens(b::StepBuffers) = length(b.ids)
@@ -108,7 +117,7 @@ the step's inputs into `buffers` with one asynchronous copy, ordered before the 
 stream. With `nothing`, the ids are already on the device (written by a previous step's
 sampling). Host side only; `seq.tokens` is not changed.
 """
-function prepare_step!(b::StepBuffers, model::DecoderLM, cache::PagedKVCache, seq::Sequence,
+function prepare_step!(b::StepBuffers, model, cache::PagedKVCache, seq::Sequence,
                        ids::Union{Nothing,AbstractVector{<:Integer}})
     n = num_tokens(b)
     ids === nothing || length(ids) == n || throw(ArgumentError("buffers are for $n tokens, got $(length(ids))"))
@@ -159,10 +168,21 @@ function run_step!(model::DecoderLM{T}, cache::PagedKVCache{T}, b::StepBuffers{T
         linear!(be, b.proj, layer.w_down, b.act)
         # The next layer's input norm, or the final norm after the last layer.
         add_rmsnorm!(be, b.x, b.h, b.proj, l < length(w.layers) ? w.layers[l+1].attn_norm : w.norm, eps)
+        save_aux!(b, l)
     end
 
     last = size(b.logits, 2) == n ? b.h : view(b.h, :, n:n)        # a column view is a CuArray
     return linear!(be, b.logits, w.lm_head, last)                  # Float32 logits
+end
+
+# Keep the residual stream after layer l if it is one of the step's aux layers.
+function save_aux!(b::StepBuffers, l)
+    b.aux === nothing && return
+    i = findfirst(==(l), b.aux_layers)
+    i === nothing && return
+    H = size(b.x, 1)
+    view(b.aux, (i-1)*H+1:i*H, :) .= b.x
+    return
 end
 
 """

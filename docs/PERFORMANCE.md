@@ -454,3 +454,28 @@ token must be accepted with a probability of roughly 0.2 or more to pay; at k = 
 drafts on open text rarely are. n-gram lookup is free but only finds text the reply copies.
 Candidates: pick k (or the proposer) from the measured acceptance, as DeepInfer's scheduler
 does; combine both proposers (n-gram when it matches, the draft otherwise).
+
+## EAGLE-3 drafting (2026-10-29)
+
+`Eagle3Proposer(load_eagle3("AngelSlim/Qwen3-4B_eagle3", target); k)`: target steps keep
+the residual stream after layers 2, 18 and 33 (`enable_aux!`, three strided copies per
+step); the drafter's one Llama layer reads [norm(embed(next token)); norm(fc(those states))]
+for the positions the target just verified (one graph per count), then its own output for
+k - 1 chained steps (as for the draft model), over a 32k vocabulary mapped back with `d2t`.
+A drafter step costs about a tenth of the 0.6B draft model's. Its acceptance matches
+AngelSlim's report (accept length 2.07–2.10 at 2 drafts on vLLM; here 1.80–2.50 at k = 2)
+and decays quickly along the chain, so k = 2 is best. `bench/speculative.jl`, 4B target, k = 2 / 4:
+
+| Prompt | plain | n-gram | 0.6B draft | EAGLE-3 | EAGLE-3 tokens per step (acceptance) at k = 2 |
+|---|---|---|---|---|---|
+| rename (greedy) | 78 tok/s | 2.12× / 2.96× | 2.12× / 2.68× | **2.20×** / 2.25× | 2.50 (0.75) |
+| document | 80 | 1.37× / 1.48× | 1.66× / **1.80×** | 1.74× / 1.75× | 2.00 (0.50) |
+| explain | 80 | 1.10× / 1.10× | 1.60× / **1.64×** | 1.58× / 1.55× | 1.82 (0.41) |
+| story | 80 | 1.04× / 1.04× | 1.39× / 1.36× | **1.51×** / 1.46× | 1.73 (0.36) |
+| *sampled:* document | 80 | 1.39× / 1.46× | 1.72× / **1.92×** | 1.74× / 1.82× | 2.00 (0.50) |
+| explain | 80 | 1.09× / 1.10× | **1.48×** / 1.41× | 1.46× / 1.40× | 1.67 (0.34) |
+| story | 80 | 1.03× / 1.03× | 1.42× / 1.39× | **1.57×** / 1.54× | 1.80 (0.40) |
+
+(n-gram at k = 7 stays best on the rename prompt: 3.92×.) EAGLE-3 trades acceptance for
+cheap drafts and ends up level with the 0.6B draft model; this head was trained for two
+drafts. The tests use GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge with Qwen3-0.6B.

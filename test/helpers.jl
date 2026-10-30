@@ -16,6 +16,8 @@ end
 
 # Model used by tests that need a real checkpoint; they are skipped when it is not pulled.
 const TEST_MODEL = "Qwen/Qwen3-0.6B"
+# An EAGLE-3 drafter for TEST_MODEL; its tests are skipped when it is not pulled.
+const EAGLE_TEST_HEAD = "GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge"
 
 function test_model_dir()
     try

@@ -149,6 +149,20 @@ function sample_token!(::Backend, ids, mirror, logits, s)
 end
 
 """
+    map_token!(backend, ids, mirror, offsets)
+
+Map the 0-based token `ids[1]` of a reduced vocabulary to `ids[1] + offsets[ids[1] + 1]`, into
+`ids[1]` and `mirror[1]`: an EAGLE drafter's token to the target's (its `d2t` table).
+"""
+function map_token!(::Backend, ids, mirror, offsets)
+    id = Int(Array(ids)[1])
+    token = Int32[id + Array(offsets)[id+1]]
+    copyto!(ids, token)
+    copyto!(mirror, token)
+    return ids
+end
+
+"""
     attention_workspace(backend, q, k_pages)
 
 Scratch memory `attention!` needs for queries shaped like `q`, or `nothing`.

@@ -31,6 +31,9 @@ mutable struct ModelRunner{T,M<:DecoderLM{T},C<:PagedKVCache{T}}
     const sampler::TokenSampler      # device sampling state, see `sample_token!`
     const token::CuVector{Int32}     # the token sampled by a step-by-step generation
     pipeline::Any                    # DecodePipeline, created on first use
+    const aux_layers::Vector{Int}    # layers whose outputs steps keep, see `enable_aux!`
+    last_step::Any                   # StepBuffers of the latest forward or verify step,
+    last_start::Int                  # and the position of its first token
 end
 
 function ModelRunner(model::DecoderLM{T}, cache::PagedKVCache{T};
@@ -38,7 +41,24 @@ function ModelRunner(model::DecoderLM{T}, cache::PagedKVCache{T};
     graphs && !supports_graphs(model.backend) &&
         throw(ArgumentError("$(nameof(typeof(model.backend))) steps cannot be captured in CUDA graphs"))
     return ModelRunner(model, cache, graphs, Dict{Int,CapturedStep{T}}(), Dict{Int,Any}(), TokenSampler(model.config.vocab_size),
-                       CuVector{Int32}(undef, 1), nothing)
+                       CuVector{Int32}(undef, 1), nothing, Int[], nothing, 0)
+end
+
+"""
+    enable_aux!(runner, layers)
+
+Make every later step keep the residual stream after `layers` (1-based) in its buffers'
+`aux`, for an EAGLE drafter; the latest step's buffers are `runner.last_step`. Drops the
+captured steps when the layers change.
+"""
+function enable_aux!(r::ModelRunner, layers)
+    r.aux_layers == layers && return r
+    copy!(r.aux_layers, layers)
+    empty!(r.steps)
+    empty!(r.verify_steps)
+    r.pipeline = nothing
+    r.last_step = nothing
+    return r
 end
 
 """
@@ -50,9 +70,20 @@ same length, so read them before running another step.
 """
 function forward!(r::ModelRunner, seq::Sequence, ids::AbstractVector{<:Integer})
     n = length(ids)
-    n > MAX_GRAPH_TOKENS && return NVTX.@range "prefill" forward!(r.model, r.cache, seq, ids)
     n > 0 || throw(ArgumentError("forward! needs at least one token"))
-    step = get!(() -> CapturedStep(StepBuffers(r.model, r.cache, n), nothing), r.steps, n)
+    r.last_start = length(seq)
+    if n > MAX_GRAPH_TOKENS
+        NVTX.@range "prefill" begin
+            b = StepBuffers(r.model, r.cache, n; r.aux_layers)
+            prepare_step!(b, r.model, r.cache, seq, ids)
+            run_step!(r.model, r.cache, b)
+        end
+        append!(seq.tokens, ids)
+        r.last_step = b
+        return b.logits
+    end
+    step = get!(() -> CapturedStep(StepBuffers(r.model, r.cache, n; r.aux_layers), nothing), r.steps, n)
+    r.last_step = step.buffers
     NVTX.@range "upload inputs" prepare_step!(step.buffers, r.model, r.cache, seq, ids)
     if step.graph !== nothing
         NVTX.@range "replay step" CUDA.launch(step.graph)

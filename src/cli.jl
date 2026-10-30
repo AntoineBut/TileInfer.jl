@@ -23,6 +23,7 @@ const USAGE = """
       --speculate K         speculative decoding with up to K drafts per step (1-7), by
                             n-gram lookup in the conversation, or by --draft
       --draft <model>       a smaller model with the same vocabulary drafts (K = 4 by default)
+      --eagle <drafter>     an EAGLE-3 drafter trained for the model drafts (K = 4 by default)
     """
 
 # Splits `args` into positionals and `--name value` options; names in `flags` take no
@@ -92,7 +93,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft")
+                            "backend", "speculate", "draft", "eagle")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -115,9 +116,11 @@ end
 
 # The proposer of --speculate / --draft, or nothing.
 function load_proposer(model::DecoderLM, options)
-    haskey(options, "speculate") || haskey(options, "draft") || return nothing
+    any(o -> haskey(options, o), ("speculate", "draft", "eagle")) || return nothing
+    haskey(options, "draft") && haskey(options, "eagle") && throw(ArgumentError("use either --draft or --eagle"))
     k = parse_option(Int, options, "speculate", 4)
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("--speculate expects 1 to $(MAX_GRAPH_TOKENS - 1) drafts, got $k"))
+    haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k)
     haskey(options, "draft") || return NgramProposer(; k)
     draft = load_model(model_dir(options["draft"]); T = eltype(model), backend = model.backend,
                        max_len = max_length(model))

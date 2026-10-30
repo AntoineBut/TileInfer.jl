@@ -1,12 +1,13 @@
-# Speculative decoding on real chat prompts: plain decoding (pipelined) against n-gram lookup
-# and a draft model, for several draft lengths k. Acceptance depends on the text, so unlike
+# Speculative decoding on real chat prompts: plain decoding (pipelined) against n-gram lookup,
+# a draft model and an EAGLE-3 drafter, for several draft lengths k. Acceptance depends on the text, so unlike
 # bench/run.jl this generates replies to fixed prompts, from one that copies its input to
 # open-ended ones.
 #
-#   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--k 1,2,4,7]
-#       [--tokens N] [--trials N] [--sampled] [--filter REGEX]
+#   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--eagle REPO|none]
+#       [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled] [--filter REGEX]
 #
-# Defaults: Qwen/Qwen3-4B drafted by Qwen/Qwen3-0.6B, k = 2, 4, 7, 256 new tokens, greedy
+# Defaults: Qwen/Qwen3-4B drafted by Qwen/Qwen3-0.6B and by AngelSlim/Qwen3-4B_eagle3 (for
+# Qwen3-4B; none otherwise), k = 2, 4, 7, 256 new tokens, greedy
 # (--sampled: the model's recommended sampling, same seed for every method). Decode tok/s
 # runs from the first new token to the last, so it excludes the target's prefill but includes
 # the draft model's (it prefills during the first proposal). Each case is the best of
@@ -16,8 +17,8 @@ using CUDA
 using Printf: @printf, @sprintf
 using Random: Xoshiro
 using TileInfer
-using TileInfer: ChatMessage, DecoderLM, DraftProposer, NgramProposer, SpecStats, chat_prompt, encode,
-                 generation_defaults, load_tokenizer, model_dir
+using TileInfer: ChatMessage, DecoderLM, DraftProposer, Eagle3Proposer, NgramProposer, SpecStats, chat_prompt,
+                 encode, generation_defaults, load_eagle3, load_tokenizer, model_dir
 
 const CODE = """
 function rmsnorm!(y, x, w, eps)
@@ -48,6 +49,7 @@ function main(args)
     _, opts = TileInfer.parse_args(args; flags = ("sampled",))
     target_name = get(opts, "model", "Qwen/Qwen3-4B")
     draft_name = get(opts, "draft", "Qwen/Qwen3-0.6B")
+    eagle_name = get(opts, "eagle", target_name == "Qwen/Qwen3-4B" ? "AngelSlim/Qwen3-4B_eagle3" : "none")
     ks = parse.(Int, split(get(opts, "k", "2,4,7"), ','))
     n = parse(Int, get(opts, "tokens", "256"))
     trials = parse(Int, get(opts, "trials", "3"))
@@ -59,16 +61,21 @@ function main(args)
     tok = load_tokenizer(dir)
     defaults, stop_ids = generation_defaults(dir, target.config)
     sampling = haskey(opts, "sampled") ? defaults : TileInfer.SamplingParams()
-    cache = TileInfer.PagedKVCache(target; max_tokens = MAX_TOKENS)
-    runner = TileInfer.ModelRunner(target, cache)
+    runner = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens = MAX_TOKENS))
+    # EAGLE makes the target's steps keep hidden states: a runner of its own keeps the others'
+    # steps as they are.
+    eagle = eagle_name == "none" ? nothing : load_eagle3(eagle_name, target; max_len = MAX_TOKENS)
+    eagle_runner = eagle === nothing ? nothing :
+                   TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens = MAX_TOKENS))
 
-    methods = Pair{String,Any}["plain" => nothing]
+    methods = Tuple{String,Any,Any}[("plain", nothing, runner)]
     for k in ks
-        push!(methods, "ngram k=$k" => NgramProposer(; k))
-        draft === nothing || push!(methods, "draft k=$k" => DraftProposer(draft; k, max_tokens = MAX_TOKENS))
+        push!(methods, ("ngram k=$k", NgramProposer(; k), runner))
+        draft === nothing || push!(methods, ("draft k=$k", DraftProposer(draft; k, max_tokens = MAX_TOKENS), runner))
+        eagle === nothing || push!(methods, ("eagle k=$k", Eagle3Proposer(eagle; k, max_tokens = MAX_TOKENS), eagle_runner))
     end
 
-    println("target $target_name, draft $(draft_name), ", sampling.temperature == 0 ? "greedy" : "sampled $sampling",
+    println("target $target_name, draft $draft_name, EAGLE-3 $eagle_name, ", sampling.temperature == 0 ? "greedy" : "sampled $sampling",
             ", $n tokens, best of $trials")
     @printf("%-9s %-11s %8s %7s %6s %6s %8s %11s\n", "prompt", "method", "tok/s", "speedup", "out", "steps",
             "accept", "tokens/step")
@@ -76,7 +83,8 @@ function main(args)
         occursin(filter, name) || continue
         ids = encode(tok, chat_prompt(target.config.model_type, [ChatMessage("user", text)]; enable_thinking = false))
         base = NaN
-        for (method, proposer) in methods
+        for (method, proposer, runner) in methods
+            cache = runner.cache
             function run()
                 seq = TileInfer.new_sequence(cache)
                 stats = SpecStats()

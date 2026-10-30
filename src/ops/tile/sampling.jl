@@ -86,3 +86,17 @@ function sample_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int
                                               ct.Constant(MAX_TOP_K), ct.Constant(MAX_TOP_K * SAMPLE_PARTS))
     return ids
 end
+
+# An EAGLE drafter samples from a reduced vocabulary: map its token to the target's.
+function map_token_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1}, Offsets::ct.TileArray{Int32,1})
+    id = Token[Int32(1)]
+    t = id + Offsets[id + Int32(1)]
+    Token[Int32(1)] = t
+    Mirror[Int32(1)] = t
+    return nothing
+end
+
+function map_token!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, offsets::CuVector{Int32})
+    @cuda backend = cuTile map_token_kernel(ids, mirror, offsets)
+    return ids
+end
