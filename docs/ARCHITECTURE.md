@@ -433,7 +433,7 @@ Chosen for what each teaches and demos, not only for raw speed; (+++) were taken
 
 | Item | Why |
 |---|---|
-| **INT8 KV cache** (+++) — first version done: keys smoothed by the k_norm weight, 1.13× decode at 32k positions on 4B; next: the INT8 attention kernel spills (66 % of DRAM bandwidth) | Long-context decode: at 32k positions Qwen3-4B reads ~4.7 GB of KV per token against 8 GB of weights, and decode attention already runs at 600–660 GB/s, so only fewer bytes help. Also doubles the context that fits |
+| **INT8 KV cache** (+++) — done: keys smoothed by the k_norm weight; attention in 32-key tiles and head-dim halves (no spills, 79 % of DRAM bandwidth); 4B decode at 32k positions 1.19× the BF16 cache | Long-context decode: at 32k positions Qwen3-4B reads ~4.7 GB of KV per token against 8 GB of weights, and decode attention already runs at 600–660 GB/s, so only fewer bytes help. Also doubles the context that fits |
 | Chunked prefill | `forward!` sizes the step buffers for the whole prompt (a 32k prompt on 4B: ~1.3 GB for gate_up alone); fixed-size chunks bound the activation memory |
 | Prefill attention for long prompts | Attention catches up with the GEMMs at long prompts: GQA packing (the group's heads share K/V loads), tiles chosen per n, heaviest causal blocks first. Needs prefill benchmarks at 4k–16k tokens first |
 | **INT8 GEMM with fused dequantization** (+++) — tiles and occupancy of its own: 1.6–2.0× at 64 tokens, prefill 512 at 0.97× BF16; next: conversion without registers to spare (prepacked layout) | INT8 prefill is 8–11 % slower than BF16: the Int8 → BF16 tile conversion is not hidden (down 0.73×) |

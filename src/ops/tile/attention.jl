@@ -1,5 +1,5 @@
 # Paged causal grouped-query attention (FlashAttention-2 online softmax). The KV loop walks
-# the sequence's block table, one page per step. Scores are computed in Float32 with exp2
+# the sequence's block table, one page per step (half a page for an INT8 cache). Scores are computed in Float32 with exp2
 # (the scale is pre-multiplied by log2(e)); probabilities are rounded to T for the PV product.
 #
 # - Prefill (many tokens): grid (query tiles, query heads), one TM-row query tile per block,
@@ -26,50 +26,97 @@ const LOG2_E = Float32(1 / log(2))
 # split then gets m = NEG_BIG, l = 0 (no -∞ - -∞ = NaN), and weight 0 when combined.
 const NEG_BIG = -floatmax(Float32)
 
-# One page of the online softmax for the query tile q (D, M) at positions qpos (1, M).
-# Keys of the page are at positions j PAGE + 1 : (j + 1) PAGE (j is 0-based), in tile column
-# kcol of K, and their values in tile column vcol of V. For an INT8 cache (Int8Pages) S holds
-# the scales, at the same tile index as their vectors; it is `nothing` otherwise.
-@inline function attend_page(K, V, S, kcol, vcol, q, qpos, m_i, l_i, acc, j, qk_scale, MASK, ::Type{T},
-                             D, PAGE, M) where {T}
-    k = ct.load(K; index = (kcol, Int32(1)), shape = (PAGE, D), order = (2, 1), latency = 2)
-    if S === nothing
-        qk = muladd(k, q, zeros(Float32, (PAGE, M)))              # (PAGE, M)
-    else                                                          # s_k (q_kᵀ x): scale the rows
-        qk = muladd(convert(ct.Tile{T}, k), q, zeros(Float32, (PAGE, M))) .*
-             reshape(ct.load(S; index = kcol, shape = (PAGE,)), (PAGE, 1))
-    end
+# The online-softmax update for the scores qk (KEYS, M) of keys at positions
+# first_key + 1 : first_key + KEYS, for queries at positions qpos (1, M): the probabilities
+# p (Float32), the factor alpha that rescales the accumulator, and the new running max and sum.
+@inline function softmax_step(qk, qpos, m_i, l_i, first_key, qk_scale, MASK, KEYS)
     if MASK
-        kpos = j * Int32(PAGE) .+ reshape(ct.arange(PAGE; dtype = Int32), (PAGE, 1))
+        kpos = first_key .+ reshape(ct.arange(KEYS; dtype = Int32), (KEYS, 1))
         qk = qk .+ ifelse.(kpos .<= qpos, 0.0f0, -Inf32)
     end
     m_ij = max.(m_i, maximum(qk; dims = 1) .* qk_scale)
     p, alpha = ct.@fpmode flush_to_zero = true begin
         exp2.(qk .* qk_scale .- m_ij), exp2.(m_i .- m_ij)
     end
-    l_i = l_i .* alpha .+ sum(p; dims = 1)
-    v = ct.load(V; index = (Int32(1), vcol), shape = (D, PAGE), latency = 4)
-    if S === nothing
-        acc = muladd(v, convert(ct.Tile{T}, p), acc .* alpha)
-    else                                                          # V diag(s_v) p
-        p = p .* reshape(ct.load(S; index = vcol, shape = (PAGE,)), (PAGE, 1))
-        acc = muladd(convert(ct.Tile{T}, v), convert(ct.Tile{T}, p), acc .* alpha)
-    end
-    return m_ij, l_i, acc
+    return p, alpha, m_ij, l_i .* alpha .+ sum(p; dims = 1)
 end
 
-# Queries times the keys' smoothing factors C (an INT8 cache), rounded to T; as they are
-# without C.
-@inline smooth_queries(q, ::Nothing, ::Type{T}, D) where {T} = q
-@inline smooth_queries(q, C, ::Type{T}, D) where {T} =
-    convert(ct.Tile{T}, convert(ct.Tile{Float32}, q) .* reshape(ct.load(C; index = Int32(1), shape = (D,)), (D, 1)))
+# One key tile of the online softmax for the query tile q (D, M) at positions qpos (1, M):
+# its KEYS keys, at positions first_key + 1 : first_key + KEYS, are tile column kcol of K
+# (width KEYS) and their values tile column vcol of V. S holds the scales of an INT8 cache
+# (Int8Pages), at the same tile index as their vectors; it is `nothing` otherwise.
+@inline function attend(K, V, ::Nothing, kcol, vcol, q, qpos, m_i, l_i, acc, first_key, qk_scale, MASK,
+                        ::Type{T}, D, KEYS, M) where {T}
+    k = ct.load(K; index = (kcol, Int32(1)), shape = (KEYS, D), order = (2, 1), latency = 2)
+    qk = muladd(k, q, zeros(Float32, (KEYS, M)))                  # (KEYS, M)
+    p, alpha, m_i, l_i = softmax_step(qk, qpos, m_i, l_i, first_key, qk_scale, MASK, KEYS)
+    v = ct.load(V; index = (Int32(1), vcol), shape = (D, KEYS), latency = 4)
+    return m_i, l_i, muladd(v, convert(ct.Tile{T}, p), acc .* alpha)
+end
+
+# An INT8 cache: the keys and values are converted to T for the tensor cores, the key's scale
+# multiplies its row of scores (s_k q_kᵀ x) and the value's scale its probability
+# (V diag(s_v) p). Converting whole (64, 128) pages of keys and values takes 255 registers
+# and spills, so the kernels take 32 keys at a time, and K, V, the queries and the
+# accumulator in two halves of the head dimension: q = (q1, q2), acc = (acc1, acc2).
+@inline function attend(K, V, S, kcol, vcol, (q1, q2), qpos, m_i, l_i, (acc1, acc2), first_key, qk_scale, MASK,
+                        ::Type{T}, D, KEYS, M) where {T}
+    k1 = ct.load(K; index = (kcol, Int32(1)), shape = (KEYS, D ÷ 2), order = (2, 1), latency = 2)
+    k2 = ct.load(K; index = (kcol, Int32(2)), shape = (KEYS, D ÷ 2), order = (2, 1), latency = 2)
+    qk = muladd(convert(ct.Tile{T}, k2), q2, muladd(convert(ct.Tile{T}, k1), q1, zeros(Float32, (KEYS, M)))) .*
+         reshape(ct.load(S; index = kcol, shape = (KEYS,)), (KEYS, 1))
+    p, alpha, m_i, l_i = softmax_step(qk, qpos, m_i, l_i, first_key, qk_scale, MASK, KEYS)
+    p = convert(ct.Tile{T}, p .* reshape(ct.load(S; index = vcol, shape = (KEYS,)), (KEYS, 1)))
+    v1 = ct.load(V; index = (Int32(1), vcol), shape = (D ÷ 2, KEYS), latency = 4)
+    v2 = ct.load(V; index = (Int32(2), vcol), shape = (D ÷ 2, KEYS), latency = 4)
+    return m_i, l_i, (muladd(convert(ct.Tile{T}, v1), p, acc1 .* alpha), muladd(convert(ct.Tile{T}, v2), p, acc2 .* alpha))
+end
+
+# Keys per step of the KV loop: a page, or half of one for an INT8 cache.
+key_tile(::Nothing, PAGE) = PAGE
+key_tile(S, PAGE) = PAGE ÷ 2
+
+# The query tile q (D, M) and a zero accumulator as `attend` takes them: as they are, or for
+# an INT8 cache (C, the keys' smoothing, not `nothing`) the queries times C, rounded to T, in
+# halves of the head dimension, and the accumulator too.
+@inline attend_operands(q, ::Nothing, ::Type{T}, D, M) where {T} = q, zeros(Float32, (D, M))
+@inline function attend_operands(q, C, ::Type{T}, D, M) where {T}
+    q = convert(ct.Tile{T}, convert(ct.Tile{Float32}, q) .* reshape(ct.load(C; index = Int32(1), shape = (D,)), (D, 1)))
+    half = (D ÷ 2, M)
+    return (ct.extract(q, (1, 1), half), ct.extract(q, (2, 1), half)), (zeros(Float32, half), zeros(Float32, half))
+end
+
+# Tile column (width PAGE ÷ R) of the key tile j (0-based) of the sequence for KV head h:
+# part j mod R of the R parts of page j ÷ R of the block table.
+@inline key_column(BT, j, h, KV_HEADS, R) =
+    R == 1 ? page_column(BT, j, h, KV_HEADS) :
+             (page_column(BT, fld(j, Int32(R)), h, KV_HEADS) - Int32(1)) * Int32(R) + rem(j, Int32(R)) + Int32(1)
 
 # Tile column of page j + 1 of the block table for KV head h.
 @inline page_column(BT, j, h, KV_HEADS) = (BT[j + Int32(1)] - Int32(1)) * Int32(KV_HEADS) + h
 
+# Stores the accumulator (rows 1:D of a tile at `index`, whose other indices are in units
+# of the tile), whole or in its halves.
+@inline store_acc(A, (i, rest...), acc) = ct.store(A; index = (i, rest...), tile = acc)
+@inline function store_acc(A, (i, rest...), (acc1, acc2)::Tuple)
+    ct.store(A; index = (Int32(2) * i - Int32(1), rest...), tile = acc1)
+    ct.store(A; index = (Int32(2) * i, rest...), tile = acc2)
+end
+
+@inline function divide(acc, l_i, ::Type{T}) where {T}
+    o = ct.@fpmode rounding_mode = ct.Rounding.Approx flush_to_zero = true begin
+        acc ./ l_i
+    end
+    return convert(ct.Tile{T}, o)
+end
+@inline divide((acc1, acc2)::Tuple, l_i, ::Type{T}) where {T} = (divide(acc1, l_i, T), divide(acc2, l_i, T))
+
+@inline partial(acc, D, M) = reshape(acc, (D, M, 1))
+@inline partial((acc1, acc2)::Tuple, D, M) = (partial(acc1, D ÷ 2, M), partial(acc2, D ÷ 2, M))
+
 # The kernels take the pools as K and V with S = nothing, or an INT8 layer as KV (keys, then
-# values from tile column VALUES + 1 on) with its scales S and the keys' smoothing C, which
-# multiplies the queries (`smooth_queries`).
+# values from VALUES key tiles on) with its scales S and the keys' smoothing C, which
+# multiplies the queries (`attend_operands`).
 function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                   V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                   qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, TM::Int,
@@ -84,7 +131,7 @@ function attention_prefill_int8_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T
                                        Pos::ct.TileArray{Int32,1}, qk_scale::Float32, D::Int, GROUP::Int,
                                        KV_HEADS::Int, TM::Int, PAGE::Int, CAUSAL::Bool) where {T}
     ct.@compiler_options occupancy = 2
-    values = size(S, 1) ÷ Int32(2 * PAGE)
+    values = size(S, 1) ÷ Int32(2 * key_tile(S, PAGE))
     prefill_body(Out, Q, KV, KV, S, C, values, BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, TM, PAGE, CAUSAL)
     return nothing
 end
@@ -98,26 +145,24 @@ end
     first_pos = start + (bx - Int32(1)) * Int32(TM)               # queries first_pos+1 : first_pos+TM
     qpos = first_pos .+ reshape(ct.arange(TM; dtype = Int32), (1, TM))
     CAUSAL || (qpos = max.(qpos, len))
-    q = smooth_queries(ct.load(Q; index = (head, bx), shape = (D, TM)), C, T, D)
+    q, acc = attend_operands(ct.load(Q; index = (head, bx), shape = (D, TM)), C, T, D, TM)
     qk_scale = qk_scale * LOG2_E
-    m_i, l_i, acc = fill(NEG_BIG, (1, TM)), zeros(Float32, (1, TM)), zeros(Float32, (D, TM))
-    # Pages before mask_start hold only keys every query of the tile sees.
-    mask_start = fld(CAUSAL ? first_pos : len, Int32(PAGE))
+    m_i, l_i = fill(NEG_BIG, (1, TM)), zeros(Float32, (1, TM))
+    KEYS = key_tile(S, PAGE)
+    # Key tiles before mask_start hold only keys every query of the tile sees.
+    mask_start = fld(CAUSAL ? first_pos : len, Int32(KEYS))
     last_key = CAUSAL ? min(first_pos + Int32(TM), len) : len
-    for j in Int32(0):cld(last_key, Int32(PAGE)) - Int32(1)
-        col = page_column(BT, j, h, KV_HEADS)
+    for j in Int32(0):cld(last_key, Int32(KEYS)) - Int32(1)
+        col = key_column(BT, j, h, KV_HEADS, PAGE ÷ KEYS)
         if j >= mask_start
-            m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, true,
-                                        T, D, PAGE, TM)
+            m_i, l_i, acc = attend(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j * Int32(KEYS), qk_scale,
+                                   true, T, D, KEYS, TM)
         else
-            m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, false,
-                                        T, D, PAGE, TM)
+            m_i, l_i, acc = attend(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j * Int32(KEYS), qk_scale,
+                                   false, T, D, KEYS, TM)
         end
     end
-    o = ct.@fpmode rounding_mode = ct.Rounding.Approx flush_to_zero = true begin
-        acc ./ l_i
-    end
-    ct.store(Out; index = (head, bx), tile = convert(ct.Tile{T}, o))
+    store_acc(Out, (head, bx), divide(acc, l_i, T))
     return nothing
 end
 
@@ -139,7 +184,7 @@ function attention_decode_int8_kernel(Part::ct.TileArray{Float32,3}, Q::ct.TileA
                                       Pos::ct.TileArray{Int32,1}, qk_scale::Float32, D::Int, GROUP::Int,
                                       KV_HEADS::Int, NT::Int, PAGE::Int, SPLITS::Int, CAUSAL::Bool) where {T}
     ct.@compiler_options occupancy = 2
-    values = size(S, 1) ÷ Int32(2 * PAGE)
+    values = size(S, 1) ÷ Int32(2 * key_tile(S, PAGE))
     decode_body(Part, Q, KV, KV, S, C, values, BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, NT, PAGE, SPLITS, CAUSAL)
     return nothing
 end
@@ -151,19 +196,21 @@ end
     M = GROUP * NT
     pages = cld(start + size(Q, 2), Int32(PAGE))
     per_split = cld(pages, Int32(SPLITS))
-    q = smooth_queries(reshape(ct.load(Q; index = (h, Int32(1)), shape = (D * GROUP, NT),
-                                       padding_mode = ct.PaddingMode.Zero), (D, M)), C, T, D)
+    q, acc = attend_operands(reshape(ct.load(Q; index = (h, Int32(1)), shape = (D * GROUP, NT),
+                                             padding_mode = ct.PaddingMode.Zero), (D, M)), C, T, D, M)
     qpos = start .+ reshape(cld.(ct.arange(M; dtype = Int32), Int32(GROUP)), (1, M))
     CAUSAL || (qpos = max.(qpos, start + size(Q, 2)))
     qk_scale = qk_scale * LOG2_E
-    m_i, l_i, acc = fill(NEG_BIG, (1, M)), zeros(Float32, (1, M)), zeros(Float32, (D, M))
-    for j in (s - Int32(1)) * per_split:min(s * per_split, pages) - Int32(1)
-        col = page_column(BT, j, h, KV_HEADS)
-        m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, true,
-                                    T, D, PAGE, M)
+    m_i, l_i = fill(NEG_BIG, (1, M)), zeros(Float32, (1, M))
+    KEYS = key_tile(S, PAGE)
+    R = PAGE ÷ KEYS
+    for j in (s - Int32(1)) * per_split * Int32(R):min(s * per_split, pages) * Int32(R) - Int32(1)
+        col = key_column(BT, j, h, KV_HEADS, R)
+        m_i, l_i, acc = attend(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j * Int32(KEYS), qk_scale, true,
+                               T, D, KEYS, M)
     end
     part = (h - Int32(1)) * Int32(SPLITS) + s
-    ct.store(Part; index = (Int32(1), Int32(1), part), tile = reshape(acc, (D, M, 1)))
+    store_acc(Part, (Int32(1), Int32(1), part), partial(acc, D, M))
     ct.store(Part; index = (Int32(D + 1), Int32(1), part), tile = reshape(m_i, (1, M, 1)))
     ct.store(Part; index = (Int32(D + 2), Int32(1), part), tile = reshape(l_i, (1, M, 1)))
     return nothing

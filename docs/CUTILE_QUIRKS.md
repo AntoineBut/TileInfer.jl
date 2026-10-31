@@ -36,6 +36,7 @@ CUDA.jl 6.3, Julia 1.13.3, RTX 4080 SUPER (sm_89, Ada). Raw output of the last f
 | 6 | `for X in (A, B)` over arrays fails to compile | `tuple_loop` | cuTile.jl | known limitation; workaround below |
 | 7 | CUPTI reports 0 bytes of local memory for kernels that spill | `narrow_matmul_t` | CUPTI / CUDA.jl | harness reads the driver attribute |
 | 8 | The `occupancy` hint alone can change results in the last bit | `knobs_attention_prefill_*` | tileiras | expected (summation order); noted |
+| 9 | Converting two (64, 128) Int8 tiles to BF16 for MMAs in one loop body spills; halves fit | `int8_attention` | tileiras | expected (register pressure); TileInfer splits the tiles |
 
 ### 1. Narrow matrix products (tileiras)
 
@@ -140,6 +141,21 @@ ulp, with the same error against the reference: a different summation order, not
 miscompile. Occupancies 1 and 2 (same registers, half the shared memory) are
 bit-identical. So results are bit-reproducible only for a given set of compiler hints.
 
+### 9. Int8 → BF16 conversion of MMA operands (tileiras)
+
+A tile converted from Int8 to BF16 for an `mmaf` is not staged through shared memory as a
+BF16 tile loaded from memory is: the bytes are shuffled into the MMA's register layout and
+converted there, so the whole converted tile is live in registers. Decode attention over
+Int8 keys and values (4B shapes, 32k positions, `int8_attention`): converting a (64, 128)
+key page uses 178 registers, a value page 232, both 255 with 56 bytes of spills per thread
+and 3.7× the SASS of the BF16 kernel. Smaller conversions fit: 32-key tiles (211
+registers), K and V in halves of the head dimension (190), or both (184, kept in
+TileInfer); each removes the spills and runs ~5–10 % faster in the probe (1.26× in the real
+kernel, which spilled more). An Int8 × Int8 `mmai` for QKᵀ avoids the key conversion
+(206 registers), at the cost of quantizing the queries. Storing V transposed, so the
+contraction axis is contiguous for the PV product, did not help (255 registers, more
+shuffles). Same class of cost as the INT8 GEMM's spills at 512 tokens (audit below).
+
 ## Not reproduced
 
 Notes in CLAUDE.md came from the OKC experiments without reproducers; on sm_89 with
@@ -158,7 +174,7 @@ Also checked: a Float64 literal in Float32 code (`x .* 0.7`) compiles to the sam
 ## TileInfer audit
 
 **Code layout.** TileInfer kernels against copies that differ only in code layout
-(`05_tileinfer_audit.jl`): decode attention with `attend_page` and `page_column` inlined
+(`05_tileinfer_audit.jl`): decode attention with `attend_page` (now `attend`) and `page_column` inlined
 (same SASS), q inputs with `norm_rope` and its closures inlined (same instruction counts
 and time), the attention combine as a 3-D reduction (same time), and RMSNorm with its
 loads through a closure or reordered (same or slightly worse). The helpers in the GEMV and

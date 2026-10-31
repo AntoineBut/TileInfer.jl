@@ -692,14 +692,43 @@ transformers (BF16 cache: 0.63):
 | decode attention at 32,768 positions | 209 µs (642 GB/s, 87 %) | 142 µs (489 GB/s, 66 %) | 1.48× for 0.52× the bytes |
 | prefill 512 | 44.9 ms | 46.0 ms | 0.98× |
 
-The INT8 attention kernel is no longer bandwidth-bound. Under `ncu` (32k positions): 255
+The first INT8 attention kernel was not bandwidth-bound. Under `ncu` (32k positions): 255
 registers with local-memory spills (38 % of L1 traffic) and 3.1× the instructions of the
 BF16 kernel (150 registers, no spills, 95 % of DRAM peak): the BF16 kernel feeds the MMAs
 from shared memory, the INT8 one converts each (64, 128) tile to BF16 in registers.
-Dropping the `latency` hints on its loads changed nothing. Next: convert in halves of the
-head dimension, or quantize the queries to Int8 too and run QKᵀ as an Int8 MMA
-(SageAttention), leaving only V to convert. At the bandwidth of the BF16 kernel, 32k-position
-decode would reach ~63 tok/s.
+Dropping the `latency` hints on its loads changed nothing.
+
+**Fixing the spills.** The probe `int8_attention` (bench/quirks/probes/08_int8_attention.jl,
+CUTILE_QUIRKS.md #9) converts K, V or both: either conversion alone fits (178 and 232
+registers), both together do not. Variants that fit, at 32k positions (probe kernel, mean µs):
+
+| Decode attention, Int8 K and V | µs | registers | spills | note |
+|---|---|---|---|---|
+| whole (64, 128) pages, as before | 117–123 | 255 | 56 B | |
+| V stored transposed (PAGE, D) per page | 112 | 255 | 8 B | a different cache layout |
+| Int8 QKᵀ: queries quantized per column, `mmai` | 109 | 206 | 0 | KL to the BF16 cache 0.0051 → 0.0070 (chat), max logit diff 0.88 → 2.0 |
+| Int8 QKᵀ with two-term queries (q_hi + q_lo / 254) | 115 | 232 | 0 | the second MMA costs what it saves |
+| 32-key tiles | 113 | 211 | 0 | |
+| K and V in halves of the head dimension | 114 | 190 | 0 | |
+| **32-key tiles and halves (kept)** | **111** | **184** | **0** | same numerics as before |
+
+Int8 QKᵀ (SageAttention's idea) is as fast but moves the key outliers back into the query
+quantization: smoothing makes c q heavy-tailed, and Int8 queries cost the accuracy that
+smoothing bought. The kernels now take 32 keys at a time and convert K and V in two halves of
+the head dimension (`attend` for `Int8Pages` in src/ops/tile/attention.jl): the decode
+kernel uses 191 registers and does not spill (prefill: 232 → 218). The numerics are those of
+the whole-page kernel up to the order of the sum over the head dimension. Qwen3-4B
+(`--kv int8`, `--seconds 2`, tile backend):
+
+| | before | after | |
+|---|---|---|---|
+| decode attention at 32,768 positions | 149.7 µs (463 GB/s) | **119.2 µs (581 GB/s, 79 %)** | 1.26× |
+| prefill-512 attention (1,024 and 32,768 positions) | 83.7 µs | 66.8 µs | 1.25× (0.6B: 1.28×) |
+| decode attention at 1,024 positions | 15.7 µs | 15.7 µs | launch-bound |
+| decode step at 32,768 positions (graph) | ~17.7 ms | **16.42 ms (60.9 tok/s)** | 1.08×; 1.19× the BF16 cache (51.3 tok/s) |
+| prefill 512 | 46.2 ms | 45.8 ms | 1.01×: attention is ~3 % of it |
+
+The BF16 kernels are unchanged (same times, both models).
 
 ## INT8 GEMM tiles (2026-10-31)
 

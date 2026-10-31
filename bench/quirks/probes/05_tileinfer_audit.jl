@@ -5,7 +5,7 @@
 using TileInfer: TileInfer
 const TI = TileInfer
 
-# --- Decode attention with `attend_page` and `page_column` inlined ---
+# --- Decode attention with `attend` (formerly `attend_page`) and `page_column` inlined ---
 
 function decode_attention_inlined(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                   V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
@@ -58,7 +58,7 @@ let (D, heads, kv, P, ctx) = (128, 16, 8, 64, 1024)
         part, TI.heads_view(q), TI.pool_view(kp), TI.pool_view(vp), bt, pos, Float32(1 / sqrt(D)), ct.Constant(D),
         ct.Constant(group), ct.Constant(kv), ct.Constant(TI.decode_tokens(group, 1)), ct.Constant(P), ct.Constant(splits), ct.Constant(true))
     probe!("audit_decode_attention", "TileInfer's decode attention (1,024 positions) vs a copy with its helpers inlined",
-           "TileInfer (attend_page helper)" => launch(TI.attention_decode_kernel), "helpers inlined" => launch(decode_attention_inlined);
+           "TileInfer (attend helper)" => launch(TI.attention_decode_kernel), "helpers inlined" => launch(decode_attention_inlined);
            output = () -> Array(part))
 end
 
