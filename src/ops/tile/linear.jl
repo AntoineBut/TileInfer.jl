@@ -243,6 +243,20 @@ function gemv_int8_config(in::Integer, out::Integer)
     return TK, max(TM ÷ 2, 2)
 end
 
+# INT8 GEMM tiles. The kernel converts each weight tile to T in registers, which BF16's
+# tiles leave no room for (255 registers and spills at 128 × 128), and its loads of the
+# Int8 tile are not overlapped like the BF16 operands', so its blocks are latency-bound: it
+# wants two blocks per SM on every grid, narrower tiles at 512 tokens, and at ≤ 64 tokens
+# (bandwidth-bound) deeper K steps that read as many bytes per step as BF16's. From a sweep
+# of 15 tiles × occupancy 1, 2 on the layers of Qwen3-0.6B, Qwen3-4B and Apertus 8B at
+# n = 8, 64, 512: within 1.5 % of the best tile in total (worst 1.11×), 1.23× the BF16
+# rule (down at 64 tokens: 2.1× on 4B, 1.7× on 8B).
+function gemm_int8_config(out::Integer, n::Integer, sms::Integer = num_sms())
+    n <= 16 && return (32, 16, 256)
+    n <= 64 && return cld(out, 32) * cld(n, 32) >= 8sms ? (64, 64, 128) : (32, 32, 256)
+    return cld(out, 128) * cld(n, 64) < 2sms ? (64, 64, 128) : (128, 64, 64)
+end
+
 function linear!(::TileBackend, y::CuMatrix{S}, W::Int8Weight, x::CuMatrix{T}) where {S,T}
     in, out = size(W)
     n = size(x, 2)
@@ -250,9 +264,8 @@ function linear!(::TileBackend, y::CuMatrix{S}, W::Int8Weight, x::CuMatrix{T}) w
         TK, TM = gemv_int8_config(in, out)
         @cuda backend = cuTile blocks = cld(out, TM) gemv_int8_kernel(y, W.q, W.scale, x, ct.Constant(TK), ct.Constant(TM))
     else
-        TM, TN, TK = gemm_config(out, n)
-        blocks = cld(out, TM) * cld(n, TN)
-        @cuda backend = cuTile blocks occupancy = gemm_occupancy(blocks) gemm_int8_kernel(
+        TM, TN, TK = gemm_int8_config(out, n)
+        @cuda backend = cuTile blocks = cld(out, TM) * cld(n, TN) occupancy = 2 gemm_int8_kernel(
             y, W.q, W.scale, x, ct.Constant(TM), ct.Constant(TN), ct.Constant(TK))
     end
     return y

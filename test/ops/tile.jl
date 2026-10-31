@@ -17,6 +17,15 @@ using Random: randperm
         return maximum(abs.(a .- b) ./ max.(eps.(T.(abs.(a))), floor_ulp); init = 0f0)
     end
 
+    # Key smoothing factors for an INT8 cache, the same on both channels of a rotary pair (as
+    # key_smoothing makes them), spanning two orders of magnitude with an RMS of 1, so that
+    # keys scaled by them keep their size.
+    function smoothing(D)
+        c = exp.(randn(Float32, D ÷ 2) .* 1.5f0)
+        c ./= sqrt(sum(abs2, c) / length(c))
+        return CuArray([c; c])
+    end
+
     @testset "$T" for T in (Float32, BFloat16)
         rnd(dims...; scale = 1) = CuArray(T.(randn(Float32, dims...) .* scale))
 
@@ -57,6 +66,24 @@ using Random: randperm
             TileInfer.store_kv!(ref, pools[1], pools[2], k, v, slots)
             TileInfer.store_kv!(tile, pools[3], pools[4], k, v, slots)
             @test host(pools[3]) == host(pools[1]) && host(pools[4]) == host(pools[2])
+            # INT8 cache: the same quantization (values and scales) as the reference.
+            a, b = TileInfer.int8_kv_pools(D, P, H, pages), TileInfer.int8_kv_pools(D, P, H, pages)
+            TileInfer.store_kv!(ref, a..., k, v, slots)
+            TileInfer.store_kv!(tile, b..., k, v, slots)
+            @test Array(a[1].layer_q) == Array(b[1].layer_q) && Array(a[1].layer_scale) == Array(b[1].layer_scale)
+            # Round to nearest: within half a step of the input, scaled to ±127.
+            x = host(k)[:, 1, 1]
+            s = Array(a[1].scale)[1, 1, 4]                       # slot 13: offset 1, page 4
+            @test s ≈ maximum(abs, x) / 127
+            @test maximum(abs.(s .* Array(a[1].q)[:, 1, 1, 4] .- x)) <= s / 2 * (1 + 1e-5)
+            @test maximum(abs, Array(a[1].q)[:, 1, 1, 4]) == 127
+            # With smoothed keys.
+            c = smoothing(D)
+            a = TileInfer.int8_kv_pools(D, P, H, pages; key_smoothing = c)
+            b = TileInfer.int8_kv_pools(D, P, H, pages; key_smoothing = c)
+            TileInfer.store_kv!(ref, a..., k, v, slots)
+            TileInfer.store_kv!(tile, b..., k, v, slots)
+            @test Array(a[1].layer_q) == Array(b[1].layer_q) && Array(a[1].layer_scale) == Array(b[1].layer_scale)
         end
 
         @testset "embed H = $H" for H in (1024, 2560)
@@ -102,6 +129,17 @@ using Random: randperm
             @test fused == unfused
             worst = maximum(ulps(r, f, T) for (r, f) in zip(reference, fused))
             @test worst <= (T == BFloat16 ? 1 : 32)    # rmsnorm's sum order, amplified by rope
+
+            # Into an INT8 cache: the fused kernel quantizes as store_kv! does.
+            c = smoothing(D)
+            function run_int8(be; fused = true)
+                q, (kp, vp) = CUDA.zeros(T, D, nq, n), TileInfer.int8_kv_pools(D, P, nkv, pages; key_smoothing = c)
+                args = (be, q, kp, vp, qkv, qn, kn, table, pos, slots, 1e-6)
+                fused ? TileInfer.attention_inputs!(args...) :
+                        invoke(TileInfer.attention_inputs!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 10)...}, args...)
+                return host(q), Array(kp.layer_q), Array(kp.layer_scale)
+            end
+            @test run_int8(tile) == run_int8(tile; fused = false)
         end
 
         @testset "add_rmsnorm H = $H" for H in (1024, 2560, 100)
@@ -205,6 +243,26 @@ using Random: randperm
             else
                 @test host(y) ≈ host(exact) rtol = 1e-5
             end
+
+            # INT8 cache (same cases), with keys whose channels scale like the smoothing factors
+            # (as real keys do): against exact attention over the dequantized cache, which the
+            # reference computes with Float32 queries.
+            c = smoothing(D)
+            k_src = k_pages .* reshape(T.(c), D, 1, 1, 1)
+            kq, vq = TileInfer.int8_kv_pools(D, P, KVH, pages; key_smoothing = c)
+            every = CuArray(Int32.(1:P*pages))
+            TileInfer.store_kv!(ref, kq, vq, reshape(permutedims(k_src, (1, 3, 2, 4)), D, KVH, :),
+                                reshape(permutedims(v_pages, (1, 3, 2, 4)), D, KVH, :), every)
+            y8 = TileInfer.attention(tile, q, kq, vq, table, positions, 1 / sqrt(D); causal)
+            exact8 = TileInfer.attention(ref, f32(q), kq, vq, table, positions, 1 / sqrt(D); causal)
+            if T == BFloat16
+                @test ulps(exact8, y8, T) <= 10   # the kernels round the smoothed queries c q to T
+            else
+                @test host(y8) ≈ host(exact8) rtol = 1e-5
+            end
+            # Quantization error of the whole op, against the unquantized keys and values.
+            exact_src = TileInfer.attention(ref, f32(q), f32(k_src), f32(v_pages), table, positions, 1 / sqrt(D); causal)
+            @test sqrt(sum(abs2, host(y8) .- host(exact_src)) / sum(abs2, host(exact_src))) < 0.02
         end
     end
 
@@ -255,6 +313,43 @@ using Random: randperm
 
     # Speculative sampling: a drafter's sample with its distribution q, and the verifier's
     # p/q decision, against the host reference with the same uniform numbers.
+    # Several columns in one call (a DFlash block): the tokens, distributions and counter of
+    # sample_token! on each column in turn (same kernels' arithmetic, so identical).
+    @testset "sample_tokens (vocab = $V, $cols columns)" for (V, cols) in ((151936, 15), (5000, 3))
+        K = TileInfer.MAX_TOP_K
+        scratch = TileInfer.sample_cols_scratch(cols)
+        for (temperature, top_k, top_p) in ((0, 0, 1), (0.6, 20, 0.95), (1.5, 64, 1)), with_q in (false, true)
+            p = TileInfer.SamplingParams(; temperature, top_k, top_p)
+            logits = CuArray(randn(Float32, V, cols) .* 3)
+            seed = rand(UInt32)
+            s1, s2 = TileInfer.TokenSampler(V), TileInfer.TokenSampler(V)
+            TileInfer.reset_sampler!(s1, p, seed)
+            TileInfer.reset_sampler!(s2, p, seed)
+            TileInfer.set_counter!(s1, 7)
+            TileInfer.set_counter!(s2, 7)
+            one, one_m = CUDA.zeros(Int32, cols), CUDA.zeros(Int32, cols)
+            all, all_m = CUDA.zeros(Int32, cols), CUDA.zeros(Int32, cols)
+            q1 = (CUDA.zeros(Int32, K, cols), CUDA.zeros(Float32, K, cols))
+            q2 = (CUDA.zeros(Int32, K, cols), CUDA.zeros(Float32, K, cols))
+            for j in 1:cols
+                args = (tile, view(one, j:j), view(one_m, j:j), logits[:, j:j], s1)
+                with_q ? TileInfer.sample_token!(args..., (view(q1[1], :, j), view(q1[2], :, j))) :
+                         TileInfer.sample_token!(args...)
+            end
+            TileInfer.sample_tokens!(tile, all, all_m, logits, s2, scratch, with_q ? q2 : nothing)
+            @test Array(all) == Array(one) == Array(all_m)
+            @test Array(s2.state)[3] == Array(s1.state)[3] == 7 + cols
+            with_q && @test Array(q2[1]) == Array(q1[1]) && Array(q2[2]) == Array(q1[2])
+            # The generic fallback: the reference sampler on each column (on the host); greedy
+            # only, where Float32 round-off cannot move a decision.
+            temperature == 0 || continue
+            fall, fall_m = CUDA.zeros(Int32, cols), CUDA.zeros(Int32, cols)
+            TileInfer.reset_sampler!(s2, p, seed); TileInfer.set_counter!(s2, 7)
+            TileInfer.sample_tokens!(ref, fall, fall_m, logits, s2, scratch)
+            @test Array(fall) == Array(one)
+        end
+    end
+
     @testset "sample_token with q, accept_token (vocab = $V)" for V in (151936, 5000)
         K = TileInfer.MAX_TOP_K
         ids, mirror, draft = CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1), CUDA.zeros(Int32, 1)

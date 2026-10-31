@@ -62,14 +62,15 @@ generate!(model::DecoderLM, cache::PagedKVCache, seq::Sequence, ids::AbstractVec
 """
     generate(model, prompt_ids; kwargs...) -> Vector{Int}
 
-One-shot [`generate!`](@ref) in a fresh cache sized for the prompt and `max_new_tokens`.
+One-shot [`generate!`](@ref) in a fresh cache sized for the prompt and `max_new_tokens`,
+quantized as `kv_quantize` (see [`PagedKVCache`](@ref)).
 """
 function generate(model::DecoderLM, prompt_ids::AbstractVector{<:Integer};
-                  max_new_tokens::Integer = 256, kwargs...)
+                  max_new_tokens::Integer = 256, kv_quantize::Union{Nothing,Symbol} = nothing, kwargs...)
     total = length(prompt_ids) + max_new_tokens
     total <= max_length(model) ||
         throw(ArgumentError("prompt + max_new_tokens = $total exceeds the model's max length $(max_length(model))"))
-    cache = PagedKVCache(model; max_tokens = total)
+    cache = PagedKVCache(model; max_tokens = total, quantize = kv_quantize)
     return generate!(model, cache, new_sequence(cache), prompt_ids; max_new_tokens, kwargs...)
 end
 

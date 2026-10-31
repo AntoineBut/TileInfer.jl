@@ -64,6 +64,23 @@ function propose(p::NgramProposer, tokens::AbstractVector{<:Integer}, k::Integer
 end
 
 """
+    propose_on_device!(proposer, tokens, k) -> Union{Nothing,CuVector{Int32}}
+
+Enqueue drafting `k` tokens to follow `tokens` without waiting for them, and return the
+device vector they land in (0-based ids), for [`verify!`](@ref) to read on the device; the
+host reads them with [`drafted`](@ref) once the stream has run that far. `nothing` when the
+proposer cannot (then [`propose`](@ref) runs instead).
+"""
+propose_on_device!(::Any, ::AbstractVector{<:Integer}, ::Integer) = nothing
+
+"""
+    drafted(proposer, k) -> Vector{Int}
+
+The `k` drafts of the latest [`propose_on_device!`](@ref), after the stream has run them.
+"""
+function drafted end
+
+"""
     attach!(proposer, runner)
 
 Prepare `proposer` to draft for the target model of `runner`, before a generation.
@@ -166,7 +183,7 @@ function run_verify_step!(r::ModelRunner, v::VerifyStep)
 end
 
 """
-    verify!(runner, seq, ids, counter; dists = nothing) -> Vector{Int}
+    verify!(runner, seq, ids, counter; dists = nothing, drafts = nothing) -> Vector{Int}
 
 Run the 0-based token `ids` (the last sampled token, then the drafts) through the model,
 appending them to `seq`, and return the token the runner's sampler picks after each of them,
@@ -174,10 +191,13 @@ with counters `counter`, `counter + 1`, … (the argmax when greedy). When the d
 sampled from the distributions `dists` (column j for draft j), the token after each input
 but the last follows the p/q rule instead ([`accept_token!`](@ref)): the next draft if
 accepted, else a different token. Steps of each length, up to $MAX_VERIFY_TOKENS tokens, are
-captured in a CUDA graph like [`forward!`](@ref) steps.
+captured in a CUDA graph like [`forward!`](@ref) steps. With `drafts`, a device vector
+(see [`propose_on_device!`](@ref)), the drafts are read from it on the device rather than
+from `ids[2:end]`, which then only hold places (and go into `seq.tokens` as they are).
 """
 function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer}, counter::Integer;
-                 dists::Union{Nothing,DraftDists} = nothing) where {T}
+                 dists::Union{Nothing,DraftDists} = nothing,
+                 drafts::Union{Nothing,CuVector{Int32}} = nothing) where {T}
     n = length(ids)
     1 <= n <= MAX_VERIFY_TOKENS || throw(ArgumentError("verify! takes 1 to $MAX_VERIFY_TOKENS tokens, got $n"))
     dists === nothing || n - 1 <= size(dists.ids, 2) || throw(ArgumentError("$(n - 1) drafts but $(size(dists.ids, 2)) distributions"))
@@ -186,6 +206,8 @@ function verify!(r::ModelRunner{T}, seq::Sequence, ids::AbstractVector{<:Integer
     r.last_step, r.last_start = v.buffers, length(seq)
     NVTX.@range "upload inputs" begin
         prepare_step!(v.buffers, r.model, r.cache, seq, ids)
+        # Ordered after the upload on the stream, which wrote placeholders there.
+        drafts === nothing || copyto!(view(v.buffers.ids, 2:n), drafts)
         set_counter!(r.sampler, counter)
     end
     if v.graph !== nothing
@@ -231,10 +253,20 @@ function generate_speculative!(r::ModelRunner, seq::Sequence, ids::AbstractVecto
         remaining == 0 && break
         push!(context, last)
         # A step emits at most k + 1 tokens: draft no more than the budget needs.
-        drafts = remaining > 1 ? propose(proposer, context, min(proposer.k, remaining - 1)) : Int[]
+        k = remaining > 1 ? min(proposer.k, remaining - 1) : 0
         start = length(seq)
-        # The token after `last` is generated token number length(generated) (0-based).
-        targets = verify!(r, seq, [last; drafts], length(generated); dists)
+        # The token after `last` is generated token number length(generated) (0-based). A
+        # proposer that drafts on the device hands its drafts to the verify step there, so
+        # the host waits once per step.
+        on_device = k > 0 ? propose_on_device!(proposer, context, k) : nothing
+        if on_device === nothing
+            drafts = k > 0 ? propose(proposer, context, k) : Int[]
+            targets = verify!(r, seq, [last; drafts], length(generated); dists)
+        else
+            targets = verify!(r, seq, [last; zeros(Int, k)], length(generated); dists, drafts = on_device)
+            drafts = drafted(proposer, k)
+            seq.tokens[end-k+1:end] .= drafts
+        end
         # (With sampled drafts, a rejected draft's position holds a token that differs from it.)
         accepted = 0
         while accepted < length(drafts) && drafts[accepted+1] == targets[accepted+1]

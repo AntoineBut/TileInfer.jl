@@ -135,6 +135,7 @@ mutable struct DFlashProposer{D<:DFlashDrafter,T}
     const mirror::CuVector{Int32}                # host-mapped: the drafts
     const mirror_host::Vector{Int32}
     const sampler::TokenSampler
+    const scratch::CuMatrix{Int32}               # for sample_tokens!
     target::Any                                  # the target's ModelRunner
 end
 
@@ -148,7 +149,7 @@ function DFlashProposer(d::DFlashDrafter{T}; k::Integer = d.block_size - 1, samp
     return DFlashProposer{typeof(d),T}(k, sample, DraftDists(B - 1), d, cache, new_sequence(cache), graphs, Dict{Int,Any}(),
                                        CuMatrix{T}(undef, H, B), CuMatrix{T}(undef, H, B),
                                        CuMatrix{Float32}(undef, V, B - 1), CuVector{Int32}(undef, B - 1), mirror,
-                                       unsafe_wrap(Array, mirror), TokenSampler(V), nothing)
+                                       unsafe_wrap(Array, mirror), TokenSampler(V), sample_cols_scratch(B - 1), nothing)
 end
 
 function attach!(p::DFlashProposer, r::ModelRunner)
@@ -190,10 +191,9 @@ function dflash_step!(p::DFlashProposer{<:DFlashDrafter{T}}, s::DFlashStep{T}) w
         add_rmsnorm!(be, p.x, last ? p.h : blk, proj, last ? d.norm : d.layers[l+1].attn_norm, eps)
     end
     linear!(be, p.logits, d.lm_head, view(p.h, :, 2:B))
-    for j in 1:B-1
-        args = (be, view(p.sink, j:j), view(p.mirror, j:j), view(p.logits, :, j:j), p.sampler)
-        p.sample ? sample_token!(args..., column(p.dists, j)) : sample_token!(args...)   # see DraftProposer
-    end
+    # All B - 1 positions in one call; q recorded when sampled (see DraftProposer).
+    sample_tokens!(be, p.sink, p.mirror, p.logits, p.sampler, p.scratch,
+                   p.sample ? (p.dists.ids, p.dists.probs) : nothing)
 end
 
 function propose(p::DFlashProposer, context::AbstractVector{<:Integer}, k::Integer)
@@ -201,12 +201,24 @@ function propose(p::DFlashProposer, context::AbstractVector{<:Integer}, k::Integ
     k >= 1 || return Int[]
     r = p.target::ModelRunner
     draft!(p, context, r.last_start, (r.last_step::StepBuffers).aux)
+    synchronize()
     return Int.(p.mirror_host[1:k])
 end
 
-# Draft the block after `context` into p.mirror (and its logits into p.logits), where the
-# target's latest step ran positions start:length(context)-2 and left their states in the
-# first columns of `aux`.
+# The drafts stay on the device, for the verify step to copy into its inputs: the host
+# enqueues the drafter's step and the target's verify step back to back and waits once.
+function propose_on_device!(p::DFlashProposer, context::AbstractVector{<:Integer}, k::Integer)
+    1 <= k <= p.k || return nothing
+    r = p.target::ModelRunner
+    draft!(p, context, r.last_start, (r.last_step::StepBuffers).aux)
+    return view(p.sink, 1:k)
+end
+
+drafted(p::DFlashProposer, k::Integer) = Int.(p.mirror_host[1:k])
+
+# Enqueue the drafting of the block after `context` into p.sink and p.mirror (and its logits
+# into p.logits), where the target's latest step ran positions start:length(context)-2 and
+# left their states in the first columns of `aux`. Does not wait for the drafts.
 function draft!(p::DFlashProposer, context::AbstractVector{<:Integer}, start::Integer, aux::CuMatrix)
     d, seq = p.drafter, p.seq
     L, B = length(context), d.block_size
@@ -234,7 +246,6 @@ function draft!(p::DFlashProposer, context::AbstractVector{<:Integer}, start::In
         else
             p.steps[c] = (s, run_captured!(step, p, graph))
         end
-        synchronize()
     end
     append!(seq.tokens, view(context, start+1:L-1))
     truncate!(p.cache, seq, L - 1)                       # drop the block's keys and values

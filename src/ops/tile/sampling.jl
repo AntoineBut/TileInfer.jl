@@ -46,13 +46,18 @@ end
 
 # The survivors among the chunks' candidates `Ids`: their 1-based ids (best first, 0 past
 # top_k), their probabilities under temperature and top-k, zeroed outside the top-p prefix,
-# and the mask of survivors.
-@inline function survivors(Ids, Logits, Params, State, K::Int, N::Int)
+# and the mask of survivors. With several columns of logits (`sample_tokens!`), Ids and
+# Logits are the flat arrays and `col` the column: its candidates are entries
+# (col - 1) N + 1 : col N of Ids, and its logits start at (col - 1) V + 1.
+@inline function survivors(Ids, Logits, Params, State, K::Int, N::Int, col = Int32(1), V = Int32(0))
     k = State[Int32(1)] % Int32
+    shift(i, offset) = ifelse.(i .> Int32(0), i .+ offset, Int32(0))       # 0 stays padding
+    lo = (col - Int32(1)) * V
     # Candidate ids, chunk after chunk; 0 (and ids past the vocabulary) gather -Inf.
-    cand = ct.load(Ids; index = Int32(1), shape = (N,), padding_mode = ct.PaddingMode.Zero)
-    ids = ct.gather(Ids, top_k_positions(ct.gather(Logits, cand; padding_value = -Inf32), k, K, N))
-    vals = ct.gather(Logits, ids; padding_value = -Inf32)
+    cand = ct.load(Ids; index = col, shape = (N,), padding_mode = ct.PaddingMode.Zero)
+    at = top_k_positions(ct.gather(Logits, shift(cand, lo); padding_value = -Inf32), k, K, N)
+    ids = ct.gather(Ids, shift(at, (col - Int32(1)) * Int32(N)))
+    vals = ct.gather(Logits, shift(ids, lo); padding_value = -Inf32)
     slot = ct.arange((K,))
     inv_t, top_p = Params[Int32(1)], Params[Int32(2)]
     w = exp.((vals .- maximum(vals; dims = 1)) .* inv_t)
@@ -129,6 +134,75 @@ function accept_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,
     Mirror[Int32(1)] = token
     State[Int32(3)] = counter + UInt32(1)
     return nothing
+end
+
+# --- Several columns at once (a DFlash drafter's block): column j samples with the counter
+# c + j - 1 as `sample_token!` on each column in turn would, in three launches instead of
+# two per column. A last one-block kernel advances the counter, after every column has read it.
+
+function topk_chunks_cols_kernel(Ids::ct.TileArray{Int32,2}, Logits::ct.TileArray{Float32,2},
+                                 State::ct.TileArray{UInt32,1}, CHUNK::Int, K::Int)
+    b, j = ct.bid(1), ct.bid(2)
+    x = reshape(ct.load(Logits; index = (b, j), shape = (CHUNK, 1), padding_mode = ct.PaddingMode.NegInf), (CHUNK,))
+    at = top_k_positions(x, State[Int32(1)] % Int32, K, CHUNK)
+    ct.store(Ids; index = (b, j), tile = reshape(ifelse.(at .> Int32(0), at .+ (b - Int32(1)) * Int32(CHUNK), Int32(0)), (K, 1)))
+    return nothing
+end
+
+function topk_sample_cols_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
+                                 Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
+                                 Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
+                                 K::Int, N::Int)
+    j = ct.bid(1)
+    ids, q, _ = survivors(Ids, Logits, Params, State, K, N, j, size(Logits, 1) ÷ size(Token, 1))
+    token = pick(ids, q, sampling_uniform(State[Int32(2)], State[Int32(3)] + (j - Int32(1)) % UInt32), K) - Int32(1)
+    Token[j] = token
+    Mirror[j] = token
+    return nothing
+end
+
+function topk_sample_dist_cols_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
+                                      QIds::ct.TileArray{Int32,1}, QProbs::ct.TileArray{Float32,1},
+                                      Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
+                                      Params::ct.TileArray{Float32,1}, State::ct.TileArray{UInt32,1},
+                                      K::Int, N::Int)
+    j = ct.bid(1)
+    ids, q, keep = survivors(Ids, Logits, Params, State, K, N, j, size(Logits, 1) ÷ size(Token, 1))
+    ct.store(QIds; index = j, tile = ifelse.(keep, ids .- Int32(1), Int32(-1)))
+    ct.store(QProbs; index = j, tile = q ./ sum(q; dims = 1))
+    token = pick(ids, q, sampling_uniform(State[Int32(2)], State[Int32(3)] + (j - Int32(1)) % UInt32), K) - Int32(1)
+    Token[j] = token
+    Mirror[j] = token
+    return nothing
+end
+
+function advance_counter_kernel(State::ct.TileArray{UInt32,1}, COUNT::Int)
+    State[Int32(3)] = State[Int32(3)] + UInt32(COUNT)
+    return nothing
+end
+
+"Scratch for [`sample_tokens!`](@ref) over `cols` columns: each column's candidates, zero-padded."
+sample_cols_scratch(cols::Integer) = CUDA.zeros(Int32, MAX_TOP_K * SAMPLE_PARTS, cols)
+
+function sample_tokens!(::TileBackend, ids::CuVector{Int32}, mirror::CuVector{Int32}, logits::CuMatrix{Float32},
+                        s, scratch::CuMatrix{Int32}, dists = nothing)
+    V, cols = size(logits)
+    chunks = cld(V, SAMPLE_CHUNK)
+    @assert chunks <= SAMPLE_PARTS && size(scratch) == (MAX_TOP_K * SAMPLE_PARTS, cols)
+    K, N = ct.Constant(MAX_TOP_K), ct.Constant(MAX_TOP_K * SAMPLE_PARTS)
+    @cuda backend = cuTile blocks = (chunks, cols) topk_chunks_cols_kernel(scratch, logits, s.state,
+                                                                          ct.Constant(SAMPLE_CHUNK), K)
+    if dists === nothing
+        @cuda backend = cuTile blocks = cols topk_sample_cols_kernel(ids, mirror, vec(scratch), vec(logits),
+                                                                     s.params, s.state, K, N)
+    else
+        q_ids, q_probs = dists
+        @cuda backend = cuTile blocks = cols topk_sample_dist_cols_kernel(ids, mirror, vec(q_ids), vec(q_probs),
+                                                                          vec(scratch), vec(logits), s.params,
+                                                                          s.state, K, N)
+    end
+    @cuda backend = cuTile advance_counter_kernel(s.state, ct.Constant(cols))
+    return ids
 end
 
 "Scratch for [`sample_token!`](@ref): the top-k candidate ids of every vocabulary chunk."

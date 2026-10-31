@@ -2,11 +2,12 @@
 # metrics (memory throughput, occupancy, stall reasons) rather than timings.
 #
 #   ncu --profile-from-start off [ncu options] \
-#       julia --project=bench bench/profile.jl [--model REPO,...] FILTER
+#       julia --project=bench bench/profile.jl [--model REPO,...] [--quantize int8] [--kv int8] [--context N] FILTER
 #
 # FILTER is a regex over the keys printed by bench/run.jl, e.g.
 # "Qwen3-0.6B/ops/rmsnorm/decode/tile". Models default to bench/run.jl's (MODELS); a
-# filter naming one model still loads the others, so pass --model to skip them.
+# filter naming one model still loads the others, so pass --model to skip them. --quantize,
+# --kv and --context are bench/run.jl's (INT8 weights, INT8 KV caches, cached positions).
 # Each matching benchmark is warmed up (so compilation and first-launch work stay outside
 # the profile), then one sample runs between cuProfilerStart/Stop. An op sample is
 # OP_REPS = 20 calls of the same kernel, so pass `-c 1` to profile one of them; a model
@@ -24,17 +25,20 @@
 include("suite.jl")
 
 function main(args)
-    repos = collect(MODELS)
-    if length(args) == 3 && args[1] == "--model"
-        repos = String.(split(args[2], ","))
-    elseif length(args) != 1
-        error("usage: see the header of bench/profile.jl")
-    end
+    isodd(length(args)) || error("usage: see the header of bench/profile.jl")
+    opts = Dict(args[i][3:end] => args[i+1] for i in 1:2:length(args)-1)
+    issubset(keys(opts), ("model", "quantize", "kv", "context")) || error("usage: see the header of bench/profile.jl")
+    repos = haskey(opts, "model") ? String.(split(opts["model"], ",")) : collect(MODELS)
+    quantize = haskey(opts, "quantize") ? Symbol(opts["quantize"]) : nothing
+    kv_quantize = haskey(opts, "kv") ? Symbol(opts["kv"]) : nothing
+    context = parse(Int, get(opts, "context", string(CONTEXT)))
     found = false
     for repo in repos
-        model = TileInfer.load_model(repo; max_len = CONTEXT + PREFILL)
+        model = TileInfer.load_model(repo; max_len = context + PREFILL, quantize)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
-        suite, info = build_suite(model, model_label(repo); filter = Regex(args[end]), sampling)
+        label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
+                (kv_quantize === nothing ? "" : "-kv$kv_quantize")
+        suite, info = build_suite(model, label; filter = Regex(args[end]), sampling, kv_quantize, context)
         benchmarks = sort!(collect(leaves(suite)); by = b -> join(first(b), "/"))
         found |= !isempty(benchmarks)
 

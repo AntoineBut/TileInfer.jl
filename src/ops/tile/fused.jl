@@ -61,6 +61,47 @@ function kv_inputs_kernel(KP::ct.TileArray{T,2}, VP::ct.TileArray{T,2}, QKV::ct.
     return nothing
 end
 
+# The same into an INT8 cache: KV, S and C are the layer's Int8 pools, scales and the keys'
+# smoothing (store_int8!).
+function kv_inputs_int8_kernel(KV::ct.TileArray{Int8,2}, S::ct.TileArray{Float32,1}, C::ct.TileArray{Float32,1},
+                               QKV::ct.TileArray{T,2},
+                               CS::ct.TileArray{T,2}, W::ct.TileArray{T,1}, Pos::ct.TileArray{Int32,1},
+                               Slots::ct.TileArray{Int32,1}, eps::Float32, D::Int, P::Int, Q_HEADS::Int,
+                               KV_HEADS::Int, NORM::Bool) where {T}
+    t, h = ct.bid(1), ct.bid(2)
+    f32(tile) = convert(ct.Tile{Float32}, tile)
+    base = Int32(Q_HEADS + 2KV_HEADS) * (t - Int32(1))
+    y1, y2 = norm_rope(QKV, base + Int32(Q_HEADS) + h, CS, Pos[t], W, eps, NORM, T, D, D ÷ 2)
+    slot = Slots[t] - Int32(1)
+    dst = rem(slot, Int32(P)) + fld(slot, Int32(P)) * Int32(P * KV_HEADS) + (h - Int32(1)) * Int32(P) + Int32(1)
+    c1, c2 = smoothing(C, D ÷ 2)
+    store_int8!(KV, S, dst, f32(y1) ./ c1, f32(y2) ./ c2)
+    v = base + Int32(Q_HEADS + KV_HEADS) + h
+    store_int8!(KV, S, dst + size(S, 1) ÷ Int32(2),
+                f32(ct.load(QKV; index = (Int32(1), v), shape = (D ÷ 2, 1))),
+                f32(ct.load(QKV; index = (Int32(2), v), shape = (D ÷ 2, 1))))
+    return nothing
+end
+
+function attention_inputs!(::TileBackend, q::CuArray{T,3}, k_pages::Int8Pages, v_pages::Int8Pages,
+                           qkv::CuMatrix{T}, q_norm::Union{Nothing,CuVector{T}}, k_norm::Union{Nothing,CuVector{T}},
+                           table::RotaryTable{T}, positions::CuVector{Int32}, slots::CuVector{Int32},
+                           eps::Real) where {T}
+    D, nq, n = size(q)
+    P, nkv = size(k_pages, 2), size(k_pages, 3)
+    KV, S, C = layer_arrays(k_pages, v_pages)
+    norm = q_norm !== nothing
+    unused = view(qkv, 1:D, 1)
+    flat(x) = reshape(x, D, :)
+    @cuda backend = cuTile blocks = (n, nq) q_inputs_kernel(
+        flat(q), flat(qkv), table.cos_sin, norm ? q_norm : unused, positions, Float32(eps),
+        ct.Constant(D), ct.Constant(nq), ct.Constant(nq + 2nkv), ct.Constant(norm))
+    @cuda backend = cuTile blocks = (n, nkv) kv_inputs_int8_kernel(
+        KV, S, C, flat(qkv), table.cos_sin, norm ? k_norm : unused, positions, slots,
+        Float32(eps), ct.Constant(D), ct.Constant(P), ct.Constant(nq), ct.Constant(nkv), ct.Constant(norm))
+    return q
+end
+
 function attention_inputs!(::TileBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
                            qkv::CuMatrix{T}, q_norm::Union{Nothing,CuVector{T}}, k_norm::Union{Nothing,CuVector{T}},
                            table::RotaryTable{T}, positions::CuVector{Int32}, slots::CuVector{Int32},

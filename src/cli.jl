@@ -21,6 +21,8 @@ const USAGE = """
       --backend tile|ref    cuTile kernels (default) or the reference ops
       --int8                Int8 linear weights with per-channel scales: half the memory
                             and up to 1.9x faster decode (needed for 8B models on 16 GB)
+      --kv-int8             Int8 KV cache with a scale per cached vector: half the memory per
+                            token of context, and faster decode at long contexts
       --raw                 run only: send the prompt as-is, without the chat template
       --speculate K         speculative decoding with up to K drafts per step (1-7), by
                             n-gram lookup in the conversation, or by --draft
@@ -99,7 +101,8 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts", "int8")
+                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts", "int8",
+                            "kv-int8")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -118,7 +121,7 @@ function load_for_generation(model_name, options)
                               top_p = parse_option(Float64, options, "top-p", defaults.top_p))
     rng = Random.Xoshiro(parse_option(Int, options, "seed", rand(UInt32)))
     return (; model, tok, sampling, stop_ids, rng, enable_thinking = thinking == "on",
-            speculative = load_proposer(model, options))
+            speculative = load_proposer(model, options), kv_quantize = haskey(options, "kv-int8") ? :int8 : nothing)
 end
 
 # The proposer of --speculate / --draft / --eagle / --dflash, or nothing.
@@ -191,7 +194,7 @@ function cmd_run(positional, options)
     stream = TimedStream(g.tok, stdout)
     spec = SpecStats()
     generated = generate(g.model, ids; max_new_tokens = parse_option(Int, options, "max-tokens", 512),
-                         g.sampling, g.stop_ids, g.rng, on_token = stream, g.speculative, spec_stats = spec)
+                         g.sampling, g.stop_ids, g.rng, on_token = stream, g.speculative, spec_stats = spec, g.kv_quantize)
     println(); flush(stdout)
     println(stderr, "[", length(ids), " prompt tokens, ", length(generated), " generated; ",
             timing_summary(stream, length(generated)), spec_summary(spec, length(generated)), "]")
@@ -234,13 +237,14 @@ function cmd_chat(positional, options)
     check_options(options, GENERATION_OPTIONS)
     length(positional) == 1 || throw(ArgumentError("chat takes exactly one model"))
     g = load_for_generation(only(positional), options)
-    session = ChatSession(g.model, g.tok; g.sampling, g.stop_ids, g.enable_thinking, g.rng, g.speculative)
+    session = ChatSession(g.model, g.tok; g.sampling, g.stop_ids, g.enable_thinking, g.rng, g.speculative,
+                          g.kv_quantize)
     chat_loop(session, stdin, stdout; max_new_tokens = parse_option(Int, options, "max-tokens", 2048))
 end
 
 const COMMANDS = Dict("pull" => cmd_pull, "ls" => cmd_ls, "rm" => cmd_rm, "run" => cmd_run,
                       "chat" => cmd_chat)
-const FLAGS = ("raw", "sample-drafts", "int8")
+const FLAGS = ("raw", "sample-drafts", "int8", "kv-int8")
 
 "Run the CLI on `args`; returns the process exit code."
 function cli(args::Vector{String})

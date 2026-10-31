@@ -87,6 +87,22 @@ if dir !== nothing
         end
 
         loaded = TileInfer.load_model(TEST_MODEL; T = BFloat16, max_len = 128)
+        # INT8 KV cache with smoothed keys: logits within ~1.5× BFloat16's distance to
+        # transformers (measured 0.94 vs 0.63; without smoothing 2.0), mean KL to a BF16
+        # cache ≤ 0.007 (0.036 without).
+        @testset "int8 KV cache $(nameof(typeof(backend)))" for backend in (RefBackend(), TileBackend())
+            m = TileInfer.DecoderLM(loaded.config, loaded.weights, loaded.rope, backend)
+            for (name, case) in LOGITS
+                ids = Int.(case["ids"])
+                cache = TileInfer.PagedKVCache(m; quantize = :int8)
+                @test TileInfer.quantization(cache) == :int8
+                logits = Array(TileInfer.forward!(m, cache, TileInfer.new_sequence(cache), ids; all_logits = true))
+                maxdiff, mismatches = compare_logits(logits, case["bfloat16"]; tie = 1.0)
+                @test maxdiff < 1.25
+                @test mismatches == 0
+            end
+        end
+
         @testset "bfloat16 $(nameof(typeof(backend)))" for backend in (RefBackend(), TileBackend())
             # Rounding to BFloat16 at the same points as PyTorch, but with GPU vs CPU
             # accumulation order: logits within a few BFloat16 ulps (0.125 at |logit| ~ 20),
@@ -147,10 +163,11 @@ end
         end
     end
 
-    @testset "CUDA graph decode$(quantize === nothing ? "" : " ($quantize)")" for quantize in (nothing, :int8)
+    @testset "CUDA graph decode (weights $quantize, KV $kv_quantize)" for (quantize, kv_quantize) in
+            ((nothing, nothing), (:int8, nothing), (nothing, :int8))
         m = TileInfer.load_model(dir; backend = TileBackend(), max_len = 256, quantize)
         ids = Int.(cases["medium"]["ids"])
-        cache, eager_cache = TileInfer.PagedKVCache(m), TileInfer.PagedKVCache(m)
+        cache, eager_cache = TileInfer.PagedKVCache(m; quantize = kv_quantize), TileInfer.PagedKVCache(m; quantize = kv_quantize)
         runner = TileInfer.ModelRunner(m, cache)
         seq, eager_seq = TileInfer.new_sequence(cache), TileInfer.new_sequence(eager_cache)
         logits = Array(TileInfer.forward!(runner, seq, ids))

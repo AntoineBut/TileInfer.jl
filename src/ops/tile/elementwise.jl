@@ -127,6 +127,52 @@ function store_kv!(::TileBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4}, 
     return nothing
 end
 
+# INT8 KV cache (Int8Pages): the layer's keys and values as one (head_dim, 2N) Int8 array KV,
+# values from column N + 1 on, their scales as one vector S of length 2N, and the keys'
+# smoothing factors C (head_dim).
+
+# The two halves of the smoothing factors, as (HALF, 1) tiles.
+@inline smoothing(C, HALF) = (reshape(ct.load(C; index = Int32(1), shape = (HALF,)), (HALF, 1)),
+                              reshape(ct.load(C; index = Int32(2), shape = (HALF,)), (HALF, 1)))
+
+# Quantize the vector whose two halves are the Float32 (HALF, 1) tiles x1 and x2 into column
+# `col` of KV and its scale into S[col], as quantize_columns does.
+@inline function store_int8!(KV, S, col, x1, x2)
+    absmax = max.(maximum(abs.(x1); dims = 1), maximum(abs.(x2); dims = 1))     # (1, 1)
+    inv = ifelse.(absmax .> 0.0f0, 127.0f0 ./ absmax, 0.0f0)
+    ct.store(KV; index = (Int32(1), col), tile = convert(ct.Tile{Int8}, floor.(x1 .* inv .+ 0.5f0)))
+    ct.store(KV; index = (Int32(2), col), tile = convert(ct.Tile{Int8}, floor.(x2 .* inv .+ 0.5f0)))
+    ct.store(S; index = col, tile = reshape(absmax ./ 127.0f0, (1,)))
+    return nothing
+end
+
+function store_kv_int8_kernel(KV::ct.TileArray{Int8,2}, S::ct.TileArray{Float32,1}, C::ct.TileArray{Float32,1},
+                              K::ct.TileArray{T,2}, V::ct.TileArray{T,2}, Slots::ct.TileArray{Int32,1}, D::Int,
+                              P::Int, HEADS::Int) where {T}
+    t = ct.bid(1)
+    slot = Slots[t] - Int32(1)
+    first_col = rem(slot, Int32(P)) + fld(slot, Int32(P)) * Int32(P * HEADS) + Int32(1)
+    values = size(S, 1) ÷ Int32(2)                    # column offset of the values
+    half(X, i, src) = convert(ct.Tile{Float32}, ct.load(X; index = (i, src), shape = (D ÷ 2, 1)))
+    c1, c2 = smoothing(C, D ÷ 2)
+    for h in Int32(1):Int32(HEADS)
+        src, dst = (t - Int32(1)) * Int32(HEADS) + h, first_col + (h - Int32(1)) * Int32(P)
+        store_int8!(KV, S, dst, half(K, Int32(1), src) ./ c1, half(K, Int32(2), src) ./ c2)
+        store_int8!(KV, S, dst + values, half(V, Int32(1), src), half(V, Int32(2), src))
+    end
+    return nothing
+end
+
+function store_kv!(::TileBackend, k_pages::Int8Pages, v_pages::Int8Pages, k::CuArray{T,3},
+                   v::CuArray{T,3}, slots::CuVector{Int32}) where {T}
+    D, P, heads, _ = size(k_pages)
+    KV, S, C = layer_arrays(k_pages, v_pages)
+    flat(x) = reshape(x, D, :)
+    @cuda backend = cuTile blocks = length(slots) store_kv_int8_kernel(
+        KV, S, C, flat(k), flat(v), slots, ct.Constant(D), ct.Constant(P), ct.Constant(heads))
+    return nothing
+end
+
 # Embedding lookup, one block per token, walking the column in tiles.
 function embed_kernel(Y::ct.TileArray{T,2}, Table::ct.TileArray{T,2}, Ids::ct.TileArray{Int32,1},
                       TILE::Int) where {T}

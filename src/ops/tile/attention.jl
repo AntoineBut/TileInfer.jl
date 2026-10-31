@@ -27,11 +27,18 @@ const LOG2_E = Float32(1 / log(2))
 const NEG_BIG = -floatmax(Float32)
 
 # One page of the online softmax for the query tile q (D, M) at positions qpos (1, M).
-# Keys of the page are at positions j PAGE + 1 : (j + 1) PAGE (j is 0-based).
-@inline function attend_page(K, V, q, qpos, m_i, l_i, acc, col, j, qk_scale, MASK, ::Type{T},
+# Keys of the page are at positions j PAGE + 1 : (j + 1) PAGE (j is 0-based), in tile column
+# kcol of K, and their values in tile column vcol of V. For an INT8 cache (Int8Pages) S holds
+# the scales, at the same tile index as their vectors; it is `nothing` otherwise.
+@inline function attend_page(K, V, S, kcol, vcol, q, qpos, m_i, l_i, acc, j, qk_scale, MASK, ::Type{T},
                              D, PAGE, M) where {T}
-    k = ct.load(K; index = (col, Int32(1)), shape = (PAGE, D), order = (2, 1), latency = 2)
-    qk = muladd(k, q, zeros(Float32, (PAGE, M)))                  # (PAGE, M)
+    k = ct.load(K; index = (kcol, Int32(1)), shape = (PAGE, D), order = (2, 1), latency = 2)
+    if S === nothing
+        qk = muladd(k, q, zeros(Float32, (PAGE, M)))              # (PAGE, M)
+    else                                                          # s_k (q_kᵀ x): scale the rows
+        qk = muladd(convert(ct.Tile{T}, k), q, zeros(Float32, (PAGE, M))) .*
+             reshape(ct.load(S; index = kcol, shape = (PAGE,)), (PAGE, 1))
+    end
     if MASK
         kpos = j * Int32(PAGE) .+ reshape(ct.arange(PAGE; dtype = Int32), (PAGE, 1))
         qk = qk .+ ifelse.(kpos .<= qpos, 0.0f0, -Inf32)
@@ -41,19 +48,49 @@ const NEG_BIG = -floatmax(Float32)
         exp2.(qk .* qk_scale .- m_ij), exp2.(m_i .- m_ij)
     end
     l_i = l_i .* alpha .+ sum(p; dims = 1)
-    v = ct.load(V; index = (Int32(1), col), shape = (D, PAGE), latency = 4)
-    acc = muladd(v, convert(ct.Tile{T}, p), acc .* alpha)
+    v = ct.load(V; index = (Int32(1), vcol), shape = (D, PAGE), latency = 4)
+    if S === nothing
+        acc = muladd(v, convert(ct.Tile{T}, p), acc .* alpha)
+    else                                                          # V diag(s_v) p
+        p = p .* reshape(ct.load(S; index = vcol, shape = (PAGE,)), (PAGE, 1))
+        acc = muladd(convert(ct.Tile{T}, v), convert(ct.Tile{T}, p), acc .* alpha)
+    end
     return m_ij, l_i, acc
 end
+
+# Queries times the keys' smoothing factors C (an INT8 cache), rounded to T; as they are
+# without C.
+@inline smooth_queries(q, ::Nothing, ::Type{T}, D) where {T} = q
+@inline smooth_queries(q, C, ::Type{T}, D) where {T} =
+    convert(ct.Tile{T}, convert(ct.Tile{Float32}, q) .* reshape(ct.load(C; index = Int32(1), shape = (D,)), (D, 1)))
 
 # Tile column of page j + 1 of the block table for KV head h.
 @inline page_column(BT, j, h, KV_HEADS) = (BT[j + Int32(1)] - Int32(1)) * Int32(KV_HEADS) + h
 
+# The kernels take the pools as K and V with S = nothing, or an INT8 layer as KV (keys, then
+# values from tile column VALUES + 1 on) with its scales S and the keys' smoothing C, which
+# multiplies the queries (`smooth_queries`).
 function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                   V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                   qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, TM::Int,
                                   PAGE::Int, CAUSAL::Bool) where {T}
     ct.@compiler_options occupancy = 2
+    prefill_body(Out, Q, K, V, nothing, nothing, Int32(0), BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, TM, PAGE, CAUSAL)
+    return nothing
+end
+
+function attention_prefill_int8_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, KV::ct.TileArray{Int8,2},
+                                       S::ct.TileArray{Float32,1}, C::ct.TileArray{Float32,1}, BT::ct.TileArray{Int32,1},
+                                       Pos::ct.TileArray{Int32,1}, qk_scale::Float32, D::Int, GROUP::Int,
+                                       KV_HEADS::Int, TM::Int, PAGE::Int, CAUSAL::Bool) where {T}
+    ct.@compiler_options occupancy = 2
+    values = size(S, 1) ÷ Int32(2 * PAGE)
+    prefill_body(Out, Q, KV, KV, S, C, values, BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, TM, PAGE, CAUSAL)
+    return nothing
+end
+
+@inline function prefill_body(Out, Q, K, V, S, C, VALUES, BT, Pos, qk_scale, ::Type{T}, D, GROUP, KV_HEADS, TM,
+                              PAGE, CAUSAL) where {T}
     bx, head = ct.bid(1), ct.bid(2)
     start = Pos[Int32(1)]
     h = cld(head, Int32(GROUP))
@@ -61,7 +98,7 @@ function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, 
     first_pos = start + (bx - Int32(1)) * Int32(TM)               # queries first_pos+1 : first_pos+TM
     qpos = first_pos .+ reshape(ct.arange(TM; dtype = Int32), (1, TM))
     CAUSAL || (qpos = max.(qpos, len))
-    q = ct.load(Q; index = (head, bx), shape = (D, TM))
+    q = smooth_queries(ct.load(Q; index = (head, bx), shape = (D, TM)), C, T, D)
     qk_scale = qk_scale * LOG2_E
     m_i, l_i, acc = fill(NEG_BIG, (1, TM)), zeros(Float32, (1, TM)), zeros(Float32, (D, TM))
     # Pages before mask_start hold only keys every query of the tile sees.
@@ -70,9 +107,11 @@ function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, 
     for j in Int32(0):cld(last_key, Int32(PAGE)) - Int32(1)
         col = page_column(BT, j, h, KV_HEADS)
         if j >= mask_start
-            m_i, l_i, acc = attend_page(K, V, q, qpos, m_i, l_i, acc, col, j, qk_scale, true, T, D, PAGE, TM)
+            m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, true,
+                                        T, D, PAGE, TM)
         else
-            m_i, l_i, acc = attend_page(K, V, q, qpos, m_i, l_i, acc, col, j, qk_scale, false, T, D, PAGE, TM)
+            m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, false,
+                                        T, D, PAGE, TM)
         end
     end
     o = ct.@fpmode rounding_mode = ct.Rounding.Approx flush_to_zero = true begin
@@ -91,20 +130,37 @@ function attention_decode_kernel(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{
                                  qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, NT::Int,
                                  PAGE::Int, SPLITS::Int, CAUSAL::Bool) where {T}
     ct.@compiler_options occupancy = 2
+    decode_body(Part, Q, K, V, nothing, nothing, Int32(0), BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, NT, PAGE, SPLITS, CAUSAL)
+    return nothing
+end
+
+function attention_decode_int8_kernel(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{T,2}, KV::ct.TileArray{Int8,2},
+                                      S::ct.TileArray{Float32,1}, C::ct.TileArray{Float32,1}, BT::ct.TileArray{Int32,1},
+                                      Pos::ct.TileArray{Int32,1}, qk_scale::Float32, D::Int, GROUP::Int,
+                                      KV_HEADS::Int, NT::Int, PAGE::Int, SPLITS::Int, CAUSAL::Bool) where {T}
+    ct.@compiler_options occupancy = 2
+    values = size(S, 1) ÷ Int32(2 * PAGE)
+    decode_body(Part, Q, KV, KV, S, C, values, BT, Pos, qk_scale, T, D, GROUP, KV_HEADS, NT, PAGE, SPLITS, CAUSAL)
+    return nothing
+end
+
+@inline function decode_body(Part, Q, K, V, S, C, VALUES, BT, Pos, qk_scale, ::Type{T}, D, GROUP, KV_HEADS, NT,
+                             PAGE, SPLITS, CAUSAL) where {T}
     h, s = ct.bid(1), ct.bid(2)
     start = Pos[Int32(1)]
     M = GROUP * NT
     pages = cld(start + size(Q, 2), Int32(PAGE))
     per_split = cld(pages, Int32(SPLITS))
-    q = reshape(ct.load(Q; index = (h, Int32(1)), shape = (D * GROUP, NT),
-                        padding_mode = ct.PaddingMode.Zero), (D, M))
+    q = smooth_queries(reshape(ct.load(Q; index = (h, Int32(1)), shape = (D * GROUP, NT),
+                                       padding_mode = ct.PaddingMode.Zero), (D, M)), C, T, D)
     qpos = start .+ reshape(cld.(ct.arange(M; dtype = Int32), Int32(GROUP)), (1, M))
     CAUSAL || (qpos = max.(qpos, start + size(Q, 2)))
     qk_scale = qk_scale * LOG2_E
     m_i, l_i, acc = fill(NEG_BIG, (1, M)), zeros(Float32, (1, M)), zeros(Float32, (D, M))
     for j in (s - Int32(1)) * per_split:min(s * per_split, pages) - Int32(1)
         col = page_column(BT, j, h, KV_HEADS)
-        m_i, l_i, acc = attend_page(K, V, q, qpos, m_i, l_i, acc, col, j, qk_scale, true, T, D, PAGE, M)
+        m_i, l_i, acc = attend_page(K, V, S, col, col + VALUES, q, qpos, m_i, l_i, acc, j, qk_scale, true,
+                                    T, D, PAGE, M)
     end
     part = (h - Int32(1)) * Int32(SPLITS) + s
     ct.store(Part; index = (Int32(1), Int32(1), part), tile = reshape(acc, (D, M, 1)))
@@ -157,7 +213,7 @@ Split-KV partials for decode attention of the queries `q` (head_dim, heads, n): 
 packed query row, split and KV head, the unnormalized output (rows 1:head_dim), running
 max and running sum (rows head_dim + 1 and + 2).
 """
-function decode_workspace(q::CuArray{<:Any,3}, k_pages::CuArray{<:Any,4})
+function decode_workspace(q::CuArray{<:Any,3}, k_pages)
     D, heads, n = size(q)
     kv_heads = size(k_pages, 3)
     rows = heads ÷ kv_heads * decode_tokens(heads ÷ kv_heads, n)
@@ -195,12 +251,44 @@ function attention_decode!(::TileBackend, out::CuArray{T,3}, part::CuArray{Float
     return out
 end
 
-attention_workspace(::TileBackend, q::CuArray{<:Any,3}, k_pages::CuArray{<:Any,4}) =
+function attention_prefill!(::TileBackend, out::CuArray{T,3}, q::CuArray{T,3}, k_pages::Int8Pages,
+                            v_pages::Int8Pages, block_table::CuVector{Int32}, positions::CuVector{Int32},
+                            scale::Real, causal::Bool) where {T}
+    D, heads, n = size(q)
+    P, kv_heads = size(k_pages, 2), size(k_pages, 3)
+    KV, S, C = layer_arrays(k_pages, v_pages)
+    @cuda backend = cuTile blocks = (cld(n, PREFILL_TM), heads) attention_prefill_int8_kernel(
+        heads_view(out), heads_view(q), KV, S, C, block_table, positions, Float32(scale), ct.Constant(D),
+        ct.Constant(heads ÷ kv_heads), ct.Constant(kv_heads), ct.Constant(PREFILL_TM), ct.Constant(P),
+        ct.Constant(causal))
+    return out
+end
+
+function attention_decode!(::TileBackend, out::CuArray{T,3}, part::CuArray{Float32,3}, q::CuArray{T,3},
+                           k_pages::Int8Pages, v_pages::Int8Pages, block_table::CuVector{Int32},
+                           positions::CuVector{Int32}, scale::Real, causal::Bool) where {T}
+    D, heads, n = size(q)
+    P, kv_heads = size(k_pages, 2), size(k_pages, 3)
+    group, splits = heads ÷ kv_heads, size(part, 3) ÷ kv_heads
+    KV, S, C = layer_arrays(k_pages, v_pages)
+    @cuda backend = cuTile blocks = (kv_heads, splits) attention_decode_int8_kernel(
+        part, heads_view(q), KV, S, C, block_table, positions, Float32(scale), ct.Constant(D), ct.Constant(group),
+        ct.Constant(kv_heads), ct.Constant(decode_tokens(group, n)), ct.Constant(P), ct.Constant(splits),
+        ct.Constant(causal))
+    @cuda backend = cuTile blocks = (group * n, kv_heads) attention_combine_kernel(
+        heads_view(out), part, ct.Constant(D), ct.Constant(group), ct.Constant(splits))
+    return out
+end
+
+# A page pool: (head_dim, page_size, kv_heads, num_pages) in T, or Int8Pages.
+const KVPool{T} = Union{CuArray{T,4},Int8Pages}
+
+attention_workspace(::TileBackend, q::CuArray{<:Any,3}, k_pages::KVPool) =
     uses_decode_kernel(size(q, 2) ÷ size(k_pages, 3), size(q, 3)) ? decode_workspace(q, k_pages) : nothing
 
 # The decode kernels when there is a split-KV workspace, the prefill kernel otherwise.
 function attention!(be::TileBackend, out::CuArray{T,3}, workspace::Union{Nothing,CuArray{Float32,3}},
-                    q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+                    q::CuArray{T,3}, k_pages::KVPool{T}, v_pages::KVPool{T},
                     block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real;
                     causal::Bool = true) where {T}
     workspace === nothing &&
@@ -208,7 +296,7 @@ function attention!(be::TileBackend, out::CuArray{T,3}, workspace::Union{Nothing
     return attention_decode!(be, out, workspace, q, k_pages, v_pages, block_table, positions, scale, causal)
 end
 
-attention(be::TileBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+attention(be::TileBackend, q::CuArray{T,3}, k_pages::KVPool{T}, v_pages::KVPool{T},
           block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real; causal::Bool = true) where {T} =
     attention!(be, similar(q), attention_workspace(be, q, k_pages), q, k_pages, v_pages, block_table,
                positions, scale; causal)

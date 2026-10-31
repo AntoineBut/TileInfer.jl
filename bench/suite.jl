@@ -114,17 +114,37 @@ function add_op!(suite, info, filter, path, op, make_args; bytes, flops = 0.0)
     end
 end
 
+# INT8 pools (TileInfer.Int8Pages) of random values, as the attention ops read them.
+function int8_pools(D, P, nkv, pages)
+    k, v = TileInfer.int8_kv_pools(D, P, nkv, pages)
+    copyto!(k.layer_q, rand(Int8, size(k.layer_q)))
+    k.layer_scale .= 0.01f0
+    return k, v
+end
+
+# `len` random tokens into `seq`, prefilled in chunks: a 32k-token context in one step would
+# need gigabytes of activations.
+function fill_context!(m, cache, seq, len; chunk = 4096)
+    for part in Iterators.partition(1:len, chunk)
+        TileInfer.forward!(m, cache, seq, rand(0:m.config.vocab_size-1, length(part)))
+    end
+    return seq
+end
+
 """
-    build_suite(model, label; filter = r"", sampling = SamplingParams()) -> (suite, info)
+    build_suite(model, label; filter = r"", sampling = SamplingParams(), kv_quantize = nothing,
+                context = CONTEXT) -> (suite, info)
 
 Benchmarks for `model` (a DecoderLM; its backend is ignored), keyed
 "<label>/ops/<op>/<size>/<backend>" and "<label>/model/<step>/<backend>", restricted to keys
 matching `filter`. `info` maps keys to their [`Workload`](@ref). `sampling` is the model's
 recommended sampling (see `TileInfer.generation_defaults`), for a sampled generation
-benchmark when it is not greedy.
+benchmark when it is not greedy. `kv_quantize = :int8` uses INT8 KV caches and pools;
+decode steps and attention run after `context - 1` cached positions.
 """
 function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex = r"",
-                     sampling::SamplingParams = SamplingParams()) where {T}
+                     sampling::SamplingParams = SamplingParams(), kv_quantize::Union{Nothing,Symbol} = nothing,
+                     context::Integer = CONTEXT) where {T}
     cfg, w = model.config, model.weights
     H, I, D, nq, nkv = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
     eps, B = cfg.rms_norm_eps, sizeof(T)
@@ -169,14 +189,18 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         end
 
         # One layer's page pools, holding `len` positions of a single sequence.
-        start = n == 1 ? CONTEXT - 1 : 0
+        start = n == 1 ? context - 1 : 0
         len = start + n
         P = TileInfer.DEFAULT_PAGE_SIZE
         pages = cld(len, P)
-        pools() = (rnd(D, P, nkv, pages), rnd(D, P, nkv, pages))
-        kv_bytes(positions) = 2.0 * positions * D * nkv * B
+        pools(pages = pages) = kv_quantize === nothing ? (rnd(D, P, nkv, pages), rnd(D, P, nkv, pages)) :
+                                                         int8_pools(D, P, nkv, pages)
+        # Ops that only write the step's n slots get pools of n positions (slots 1:n): copies
+        # of a long context's pools would not fit next to the model.
+        write_pools() = pools(cld(n, P))
+        kv_bytes(positions) = 2.0 * positions * nkv * (kv_quantize === nothing ? D * B : D + 4)
         add_op!(suite, info, filter, ops("store_kv"), TileInfer.store_kv!,
-                () -> (pools()..., rnd(D, nkv, n), rnd(D, nkv, n), CuArray(Int32.(start+1:start+n)));
+                () -> (write_pools()..., rnd(D, nkv, n), rnd(D, nkv, n), CuArray(Int32.(1:n)));
                 bytes = 2 * kv_bytes(n))                        # read k, v and write n slots
         # Causal prefill visits about half of the (len × n) score matrix.
         visited = n == 1 ? len : n * (n + 1) / 2
@@ -203,8 +227,8 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         end
         # q/k norm + rope from the fused qkv, keys and values into the pools.
         add_op!(suite, info, filter, ops("attention_inputs"), TileInfer.attention_inputs!,
-                () -> (rnd(D, nq, n), pools()..., rnd((nq + 2nkv) * D, n), layer.q_norm, layer.k_norm, model.rope,
-                       CuArray(Int32.(start:len-1)), CuArray(Int32.(start+1:start+n)), eps);
+                () -> (rnd(D, nq, n), write_pools()..., rnd((nq + 2nkv) * D, n), layer.q_norm, layer.k_norm, model.rope,
+                       CuArray(Int32.(start:len-1)), CuArray(Int32.(1:n)), eps);
                 bytes = (2.0 * nq + 4.0 * nkv + 2.0) * D * n * B)  # qkv in, q and k/v out, rope table
         # Device sampling with the model's recommended settings (top-1 if it is greedy).
         n == 1 && add_op!(suite, info, filter, ops("sample"), TileInfer.sample_token!,
@@ -221,17 +245,17 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
     for be in BACKENDS
         name = backend_name(be)
         prefill_keys = ("$label/model/prefill$SHORT/$name", "$label/model/prefill$PREFILL/$name")
-        decode_key = "$label/model/decode_ctx$CONTEXT/$name"
-        graph_key = "$label/model/decode_graph_ctx$CONTEXT/$name"    # through a ModelRunner
+        decode_key = "$label/model/decode_ctx$context/$name"
+        graph_key = "$label/model/decode_graph_ctx$context/$name"    # through a ModelRunner
         # Greedy generation, pipelined and step by step, and with the model's sampling.
         gen_modes = [("", SamplingParams(), true), ("_unpipelined", SamplingParams(), false)]
         sampling.temperature > 0 && push!(gen_modes, ("_sampled", sampling, true))
-        gen_keys = ["$label/model/generate$(GEN)$(suffix)_ctx$CONTEXT/$name" for (suffix, _, _) in gen_modes]
+        gen_keys = ["$label/model/generate$(GEN)$(suffix)_ctx$context/$name" for (suffix, _, _) in gen_modes]
         keys = TileInfer.supports_graphs(be) ? (prefill_keys..., decode_key, graph_key, gen_keys...) :
                                                (prefill_keys..., decode_key)
         any(k -> occursin(filter, k), keys) || continue
         m = DecoderLM(cfg, w, model.rope, be)
-        cache = PagedKVCache(m; max_tokens = CONTEXT + PREFILL)
+        cache = PagedKVCache(m; max_tokens = context + PREFILL, quantize = kv_quantize)
         prompt = rand(0:cfg.vocab_size-1, PREFILL)
         seq = TileInfer.new_sequence(cache)
         try
@@ -253,28 +277,28 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
             info[key] = Workload(1, weights, 2 * params * length(p), length(p))
         end
 
-        # One new token after CONTEXT - 1 cached positions, rewound after each sample: eagerly
+        # One new token after context - 1 cached positions, rewound after each sample: eagerly
         # (buffers allocated per step), and replaying a CUDA graph through a ModelRunner.
         ctx = TileInfer.new_sequence(cache)
-        TileInfer.forward!(m, cache, ctx, rand(0:cfg.vocab_size-1, CONTEXT - 1))
-        kv = Float64(CONTEXT * TileInfer.bytes_per_token(cfg, T))
+        fill_context!(m, cache, ctx, context - 1)
+        kv = Float64(context * TileInfer.bytes_per_token(cfg, something(kv_quantize, T)))
         if occursin(filter, decode_key)
             setleaf!(suite, split(decode_key, "/"), @benchmarkable begin
                 TileInfer.forward!($m, $cache, $ctx, [42])
                 CUDA.synchronize()
-                TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+                TileInfer.truncate!($cache, $ctx, $(context - 1))
             end evals = 1)
             info[decode_key] = Workload(1, weights + kv, 2 * params, 1)
         end
         if graph_key in keys && any(k -> occursin(filter, k), (graph_key, gen_keys...))
             runner = TileInfer.ModelRunner(m, cache)
             TileInfer.forward!(runner, ctx, [42])                     # captures the graph
-            TileInfer.truncate!(cache, ctx, CONTEXT - 1)
+            TileInfer.truncate!(cache, ctx, context - 1)
             if occursin(filter, graph_key)
                 setleaf!(suite, split(graph_key, "/"), @benchmarkable begin
                     TileInfer.forward!($runner, $ctx, [42])
                     CUDA.synchronize()
-                    TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+                    TileInfer.truncate!($cache, $ctx, $(context - 1))
                 end evals = 1)
                 info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
             end
@@ -286,11 +310,11 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
                 rng = Xoshiro(1)
                 gen() = TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[],
                                             sampling = sp, rng, pipeline)
-                gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, CONTEXT - 1)
+                gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, context - 1)
                 setleaf!(suite, split(key, "/"), @benchmarkable begin
                     $gen()
                     CUDA.synchronize()
-                    TileInfer.truncate!($cache, $ctx, $(CONTEXT - 1))
+                    TileInfer.truncate!($cache, $ctx, $(context - 1))
                 end evals = 1)
                 info[key] = Workload(1, GEN * (weights + kv), 2 * params * GEN, GEN)
             end

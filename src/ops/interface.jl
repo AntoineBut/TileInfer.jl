@@ -199,6 +199,22 @@ function sample_token!(be::Backend, ids, mirror, logits, s, (q_ids, q_probs))
 end
 
 """
+    sample_tokens!(backend, ids, mirror, logits, sampler, scratch, dists = nothing)
+
+[`sample_token!`](@ref) on each column j of `logits` (vocab, n) in turn, into `ids[j]` and
+`mirror[j]` (and with `dists`, a pair of (MAX_TOP_K, n) matrices, column j's distribution
+into their column j), in a few launches on TileBackend. `scratch` is a zeroed
+[`sample_cols_scratch`](@ref).
+"""
+function sample_tokens!(be::Backend, ids, mirror, logits, s, scratch, dists = nothing)
+    for j in axes(logits, 2)
+        args = (be, view(ids, j:j), view(mirror, j:j), view(logits, :, j:j), s)
+        dists === nothing ? sample_token!(args...) : sample_token!(args..., (view(dists[1], :, j), view(dists[2], :, j)))
+    end
+    return ids
+end
+
+"""
     accept_token!(backend, ids, mirror, logits, sampler, draft, (q_ids, q_probs))
 
 The token a verify step emits at a position drafted as `draft[1]` from the distribution

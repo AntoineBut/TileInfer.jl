@@ -6,9 +6,11 @@
 
 """
     ChatSession(model, tokenizer; sampling, stop_ids, enable_thinking = true,
-                max_tokens = max_length(model), rng = Random.default_rng(), speculative = nothing)
+                max_tokens = max_length(model), rng = Random.default_rng(), speculative = nothing,
+                kv_quantize = nothing)
 
-A conversation with `model`, with its own paged KV cache for up to `max_tokens` positions.
+A conversation with `model`, with its own paged KV cache for up to `max_tokens` positions,
+quantized as `kv_quantize` (see [`PagedKVCache`](@ref)).
 Send messages with [`reply!`](@ref). `speculative` is a proposer for speculative decoding
 (see [`generate!`](@ref)).
 """
@@ -29,8 +31,8 @@ end
 function ChatSession(model::DecoderLM, tok::BPETokenizer; sampling::SamplingParams = SamplingParams(),
                      stop_ids = model.config.eos_token_ids, enable_thinking::Bool = true,
                      max_tokens::Integer = max_length(model), rng::AbstractRNG = Random.default_rng(),
-                     speculative = nothing)
-    cache = PagedKVCache(model; max_tokens = min(max_tokens, max_length(model)))
+                     speculative = nothing, kv_quantize::Union{Nothing,Symbol} = nothing)
+    cache = PagedKVCache(model; max_tokens = min(max_tokens, max_length(model)), quantize = kv_quantize)
     return ChatSession(model, tok, cache, ModelRunner(model, cache), new_sequence(cache), ChatMessage[],
                        sampling, collect(Int, stop_ids), enable_thinking, rng, speculative)
 end

@@ -646,3 +646,113 @@ k = 7 wins (2.37× vs 2.20×; 3.2 vs 2.9 tokens per step). Plain decoding runs a
 (80 on the short prompts), and the 2.2k-token prefill takes 203 ms (11k tok/s, ~78
 TFLOP/s; 91 at 512 tokens). Rows of one run compare; between the full run (every method)
 and the DFlash-only runs, long-explain's DFlash rows differed by up to 11 %.
+
+## INT8 KV cache (2026-10-31)
+
+`PagedKVCache(model; quantize = :int8)` (`--kv-int8` in the CLI, `--kv int8` in bench/run.jl,
+keys `<model>-kvint8/...`): each cached key or value vector (one KV head at one position) as
+Int8 with one Float32 scale, round to nearest, written once by the fused `attention_inputs`
+kernel (`Int8Pages`, src/ops/quant.jl). Attention never dequantizes the cache: a key's scale
+multiplies its row of scores after the QKᵀ product (Int8 tiles convert exactly to BF16 for
+the tensor cores), and a value's scale multiplies its probability before the PV product. A
+layer's keys and values share one Int8 array and one scale vector, so the kernels stay under
+32 parameters (separate arrays would take the KV write kernel to 36). 132 bytes per vector
+instead of 256 in BF16: Qwen3-4B holds 75k positions per GB instead of 39k.
+
+**Accuracy: smoothing the keys.** With one scale per vector, Qwen3-0.6B's mean KL to a BF16
+cache was 0.004–0.036 over the fixture prompts (INT8 weights: 0.032). The keys carry it:
+
+| Qwen3-0.6B, chat prompt | layer 1 K | layer 2 K | layer 14 K | layer 28 K | values (any layer) |
+|---|---|---|---|---|---|
+| relative error, one scale per vector | 0.022 | 0.025 | 0.011 | 0.020 | 0.007–0.013 |
+| one scale per channel (KIVI) | 0.005 | 0.004 | 0.008 | 0.005 | 0.008–0.016 |
+| per vector, keys smoothed by the k_norm weight | **0.003** | **0.004** | 0.011 | **0.006** | — |
+| largest / median channel max | 109 | 43 | 6.5 | 11 | 1.6–5 |
+
+A few key channels are ~100× the others, which leaves few levels for the rest; per-channel
+scales do not fit a cache written one position at a time. In Qwen3 (and Apertus) these
+channels come from the per-channel weight w of the key norm, k = rope(rmsnorm(k) w), so the
+cache stores k / c with c = max(|w_i|, |w_j|) for each rotary pair (i, j): the same factor on
+both channels a rotation mixes, so it commutes with rope. Scores are unchanged by multiplying
+the queries by c in the attention kernels (qᵀk = (c q)ᵀ(k / c)). No calibration; one extra
+multiply per query tile. Mean KL to a BF16 cache, and largest logit difference to
+transformers (BF16 cache: 0.63):
+
+| Qwen3-0.6B, tile backend | chat | prose | code | max logit diff |
+|---|---|---|---|---|
+| one scale per vector | 0.030 | 0.0089 | 0.0043 | 1.75 |
+| smoothed keys (kept) | **0.0051** | **0.0040** | **0.0022** | **0.88** |
+
+**Speed** (Qwen3-4B, `--seconds 2`; pipelined greedy decode, decode attention op per layer):
+
+| | BF16 cache | INT8 cache | |
+|---|---|---|---|
+| decode at 1,024 positions | 78.7 tok/s | 78.1 tok/s | 0.99× (attention is 4 % of the step) |
+| decode at 32,768 positions | 51.3 tok/s | **57.8 tok/s** | **1.13×** |
+| decode attention at 32,768 positions | 209 µs (642 GB/s, 87 %) | 142 µs (489 GB/s, 66 %) | 1.48× for 0.52× the bytes |
+| prefill 512 | 44.9 ms | 46.0 ms | 0.98× |
+
+The INT8 attention kernel is no longer bandwidth-bound. Under `ncu` (32k positions): 255
+registers with local-memory spills (38 % of L1 traffic) and 3.1× the instructions of the
+BF16 kernel (150 registers, no spills, 95 % of DRAM peak): the BF16 kernel feeds the MMAs
+from shared memory, the INT8 one converts each (64, 128) tile to BF16 in registers.
+Dropping the `latency` hints on its loads changed nothing. Next: convert in halves of the
+head dimension, or quantize the queries to Int8 too and run QKᵀ as an Int8 MMA
+(SageAttention), leaving only V to convert. At the bandwidth of the BF16 kernel, 32k-position
+decode would reach ~63 tok/s.
+
+## INT8 GEMM tiles (2026-10-31)
+
+INT8 prefill was 8–11 % slower than BF16 although it reads half the weight bytes, and at 64
+tokens, where a GEMM is bandwidth-bound, the INT8 GEMMs were 0.68–1.13× BF16. Under `ncu`
+(Qwen3-4B down): at 512 tokens 255 registers and 1.6× BF16's instructions (byte shuffles
+and conversions of the weight tile); at 64 tokens 29 % of DRAM peak against BF16's 90 %,
+with 37 % of the stall samples on the conversion waiting for its global load: the Int8
+tile is not staged through shared memory and overlapped like the BF16 operands. Neither
+`latency` hints on the weight loads (1–8) nor swapping the operands (Xᵀ W, the weight in its
+natural layout as the B operand) helped. Tiles and occupancy did: a sweep of 15 tiles ×
+occupancy 1, 2 on the layers of Qwen3-0.6B, Qwen3-4B and Apertus 8B at n = 8, 64, 512 found
+the latency-bound INT8 blocks always want two per SM, narrower tiles than BF16 at 512 tokens
+(128 × 64 × 64), and at ≤ 64 tokens deeper K steps (32 × 32 × 256, or 64 × 64 × 128 on large
+grids). `gemm_int8_config` encodes that: within 1.5 % of the best tile summed over the sweep
+(worst case 1.11×), 1.23× faster than BF16's rule. Qwen3-4B, `--seconds 2`:
+
+| | before | after | BF16 |
+|---|---|---|---|
+| GEMMs at 64 tokens (qkv / o / gate_up / down) | 72 / 46 / 155 / 126 µs | 44 / 26 / 99 / 62 µs (1.57–2.03×) | 60 / 36 / 175 / 85 µs |
+| GEMMs at 512 tokens | 237 / 155 / 580 / 369 µs | 196 / 127 / 567 / 284 µs (1.02–1.30×) | 203 / 116 / 521 / 266 µs |
+| prefill 64 | — | **9.55 ms (1.52× BF16)** | 14.49 ms |
+| prefill 512 | 10.1k tok/s (0.89× BF16) | **11.07k tok/s (0.97× BF16)** | 11.40k tok/s |
+
+At 512 tokens INT8 is still a few percent behind: the conversion in registers stays. A
+weight layout prepacked for the conversion (as Marlin does), or conversion by bit tricks
+(Int8 bytes into Float32 mantissas with a magic exponent) would be the next step.
+
+## DFlash without a host round trip (2026-10-31)
+
+A DFlash step was: drafter step, host waits for the drafts and uploads them into the verify
+step, verify step, host waits for the target's tokens. Now the drafter's sampling writes the
+drafts into a device vector (`propose_on_device!`), and `verify!(…; drafts)` copies them into
+the verify step's ids on the stream, after the upload of its other inputs: the host enqueues
+both steps back to back and waits once, after the verify step. The second wait remains: the
+host needs the accepted count to truncate the cache and to pick the next drafter graph (one
+per context length). The drafter's 15 per-position sampling calls (30 launches) became one
+batched `sample_tokens!` (three launches: candidates over a (chunk, column) grid, one block
+per column sampling with counter c + j − 1, and a one-block kernel advancing the counter, which
+no block of the sampling kernel may do while others read it); same tokens and distributions
+as the per-column calls.
+
+Under the tracer (Qwen3-4B, k = 15, "explain"): GPU idle time inside generation fell 2.8×,
+sampling 0.086 → 0.050 ms per step. End to end (`bench/speculative.jl`, greedy, same tokens and
+steps before and after):
+
+| Prompt | DFlash k = 7 | DFlash k = 15 |
+|---|---|---|
+| rename | — | 662.8 → 670.5 tok/s (+1.2 %) |
+| explain | 192.5 → 194.8 (+1.2 %) | 202.2 → 204.9 (+1.3 %) |
+| long-explain (2.2k tokens) | 182.6 → 184.7 (+1.2 %) | 169.4 → 171.5 (+1.2 %) |
+
+As the step times predicted (3.17 ms drafting + 13.3 ms verify ≈ the 16.6 ms step), the host
+was already mostly hidden: the round trip cost ~0.2 ms of a 16.5 ms step. What remains is the
+step's own GPU time; the bigger lever for DFlash is choosing k per prompt (k = 7 beats 15 at long
+contexts on open text) or verifying a tree of drafts.

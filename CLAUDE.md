@@ -13,7 +13,7 @@ Hot kernels are written in cuTile.jl. Clear, measurable code wins over feature b
 julia --project=test test/runtests.jl                 # full suite, ~130 s (cuTile examples, model loads)
 julia --project=test test/runtests.jl kernels graphs  # only files whose path contains an arg, ~10 s
 julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
-julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME] [--model REPO,...]  # op + model benchmarks
+julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME] [--model REPO,...] [--quantize int8] [--kv int8] [--context N]  # op + model benchmarks
 julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter RE]  # GPU time per kernel of real steps, ~2 min
 julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--eagle REPO|none] [--dflash REPO|none] [--k 2,4,7] [--sampled]  # spec decoding on chat prompts (`--filter long`: 2.2k-token ones), ~12 min
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \

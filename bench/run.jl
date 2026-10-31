@@ -11,6 +11,9 @@
 #                      Qwen/Qwen3-4B, one after the other). Keys start with the model name.
 #   --quantize int8    load the models with Int8 linear weights (keys start "<model>-int8"; the
 #                      op benchmarks of weight-reading kernels use Int8 weights)
+#   --kv int8          INT8 KV caches (keys start "<model>-kvint8"; the attention ops read Int8 pools)
+#   --context N        cached positions before decode steps and decode attention (default 1024;
+#                      keys say "ctxN" for the model steps)
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
@@ -32,7 +35,7 @@ function parse_cli(args)
         opts[args[i][3:end]] = args[i+1]
         i += 2
     end
-    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model", "quantize"))
+    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model", "quantize", "kv", "context"))
     isempty(unknown) || error("unknown options: $(join(unknown, ", "))")
     return opts
 end
@@ -120,10 +123,13 @@ function main(args)
     results, info = BenchmarkGroup(), Dict{String,Workload}()
     for repo in repos
         quantize = haskey(opts, "quantize") ? Symbol(opts["quantize"]) : nothing
-        model = TileInfer.load_model(repo; max_len = CONTEXT + PREFILL, quantize)
+        kv_quantize = haskey(opts, "kv") ? Symbol(opts["kv"]) : nothing
+        context = parse(Int, get(opts, "context", string(CONTEXT)))
+        model = TileInfer.load_model(repo; max_len = context + PREFILL, quantize)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
-        label = model_label(repo) * (quantize === nothing ? "" : "-$quantize")
-        suite, model_info = build_suite(model, label; filter, sampling)
+        label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
+                (kv_quantize === nothing ? "" : "-kv$kv_quantize")
+        suite, model_info = build_suite(model, label; filter, sampling, kv_quantize, context)
         if !isempty(leaves(suite))
             foreach(((_, b),) -> (b.params.seconds = seconds; b.params.samples = 10_000), leaves(suite))
             println("Running $(length(leaves(suite))) $label benchmarks on $(env["gpu"]) at $(env["commit"])...")

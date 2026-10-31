@@ -77,7 +77,8 @@ end
 
 # Eager attention, per KV head over its group of query heads at once:
 #   S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
-function attention(::RefBackend, q::CuArray{T,3}, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
+# The pools are (head_dim, page_size, kv_heads, num_pages) arrays or Int8Pages.
+function attention(::RefBackend, q::CuArray{T,3}, k_pages, v_pages,
                    block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real;
                    causal::Bool = true) where {T}
     D, heads, n = size(q)

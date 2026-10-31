@@ -33,13 +33,18 @@ Base.eltype(::DecoderLM{T}) where {T} = T
 max_length(m::DecoderLM) = length(m.rope)
 
 """
-    PagedKVCache(model; max_tokens = max_length(model), page_size = $DEFAULT_PAGE_SIZE)
+    PagedKVCache(model; max_tokens = max_length(model), page_size = $DEFAULT_PAGE_SIZE, quantize = nothing)
 
-An empty paged KV cache for `model` with room for `max_tokens` positions in total.
+An empty paged KV cache for `model` with room for `max_tokens` positions in total;
+`quantize = :int8` stores it as Int8 (see [`Int8Pages`](@ref)), with keys smoothed by the
+layers' key norms when the model has them.
 """
-PagedKVCache(m::DecoderLM{T}; max_tokens::Integer = max_length(m),
-             page_size::Integer = DEFAULT_PAGE_SIZE) where {T} =
-    PagedKVCache{T}(m.config, cld(max_tokens, page_size); page_size)
+function PagedKVCache(m::DecoderLM{T}; max_tokens::Integer = max_length(m), page_size::Integer = DEFAULT_PAGE_SIZE,
+                      quantize::Union{Nothing,Symbol} = nothing) where {T}
+    norms = [layer.k_norm for layer in m.weights.layers]
+    smoothing = quantize === nothing || any(isnothing, norms) ? nothing : key_smoothing.(norms)
+    return PagedKVCache{T}(m.config, cld(max_tokens, page_size); page_size, quantize, key_smoothing = smoothing)
+end
 
 """
     StepBuffers(model, cache, n; all_logits = false, aux_layers = Int[])
