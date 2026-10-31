@@ -12,8 +12,9 @@
 # ///
 """A tiny random Apertus checkpoint and its reference logits from transformers.
 
-Usage (CPU-only torch, ~10 s; uv installs it in an isolated environment):
-    uv run scripts/gen_apertus_fixtures.py
+Usage (CPU-only torch; uv installs it in an isolated environment):
+    uv run scripts/gen_apertus_fixtures.py                    # tiny random model, ~10 s
+    uv run scripts/gen_apertus_fixtures.py real <model_dir>   # Apertus 1.5 8B, ~5 min, ~40 GB RAM
 
 Apertus 8B does not fit the 16 GB GPU in BFloat16, so the forward pass is checked on a
 small model with random weights instead. It runs on transformers' ApertusForCausalLM
@@ -25,14 +26,22 @@ after the text vocabulary (image and audio codes there) that lm_head does not pr
 Writes test/fixtures/apertus/tiny/{config.json,model.safetensors} (BFloat16 weights) and
 test/fixtures/logits/apertus-tiny.json: for each prompt of random token ids and for both
 float32 and bfloat16, the top-k logits at every position and a greedy continuation.
+
+`real` runs the pulled Apertus 1.5 8B checkpoint the same way, in Float32 only: its decoder
+tensors renamed to Apertus 1's and the embedding cut to the text rows, on the prompts of
+gen_model_fixtures.py (the chat one through the checkpoint's own template), and writes
+test/fixtures/logits/apertus-1.5-8b.json.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
-from transformers import ApertusConfig, ApertusForCausalLM
+from transformers import ApertusConfig, ApertusForCausalLM, AutoTokenizer
+from transformers.models.apertus.modeling_apertus import ApertusRotaryEmbedding
 
 FIXTURES = Path(__file__).resolve().parent.parent / "test" / "fixtures"
 TOP_K = 10
@@ -131,5 +140,57 @@ def main() -> None:
     print(f"wrote {out}")
 
 
+REAL_PROMPTS = {
+    "chat": [{"role": "user", "content": "Explain in two sentences why the sky is blue."}],
+    "prose": "The history of the printing press begins in the fifteenth century, when",
+    "code": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
+}
+
+
+def load_real(model_dir: Path) -> ApertusForCausalLM:
+    text = json.loads((model_dir / "config.json").read_text())["text_config"]
+    keys = ["hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+            "rms_norm_eps", "max_position_embeddings", "rope_parameters", "hidden_act", "tie_word_embeddings",
+            "bos_token_id", "eos_token_id", "pad_token_id"]
+    config = ApertusConfig(**{k: text[k] for k in keys}, vocab_size=text["output_vocab_size"])
+    with torch.device("meta"):
+        model = ApertusForCausalLM(config)
+    state = {}
+    for shard in sorted(model_dir.glob("model-apertus-model-*.safetensors")):
+        with safe_open(shard, "pt") as f:
+            for name in f.keys():
+                t = f.get_tensor(name).float()
+                if name == "model.language_model.embed_tokens.weight":
+                    t = t[: config.vocab_size].clone()
+                state[name.replace("model.language_model.", "model.", 1)] = t
+    model.load_state_dict(state, strict=True, assign=True)
+    model.model.rotary_emb = ApertusRotaryEmbedding(config)       # not in the checkpoint
+    return model.eval()
+
+
+def real(model_dir: str) -> None:
+    model_dir = Path(model_dir)
+    model = load_real(model_dir)
+    model.config._attn_implementation = "eager"
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    cases = {}
+    for name, prompt in REAL_PROMPTS.items():
+        if isinstance(prompt, list):
+            text = tok.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            ids = tok(text, add_special_tokens=False)["input_ids"]
+        else:
+            ids = tok(prompt, add_special_tokens=True)["input_ids"]
+        cases[name] = {"ids": ids, "float32": reference(model, ids)}
+        print(f"float32 {name}: {len(ids)} tokens")
+    out = FIXTURES / "logits" / "apertus-1.5-8b.json"
+    out.write_text(json.dumps({"top_k": TOP_K, "cases": cases}) + "\n")
+    print(f"wrote {out}")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "real":
+        real(sys.argv[2])
+    elif len(sys.argv) == 1:
+        main()
+    else:
+        sys.exit(__doc__)

@@ -172,3 +172,108 @@ function linear_xielu!(be::TileBackend, y::CuMatrix{T}, W::CuMatrix{T}, x::CuMat
     end
     return xielu!(be, y, linear!(be, y, W, x), a)
 end
+
+# INT8 weights (Int8Weight): the same kernels reading Int8 values, which convert exactly to
+# Float32 (GEMV) or to T (GEMM, on tensor cores: |q| ≤ 127 fits BFloat16's 8-bit
+# significand). The per-column scales multiply the Float32 sums before the one rounding to
+# T, so `y = T(s qᵀx)`.
+
+# Float32 sums of TM weight columns against x, from column tile `col`: the GEMV loop.
+@inline function gemv_sums(W, X, col, TK, TM)
+    acc = zeros(Float32, (TK, TM))
+    for k in Int32(1):ct.num_tiles(W, 1, (TK, TM))
+        w = convert(ct.Tile{Float32}, ct.load(W; index = (k, col), shape = (TK, TM), padding_mode = ct.PaddingMode.Zero))
+        x = convert(ct.Tile{Float32}, ct.load(X; index = (k, Int32(1)), shape = (TK, 1), padding_mode = ct.PaddingMode.Zero))
+        acc = acc .+ w .* x
+    end
+    return sum(acc; dims = 1)                                # (1, TM)
+end
+
+# Scaled, rounded GEMV outputs of column tile `col`, as Float32 (1, TM).
+@inline function gemv_int8_out(::Type{T}, W, Scale, X, col, TK, TM) where {T}
+    s = reshape(ct.load(Scale; index = col, shape = (TM,), padding_mode = ct.PaddingMode.Zero), (1, TM))
+    return convert(ct.Tile{Float32}, convert(ct.Tile{T}, gemv_sums(W, X, col, TK, TM) .* s))
+end
+
+function gemv_int8_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{Int8,2}, Scale::ct.TileArray{Float32,1},
+                          X::ct.TileArray{T,2}, TK::Int, TM::Int) where {S,T}
+    bid = ct.bid(1)
+    y = gemv_int8_out(T, W, Scale, X, bid, TK, TM)
+    ct.store(Y; index = (bid, Int32(1)), tile = reshape(convert(ct.Tile{S}, y), (TM, 1)))
+    return nothing
+end
+
+function gemv_int8_swiglu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{Int8,2}, Scale::ct.TileArray{Float32,1},
+                                 X::ct.TileArray{T,2}, TK::Int, TM::Int) where {T}
+    bid = ct.bid(1)
+    g = gemv_int8_out(T, W, Scale, X, bid, TK, TM)
+    u = gemv_int8_out(T, W, Scale, X, bid + ct.num_tiles(Y, 1, (TM, 1)), TK, TM)
+    act = convert(ct.Tile{Float32}, convert(ct.Tile{T}, g ./ (1.0f0 .+ exp.(.-g))))
+    ct.store(Y; index = (bid, Int32(1)), tile = reshape(convert(ct.Tile{T}, act .* u), (TM, 1)))
+    return nothing
+end
+
+function gemv_int8_xielu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{Int8,2}, Scale::ct.TileArray{Float32,1},
+                                X::ct.TileArray{T,2}, alpha_p::Float32, alpha_n::Float32, beta::Float32,
+                                eps::Float32, TK::Int, TM::Int) where {T}
+    bid = ct.bid(1)
+    y = xielu_tile(T, gemv_int8_out(T, W, Scale, X, bid, TK, TM), alpha_p, alpha_n, beta, eps)
+    ct.store(Y; index = (bid, Int32(1)), tile = reshape(convert(ct.Tile{T}, y), (TM, 1)))
+    return nothing
+end
+
+function gemm_int8_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{Int8,2}, Scale::ct.TileArray{Float32,1},
+                          X::ct.TileArray{T,2}, TM::Int, TN::Int, TK::Int) where {S,T}
+    bm, bn = swizzle_2d(size(W, 2), size(X, 2), TM, TN, 8, ct.bid(1))
+    acc = zeros(Float32, TM, TN)
+    for k in Int32(1):ct.num_tiles(X, 1, (TK, TN))
+        a = ct.load(W; index = (bm, k), shape = (TM, TK), order = (2, 1), padding_mode = ct.PaddingMode.Zero)
+        b = ct.load(X; index = (k, bn), shape = (TK, TN), padding_mode = ct.PaddingMode.Zero)
+        acc = muladd(convert(ct.Tile{T}, a), b, acc)
+    end
+    s = reshape(ct.load(Scale; index = bm, shape = (TM,), padding_mode = ct.PaddingMode.Zero), (TM, 1))
+    ct.store(Y; index = (bm, bn), tile = convert(ct.Tile{S}, convert(ct.Tile{T}, acc .* s)))
+    return nothing
+end
+
+# Int8 GEMV tiles of half the BF16 width: TK × TM ≈ 4096 elements was fastest on Apertus
+# 8B's layers (TK = 1024, TM = 4: 600–670 GB/s; TM = 8 was 7–13 % slower).
+function gemv_int8_config(in::Integer, out::Integer)
+    TK, TM = gemv_config(in, out)
+    return TK, max(TM ÷ 2, 2)
+end
+
+function linear!(::TileBackend, y::CuMatrix{S}, W::Int8Weight, x::CuMatrix{T}) where {S,T}
+    in, out = size(W)
+    n = size(x, 2)
+    if n == 1
+        TK, TM = gemv_int8_config(in, out)
+        @cuda backend = cuTile blocks = cld(out, TM) gemv_int8_kernel(y, W.q, W.scale, x, ct.Constant(TK), ct.Constant(TM))
+    else
+        TM, TN, TK = gemm_config(out, n)
+        blocks = cld(out, TM) * cld(n, TN)
+        @cuda backend = cuTile blocks occupancy = gemm_occupancy(blocks) gemm_int8_kernel(
+            y, W.q, W.scale, x, ct.Constant(TM), ct.Constant(TN), ct.Constant(TK))
+    end
+    return y
+end
+
+function linear_swiglu!(be::TileBackend, y::CuMatrix{T}, gate_up::CuMatrix{T}, W::Int8Weight, x::CuMatrix{T}) where {T}
+    in, I = size(W, 1), size(y, 1)
+    TK, TM = gemv_int8_config(in, 2I)
+    if size(x, 2) == 1 && I % TM == 0
+        @cuda backend = cuTile blocks = I ÷ TM gemv_int8_swiglu_kernel(y, W.q, W.scale, x, ct.Constant(TK), ct.Constant(TM))
+        return y
+    end
+    return silu_mul!(be, y, linear!(be, gate_up, W, x))
+end
+
+function linear_xielu!(be::TileBackend, y::CuMatrix{T}, W::Int8Weight, x::CuMatrix{T}, a::XIELU{T}) where {T}
+    if size(x, 2) == 1
+        TK, TM = gemv_int8_config(size(W)...)
+        @cuda backend = cuTile blocks = cld(size(W, 2), TM) gemv_int8_xielu_kernel(
+            y, W.q, W.scale, x, xielu_args(a)..., ct.Constant(TK), ct.Constant(TM))
+        return y
+    end
+    return xielu!(be, y, linear!(be, y, W, x), a)
+end

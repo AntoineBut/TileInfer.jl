@@ -130,6 +130,10 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
     eps, B = cfg.rms_norm_eps, sizeof(T)
     suite, info = BenchmarkGroup(), Dict{String,Workload}()
     rnd(dims...) = CUDA.rand(T, dims...)
+    # Weights like the model's: Int8 (1 byte each, plus a scale per column) when it is quantized.
+    int8 = TileInfer.quantization(w) === :int8
+    weight(in, out) = int8 ? TileInfer.quantize_int8(rnd(in, out)) : rnd(in, out)
+    WB = int8 ? 1 : B
 
     for (size_label, n) in (("decode", 1), ("prefill$SHORT", SHORT), ("prefill$PREFILL", PREFILL))
         ops(name) = [label, "ops", name, size_label]
@@ -141,8 +145,8 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         for (name, (in, out)) in (("qkv", size(first(w.layers).wqkv)), ("o", size(first(w.layers).wo)),
                                   ("gate_up", size(first(w.layers).w_gate_up)),
                                   ("down", size(first(w.layers).w_down)))
-            add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (rnd(in, out), rnd(in, n));
-                    bytes = (in * out + (in + out) * n) * B, flops = 2.0 * in * out * n)
+            add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (weight(in, out), rnd(in, n));
+                    bytes = in * out * WB + (in + out) * n * B, flops = 2.0 * in * out * n)
         end
         # The lm_head as a step runs it: the last token only, into Float32 logits. The weight
         # is the real one (311 MB for 0.6B, 778 MB for 4B) rather than copies.
@@ -150,7 +154,7 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         n == 1 && let (in, out) = size(w.lm_head)
             add_op!(suite, info, filter, ops("linear_lm_head"), TileInfer.linear!,
                     () -> (CuMatrix{Float32}(undef, out, 1), w.lm_head, rnd(in, 1));
-                    bytes = (in * out + in) * B + 4.0 * out, flops = 2.0 * in * out)
+                    bytes = in * out * WB + in * B + 4.0 * out, flops = 2.0 * in * out)
         end
         # The model's own rope tables: a step reads n of their columns.
         positions() = CuArray(Int32.(rand(0:length(model.rope)-1, n)))
@@ -189,12 +193,12 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         let (in, out) = size(layer.w_gate_up)
             if layer.xielu === nothing
                 add_op!(suite, info, filter, ops("linear_swiglu"), TileInfer.linear_swiglu!,
-                        () -> (rnd(out ÷ 2, n), rnd(out, n), rnd(in, out), rnd(in, n));
-                        bytes = (in * out + (in + out ÷ 2) * n) * B, flops = 2.0 * in * out * n)
+                        () -> (rnd(out ÷ 2, n), rnd(out, n), weight(in, out), rnd(in, n));
+                        bytes = in * out * WB + (in + out ÷ 2) * n * B, flops = 2.0 * in * out * n)
             else
                 add_op!(suite, info, filter, ops("linear_xielu"), TileInfer.linear_xielu!,
-                        () -> (rnd(out, n), rnd(in, out), rnd(in, n), layer.xielu);
-                        bytes = (in * out + (in + out) * n) * B, flops = 2.0 * in * out * n)
+                        () -> (rnd(out, n), weight(in, out), rnd(in, n), layer.xielu);
+                        bytes = in * out * WB + (in + out) * n * B, flops = 2.0 * in * out * n)
             end
         end
         # q/k norm + rope from the fused qkv, keys and values into the pools.
@@ -213,7 +217,7 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
     end
 
     weights = Float64(TileInfer.weight_bytes(w))
-    params = weights / sizeof(T)
+    params = Float64(TileInfer.weight_count(w))
     for be in BACKENDS
         name = backend_name(be)
         prefill_keys = ("$label/model/prefill$SHORT/$name", "$label/model/prefill$PREFILL/$name")

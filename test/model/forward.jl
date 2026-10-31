@@ -69,6 +69,23 @@ if dir !== nothing
         end
         loaded = nothing; GC.gc(); CUDA.reclaim()
 
+        # Weight-only INT8 (per-channel round to nearest) on the TileBackend: ~4× the error of
+        # BFloat16 on this small model (mean KL to BF16 ~0.03), argmax changes only where
+        # transformers' top-1 margin is small.
+        @testset "int8" begin
+            m = TileInfer.load_model(TEST_MODEL; backend = TileBackend(), max_len = 128, quantize = :int8)
+            @test TileInfer.weight_bytes(m.weights) < 1.0e9          # vs 1.2 GB in BFloat16
+            for (name, case) in LOGITS
+                ids = Int.(case["ids"])
+                cache = TileInfer.PagedKVCache(m)
+                logits = Array(TileInfer.forward!(m, cache, TileInfer.new_sequence(cache), ids; all_logits = true))
+                maxdiff, mismatches = compare_logits(logits, case["bfloat16"]; tie = 1.0)
+                @test maxdiff < 2.5           # measured 1.81
+                @test mismatches == 0
+            end
+            m = nothing; GC.gc(); CUDA.reclaim()
+        end
+
         loaded = TileInfer.load_model(TEST_MODEL; T = BFloat16, max_len = 128)
         @testset "bfloat16 $(nameof(typeof(backend)))" for backend in (RefBackend(), TileBackend())
             # Rounding to BFloat16 at the same points as PyTorch, but with GPU vs CPU
@@ -115,8 +132,23 @@ end
         end
     end
 
-    @testset "CUDA graph decode" begin
-        m = TileInfer.load_model(dir; backend = TileBackend(), max_len = 256)
+    # Weight-only INT8 against transformers' Float32 run of the unquantized model: the
+    # quantization error (~0.05 here), and argmax changes only at near-ties.
+    @testset "int8 $T $(nameof(typeof(backend)))" for T in (Float32, BFloat16), backend in (RefBackend(), TileBackend())
+        m = TileInfer.load_model(dir; T, backend, max_len = 256, quantize = :int8)
+        @test TileInfer.quantization(m.weights) == :int8 && m.weights.layers[1].w_down isa TileInfer.Int8Weight
+        for (name, case) in cases
+            ids = Int.(case["ids"])
+            cache = TileInfer.PagedKVCache(m)
+            logits = Array(TileInfer.forward!(m, cache, TileInfer.new_sequence(cache), ids; all_logits = true))
+            maxdiff, mismatches = compare_logits(logits, case["float32"]; tie = 0.1)
+            @test maxdiff < 0.1
+            @test mismatches == 0
+        end
+    end
+
+    @testset "CUDA graph decode$(quantize === nothing ? "" : " ($quantize)")" for quantize in (nothing, :int8)
+        m = TileInfer.load_model(dir; backend = TileBackend(), max_len = 256, quantize)
         ids = Int.(cases["medium"]["ids"])
         cache, eager_cache = TileInfer.PagedKVCache(m), TileInfer.PagedKVCache(m)
         runner = TileInfer.ModelRunner(m, cache)
@@ -134,5 +166,37 @@ end
         TileInfer.prepare_step!(b, m, cache, seq, [42])
         TileInfer.run_step!(m, cache, b)
         @test CUDA.@allocated(TileInfer.run_step!(m, cache, b)) == 0
+    end
+end
+
+# The real Apertus 1.5 8B in INT8 (it needs 16.1 GB in BFloat16) against transformers' Float32
+# run on the CPU (scripts/gen_apertus_fixtures.py real <model_dir>), when it is pulled: the
+# chat prompt tokenizes to the same ids, and argmax changes only at near-ties (measured:
+# 2 of 103 positions, at margins 0.2 and 0.02; greedy continuations were identical).
+function test_apertus_8b(dir)
+    GC.gc(true); CUDA.reclaim()           # it needs ~9 of the 16 GB
+    cases = TileInfer.JSON.parsefile(fixture("logits", "apertus-1.5-8b.json"))["cases"]
+    tok = TileInfer.load_tokenizer(dir)
+    chat = TileInfer.chat_prompt("apertus1p5", [TileInfer.ChatMessage("user", "Explain in two sentences why the sky is blue.")];
+                                 enable_thinking = false)
+    @test TileInfer.encode(tok, chat; add_special_tokens = false) == cases["chat"]["ids"]
+    m = TileInfer.load_model(dir; backend = TileBackend(), max_len = 128, quantize = :int8)
+    @test 8.5e9 < TileInfer.weight_bytes(m.weights) < 8.7e9
+    for (name, case) in cases
+        ids = Int.(case["ids"])
+        cache = TileInfer.PagedKVCache(m)
+        logits = Array(TileInfer.forward!(m, cache, TileInfer.new_sequence(cache), ids; all_logits = true))
+        maxdiff, mismatches = compare_logits(logits, case["float32"]; tie = 0.5)
+        @test maxdiff < 5.0                                     # measured 3.53, at |logits| up to 60
+        @test mismatches == 0
+    end
+end
+
+let dir = test_model_dir(APERTUS_TEST_MODEL)
+    if dir !== nothing
+        @testset "Apertus 1.5 8B (int8) vs transformers" begin
+            test_apertus_8b(dir)
+        end
+        GC.gc(); CUDA.reclaim()
     end
 end

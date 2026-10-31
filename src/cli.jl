@@ -19,6 +19,8 @@ const USAGE = """
       --seed S              random seed
       --thinking on|off     Qwen3 reasoning mode (default on)
       --backend tile|ref    cuTile kernels (default) or the reference ops
+      --int8                Int8 linear weights with per-channel scales: half the memory
+                            and up to 1.9x faster decode (needed for 8B models on 16 GB)
       --raw                 run only: send the prompt as-is, without the chat template
       --speculate K         speculative decoding with up to K drafts per step (1-7), by
                             n-gram lookup in the conversation, or by --draft
@@ -97,7 +99,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts")
+                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts", "int8")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
 # Model, tokenizer and generation settings shared by `run` and `chat`.
@@ -107,7 +109,8 @@ function load_for_generation(model_name, options)
     backend = get(BACKENDS, get(options, "backend", "tile"), nothing)
     backend === nothing && throw(ArgumentError("--backend expects tile or ref"))
     dir = model_dir(model_name)
-    model = load_model(dir; backend, max_len = parse_option(Int, options, "max-context", 4096))
+    model = load_model(dir; backend, max_len = parse_option(Int, options, "max-context", 4096),
+                       quantize = haskey(options, "int8") ? :int8 : nothing)
     tok = load_tokenizer(dir)
     defaults, stop_ids = generation_defaults(dir, model.config)
     sampling = SamplingParams(temperature = parse_option(Float64, options, "temperature", defaults.temperature),
@@ -136,7 +139,7 @@ function load_proposer(model::DecoderLM, options)
     haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k, sample)
     haskey(options, "draft") || return NgramProposer(; k)
     draft = load_model(model_dir(options["draft"]); T = eltype(model), backend = model.backend,
-                       max_len = max_length(model))
+                       max_len = max_length(model), quantize = quantization(model.weights))
     draft.config.vocab_size == model.config.vocab_size ||
         throw(ArgumentError("the draft model's vocabulary ($(draft.config.vocab_size)) differs from the model's ($(model.config.vocab_size))"))
     return DraftProposer(draft; k, sample)
@@ -237,7 +240,7 @@ end
 
 const COMMANDS = Dict("pull" => cmd_pull, "ls" => cmd_ls, "rm" => cmd_rm, "run" => cmd_run,
                       "chat" => cmd_chat)
-const FLAGS = ("raw", "sample-drafts")
+const FLAGS = ("raw", "sample-drafts", "int8")
 
 "Run the CLI on `args`; returns the process exit code."
 function cli(args::Vector{String})

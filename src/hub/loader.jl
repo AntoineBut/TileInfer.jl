@@ -94,32 +94,77 @@ function check_size(x, expected, name)
     return x
 end
 
+check_quantize(quantize) = quantize in (nothing, :int8) ||
+    throw(ArgumentError("unsupported quantization $quantize; supported: :int8"))
+
+# Quantize a freshly uploaded weight and free its T copy at once, so that loading a model
+# that only fits quantized never holds more than one T matrix at a time.
+function quantized(W::CuMatrix, quantize::Union{Nothing,Symbol})
+    check_quantize(quantize)
+    quantize === nothing && return W
+    Wq = quantize_int8(W)
+    CUDA.unsafe_free!(W)
+    return Wq
+end
+
+const QUANTIZE_COLUMNS = 16384   # 128 MB of BFloat16 at 4096 rows
+
 """
-    load_weights(T, config, dir) -> ModelWeights{T}
+Tensor `name` uploaded in file layout and stored as an Int8Weight (or as a T matrix when
+`quantize === nothing`), with only its first `cols` columns if given. Quantization is per
+column, so it is done block by block: the T copy on the device never exceeds
+QUANTIZE_COLUMNS columns (a 131k-token lm_head is 1 GB in BFloat16).
+"""
+function upload_weight(::Type{T}, c::Checkpoint, name::AbstractString, quantize::Union{Nothing,Symbol};
+                       cols::Union{Nothing,Integer} = nothing) where {T}
+    check_quantize(quantize)
+    quantize === nothing && return upload(T, c, name; cols)
+    x = file_layout(c, name)
+    n = something(cols, size(x, 2))
+    n <= size(x, 2) || error("$name has $(size(x, 2)) columns, cannot take the first $n")
+    W = Int8Weight(CuMatrix{Int8}(undef, size(x, 1), n), CuVector{Float32}(undef, n))
+    for block in Iterators.partition(1:n, QUANTIZE_COLUMNS)
+        part = CuMatrix{T}(undef, size(x, 1), length(block))
+        upload!(part, 1, view(x, :, block))
+        q = quantized(part, :int8)
+        copyto!(view(W.q, :, block), q.q)
+        copyto!(view(W.scale, block), q.scale)
+        CUDA.unsafe_free!(q.q)
+    end
+    return W
+end
+
+"""
+    load_weights(T, config, dir; quantize = nothing) -> ModelWeights{T}
 
 Read the checkpoint in `dir` onto the GPU with element type `T`, fusing q/k/v and gate/up.
+With `quantize = :int8`, the linear weights and the lm_head are stored as [`Int8Weight`](@ref)
+(the embedding table stays in `T`).
 """
-function load_weights(::Type{T}, cfg::ModelConfig, dir::AbstractString) where {T}
+function load_weights(::Type{T}, cfg::ModelConfig, dir::AbstractString;
+                      quantize::Union{Nothing,Symbol} = nothing) where {T}
     c = Checkpoint(dir)
     H = cfg.hidden_size
     # Multimodal checkpoints (Apertus 1.5) keep the decoder under `model.language_model.`.
     m = haskey(c, "model.language_model.embed_tokens.weight") ? "model.language_model." : "model."
-    layers = [load_layer(T, c, cfg, "$(m)layers.$i.") for i in 0:cfg.num_layers-1]
+    layers = [load_layer(T, c, cfg, "$(m)layers.$i."; quantize) for i in 0:cfg.num_layers-1]
     # Only the text rows: Apertus 1.5 also embeds image and audio codes after them.
     embed = check_size(upload(T, c, m * "embed_tokens.weight"; cols = cfg.vocab_size), (H, cfg.vocab_size), "embed")
     # Some tied checkpoints (Qwen3-0.6B) still store a copy of lm_head; like transformers,
     # ignore it rather than spend a second vocab × hidden matrix of memory.
     lm_head = if cfg.tie_word_embeddings
-        embed
+        quantize === nothing ? embed : upload_weight(T, c, m * "embed_tokens.weight", quantize; cols = cfg.vocab_size)
     else
-        check_size(upload(T, c, "lm_head.weight"), (H, cfg.vocab_size), "lm_head")
+        check_size(upload_weight(T, c, "lm_head.weight", quantize), (H, cfg.vocab_size), "lm_head")
     end
     norm = check_size(upload(T, c, m * "norm.weight"), (H,), "norm")
     return ModelWeights(embed, layers, norm, lm_head)
 end
 
 "The weights of the decoder layer whose tensors are named `prefix * \"self_attn.q_proj.weight\"`, …"
-function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractString) where {T}
+function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractString;
+                    quantize::Union{Nothing,Symbol} = nothing) where {T}
+    q(W) = quantized(W, quantize)
     H, I, D = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim
     attn = p * "self_attn."
     qkv_names = [attn * "$(x)_proj.weight" for x in ("q", "k", "v")]
@@ -130,14 +175,14 @@ function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractStrin
     mlp_in = xielu ? [p * "mlp.up_proj.weight"] : [p * "mlp.gate_proj.weight", p * "mlp.up_proj.weight"]
     return LayerWeights(
         check_size(upload(T, c, p * attn_norm * ".weight"), (H,), "attn_norm"),
-        check_size(upload_fused(T, c, qkv_names), (H, (cfg.num_heads + 2cfg.num_kv_heads) * D), "wqkv"),
+        q(check_size(upload_fused(T, c, qkv_names), (H, (cfg.num_heads + 2cfg.num_kv_heads) * D), "wqkv")),
         cfg.qkv_bias ? upload_fused(T, c, replace.(qkv_names, "weight" => "bias")) : nothing,
         cfg.qk_norm ? check_size(upload(T, c, attn * "q_norm.weight"), (D,), "q_norm") : nothing,
         cfg.qk_norm ? check_size(upload(T, c, attn * "k_norm.weight"), (D,), "k_norm") : nothing,
-        check_size(upload(T, c, attn * "o_proj.weight"), (cfg.num_heads * D, H), "wo"),
+        check_size(upload_weight(T, c, attn * "o_proj.weight", quantize), (cfg.num_heads * D, H), "wo"),
         check_size(upload(T, c, p * mlp_norm * ".weight"), (H,), "mlp_norm"),
-        check_size(upload_fused(T, c, mlp_in), (H, length(mlp_in) * I), "w_gate_up"),
-        check_size(upload(T, c, p * "mlp.down_proj.weight"), (I, H), "w_down"),
+        q(check_size(upload_fused(T, c, mlp_in), (H, length(mlp_in) * I), "w_gate_up")),
+        check_size(upload_weight(T, c, p * "mlp.down_proj.weight", quantize), (I, H), "w_down"),
         xielu ? load_xielu(T, c, p * "mlp.act_fn.") : nothing,
     )
 end

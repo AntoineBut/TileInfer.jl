@@ -9,6 +9,8 @@
 #   --seconds S        time budget per benchmark (default 1)
 #   --model REPO,...   models whose shapes and weights are used (default: Qwen/Qwen3-0.6B and
 #                      Qwen/Qwen3-4B, one after the other). Keys start with the model name.
+#   --quantize int8    load the models with Int8 linear weights (keys start "<model>-int8"; the
+#                      op benchmarks of weight-reading kernels use Int8 weights)
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
@@ -30,7 +32,7 @@ function parse_cli(args)
         opts[args[i][3:end]] = args[i+1]
         i += 2
     end
-    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model"))
+    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model", "quantize"))
     isempty(unknown) || error("unknown options: $(join(unknown, ", "))")
     return opts
 end
@@ -117,9 +119,10 @@ function main(args)
     # One model at a time, so that only one set of weights is on the GPU.
     results, info = BenchmarkGroup(), Dict{String,Workload}()
     for repo in repos
-        model = TileInfer.load_model(repo; max_len = CONTEXT + PREFILL)
+        quantize = haskey(opts, "quantize") ? Symbol(opts["quantize"]) : nothing
+        model = TileInfer.load_model(repo; max_len = CONTEXT + PREFILL, quantize)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
-        label = model_label(repo)
+        label = model_label(repo) * (quantize === nothing ? "" : "-$quantize")
         suite, model_info = build_suite(model, label; filter, sampling)
         if !isempty(leaves(suite))
             foreach(((_, b),) -> (b.params.seconds = seconds; b.params.samples = 10_000), leaves(suite))

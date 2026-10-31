@@ -20,6 +20,21 @@ using SafeTensors: SafeTensors
         end
     end
 
+    @testset "int8 upload in column blocks" begin
+        mktempdir() do dir
+            n = 2TileInfer.QUANTIZE_COLUMNS + 100                    # three blocks
+            SafeTensors.serialize(joinpath(dir, "model.safetensors"), Dict("w" => randn(Float32, n, 8)))
+            c = TileInfer.Checkpoint(dir)
+            whole = TileInfer.quantize_int8(TileInfer.upload(BFloat16, c, "w"))
+            blocks = TileInfer.upload_weight(BFloat16, c, "w", :int8)
+            @test Array(blocks.q) == Array(whole.q) && Array(blocks.scale) == Array(whole.scale)
+            first_cols = TileInfer.upload_weight(BFloat16, c, "w", :int8; cols = 20000)
+            @test Array(first_cols.q) == Array(whole.q)[:, 1:20000]
+            @test TileInfer.upload_weight(BFloat16, c, "w", nothing) isa CuMatrix{BFloat16}
+            @test_throws ArgumentError TileInfer.upload_weight(BFloat16, c, "w", :int4)
+        end
+    end
+
     @testset "Apertus 1.5 layout" begin
         # A tiny checkpoint named and shaped like Apertus 1.5: nested decoder, ungated xIELU
         # MLP, sublayer-named norms, q/k norms and an embedding with extra (image) rows.

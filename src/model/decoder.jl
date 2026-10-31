@@ -15,17 +15,18 @@ struct DecoderLM{T,W<:ModelWeights{T},R<:RotaryTable{T},B<:Backend}
 end
 
 """
-    load_model(model; T = BFloat16, backend = RefBackend(), max_len = 4096) -> DecoderLM
+    load_model(model; T = BFloat16, backend = RefBackend(), max_len = 4096, quantize = nothing) -> DecoderLM
 
 Load a pulled model (repo id) or a model directory. `max_len` bounds the positions the
-RoPE tables cover, i.e. the longest sequence the model can process.
+RoPE tables cover, i.e. the longest sequence the model can process. `quantize = :int8`
+stores the linear weights as Int8 with per-channel scales (see [`Int8Weight`](@ref)).
 """
 function load_model(model::AbstractString; T::Type = BFloat16, backend::Backend = RefBackend(),
-                    max_len::Integer = 4096)
+                    max_len::Integer = 4096, quantize::Union{Nothing,Symbol} = nothing)
     dir = model_dir(model)
     cfg = load_config(dir)
     max_len = min(max_len, cfg.max_position_embeddings)
-    return DecoderLM(cfg, load_weights(T, cfg, dir), RotaryTable{T}(cfg, max_len), backend)
+    return DecoderLM(cfg, load_weights(T, cfg, dir; quantize), RotaryTable{T}(cfg, max_len), backend)
 end
 
 Base.eltype(::DecoderLM{T}) where {T} = T

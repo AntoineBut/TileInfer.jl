@@ -133,6 +133,34 @@ using Random: randperm
             @test ulps(y_ref, y, T) <= (T == BFloat16 ? 2 : 1000) # the linear's 1 ulp, through αp x²
         end
 
+        # INT8 weights: same Float32 sums of the Int8 values, scaled, then one rounding.
+        @testset "int8 linear ($in, $out) n = $n" for (in, out) in ((4096, 6144), (1024, 3000), (1000, 37)),
+                                                      n in (1, 3, 100, 512)
+            W, x = TileInfer.quantize_int8(rnd(in, out)), rnd(in, n)
+            y_ref, y = TileInfer.linear(ref, W, x), TileInfer.linear(tile, W, x)
+            if T == BFloat16
+                @test ulps(y_ref, y, T) <= 1
+            else
+                @test host(y) ≈ host(y_ref) rtol = 1e-4       # Float32 sums in another order
+            end
+            if n == 1
+                y32 = TileInfer.linear!(tile, CuMatrix{Float32}(undef, out, 1), W, x)
+                @test Array(y32) == host(y)
+            end
+        end
+
+        @testset "int8 linear_swiglu / linear_xielu ($in, $I) n = $n" for (in, I) in ((4096, 21504), (200, 96)), n in (1, 3)
+            a = TileInfer.XIELU{T}(18.1, 1.2, 0.5, -1e-6)
+            Wg, Wu, x = TileInfer.quantize_int8(rnd(in, 2I)), TileInfer.quantize_int8(rnd(in, I)), rnd(in, n)
+            fused, unfused, scratch = CuMatrix{T}(undef, I, n), CuMatrix{T}(undef, I, n), CuMatrix{T}(undef, 2I, n)
+            TileInfer.linear_swiglu!(tile, fused, scratch, Wg, x)
+            invoke(TileInfer.linear_swiglu!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 4)...}, tile, unfused, scratch, Wg, x)
+            @test ulps(unfused, fused, T) <= (T == BFloat16 ? 1 : 8)
+            TileInfer.linear_xielu!(tile, fused, Wu, x, a)
+            invoke(TileInfer.linear_xielu!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 4)...}, tile, unfused, Wu, x, a)
+            @test ulps(unfused, fused, T) <= (T == BFloat16 ? 1 : 8)
+        end
+
         @testset "linear into Float32 n = $n" for n in (1, 17)
             W, x = rnd(1024, 300; scale = 1 / 30), rnd(1024, n)
             y = TileInfer.linear!(tile, CuMatrix{Float32}(undef, 300, n), W, x)

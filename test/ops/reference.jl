@@ -46,6 +46,23 @@ using LinearAlgebra: dot
         @test Array(TileInfer.silu_mul(be, CuArray(gu))) ≈ g ./ (1 .+ exp.(-g)) .* u
     end
 
+    @testset "int8 weights" begin
+        W = randn(Float32, 300, 40) .* rand(Float32, 1, 40)          # columns of different scales
+        W[:, 7] .= 0
+        Wq = TileInfer.quantize_int8(CuArray(W))
+        q, scale = Array(Wq.q), Array(Wq.scale)
+        @test size(Wq) == (300, 40) && maximum(abs, q) == 127
+        @test scale[7] == 1 && all(iszero, q[:, 7])
+        # Round to nearest: within half a step of each column's scale.
+        @test all(abs.(Array(TileInfer.dequantize(Float32, Wq)) .- W) .<= scale' ./ 2 .* (1 + 1e-6))
+        x = randn(Float32, 300, 3)
+        exact = scale .* (Float64.(q)' * Float64.(x))
+        @test Array(TileInfer.linear(be, Wq, CuArray(x))) ≈ exact rtol = 1e-5
+        xb = CuArray(BFloat16.(x))
+        @test Array(TileInfer.linear(be, Wq, xb)) ==
+              BFloat16.(Array(TileInfer.linear(be, Wq, CuArray(Float32.(Array(xb))))))  # one rounding to T
+    end
+
     @testset "xielu" begin
         a = TileInfer.XIELU{Float32}(1.3f0, 0.9f0, 0.5f0, -1f-6)
         x = Float32[-30, -2, -0.1, -1f-3, -1f-7, 0, 1f-7, 0.5, 3]

@@ -568,3 +568,37 @@ column. Sampled drafts pay on the open "explain" prompt at every k (draft model 
 so a difference of one step moves it by several percent (DFlash k = 15 on rename: 10 → 11
 steps). Greedy drafts stay the default. Sampled drafts should gain more at higher
 temperatures, where p(argmax q) falls faster than Σ min(p, q).
+
+## Weight-only INT8, and Apertus 1.5 8B (2026-10-31)
+
+`load_model(...; quantize = :int8)`, `--int8` (CLI), `--quantize int8` (bench/run.jl, keys
+`<model>-int8/...`): linear weights and the lm_head as Int8 with one Float32 scale per output
+channel (symmetric, round to nearest, quantized on the GPU at load time); the embedding stays
+BF16. Kernels accumulate the Int8 values in Float32 and scale the sums before the one
+rounding to T: the GEMV (and its SwiGLU / xIELU epilogues) converts Int8 to Float32, the GEMM
+converts Int8 tiles to BF16 for the tensor cores (|q| ≤ 127 is exact).
+
+- **GEMV tiles**: half the BF16 width. TK × TM ≈ 4096 Int8 elements per tile (TK = 1024,
+  TM = 4) was best on every Apertus 8B layer; BF16's TM = 8 was 7–13 % slower, TK ≥ 2048 with
+  TM ≥ 4 much slower. With it, the INT8 GEMVs run at 85–93 % of the roofline (qkv 91 %, o 87 %,
+  up + xIELU 91 %, down 85 %, lm_head 93 %).
+- **Accuracy** (mean KL to the BF16 model over the fixture prompts; top-1 agreement):
+  Qwen3-0.6B 0.032 (46/50), Qwen3-4B 0.009 (49/50). Apertus 1.5 8B in INT8 against
+  transformers' Float32 run of the unquantized checkpoint on the CPU: argmax differs at 2 of
+  103 positions, both near-ties (margins 0.2 and 0.02), and 24-token greedy continuations are
+  identical on all three prompts.
+
+End to end (`--seconds 2`, tile backend; decode at 1,024 positions):
+
+| | BF16 decode | INT8 decode | BF16 prefill 512 | INT8 prefill 512 |
+|---|---|---|---|---|
+| Qwen3-0.6B | 409 tok/s | 539 tok/s (1.32×) | 58.2k tok/s | 53.9k tok/s (0.92×) |
+| Qwen3-4B | 77.7 tok/s | 136.9 tok/s (1.77×) | 11.4k tok/s | 10.1k tok/s (0.89×) |
+| Apertus 1.5 8B | does not fit (16.1 GB) | 80.5 tok/s | — | 4.8k tok/s |
+
+Apertus 8B in INT8 holds 8.6 GB of weights (linear 7.0 GB, lm_head 0.54 GB, BF16 embedding
+1.07 GB) and loads in 12 s. Its decode step (12.4 ms from a graph) reads ~7.5 GB of weights
+plus the KV cache, ~82 % of the 736 GB/s roofline; the suite's 95 % counts the whole
+embedding table as read, as it does for every model. INT8 prefill is 8–11 % slower than
+BF16: the GEMM's Int8 → BF16 tile conversion is not hidden yet (down, K = 21504, is the
+worst at 0.73× of its BF16 GEMM), so fused dequantization in the GEMM is the next lever.

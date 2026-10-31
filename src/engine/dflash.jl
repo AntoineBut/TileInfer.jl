@@ -31,7 +31,7 @@ A DFlash drafter on the GPU: its Qwen3 layers, `fc` and norms, the target's embe
 and lm_head (shared), its RoPE table, the target layers it reads (`aux_layers`, 1-based),
 the block size and the mask token. Load with [`load_dflash`](@ref).
 """
-struct DFlashDrafter{T,M<:AbstractMatrix{T},V<:AbstractVector{T},R<:RotaryTable{T},B<:Backend}
+struct DFlashDrafter{T,M<:AbstractMatrix{T},L,V<:AbstractVector{T},R<:RotaryTable{T},B<:Backend}
     config::ModelConfig
     aux_layers::Vector{Int}
     block_size::Int
@@ -41,7 +41,7 @@ struct DFlashDrafter{T,M<:AbstractMatrix{T},V<:AbstractVector{T},R<:RotaryTable{
     layers::Vector{LayerWeights{T,M,V}}
     norm::V
     embed::M                         # the target's (hidden, vocab)
-    lm_head::M                       # the target's
+    lm_head::L                       # the target's (Int8Weight if it is quantized)
     rope::R
     backend::B
 end
@@ -59,7 +59,7 @@ load_dflash(name::AbstractString, target::DecoderLM{T}; max_len::Integer = max_l
 
 # With the target's configuration, embedding table and lm_head given separately (the tests
 # run the drafter in Float32 without the whole target).
-function load_dflash(name::AbstractString, tcfg::ModelConfig, embed::AbstractMatrix{T}, lm_head::AbstractMatrix{T},
+function load_dflash(name::AbstractString, tcfg::ModelConfig, embed::AbstractMatrix{T}, lm_head,
                      backend::Backend; max_len::Integer) where {T}
     dir = model_dir(name)
     raw = JSON.parsefile(joinpath(dir, "config.json"))
