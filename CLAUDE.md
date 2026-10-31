@@ -19,7 +19,7 @@ julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [-
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
-julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~6 min
+julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~11 min
 ```
 
 Profiling workflow, model-step costs and how to read the summary: [docs/PROFILING.md](docs/PROFILING.md).

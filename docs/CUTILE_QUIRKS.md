@@ -5,7 +5,7 @@ what to report upstream, and what TileInfer's kernels must work around. Probes l
 `bench/quirks/probes/`; each runs kernels that compute the same thing written differently.
 
 ```sh
-julia --project=bench bench/quirks/run.jl [NAME_FILTER...]    # all probes ~6 min
+julia --project=bench bench/quirks/run.jl [NAME_FILTER...]    # all probes ~11 min
 ```
 
 For each variant the harness (`bench/quirks/harness.jl`) prints the GPU time (CUPTI trace,
@@ -20,7 +20,7 @@ the Tile IR cuTile.jl emits (`.tileir`) and the SASS `tileiras` produces (`.sass
 | Same up to names, or only the tile shape | differs | `tileiras` (Tile IR → SASS) | NVIDIA (CUDA Tile IR) |
 | Same | same | noise | — |
 
-Environment (2026-10-29): cuTile.jl 1.0.0 (the latest registered), tileiras 13.3.36,
+Environment (2026-10-29, re-run 2026-10-31): cuTile.jl 1.0.0 (the latest registered), tileiras 13.3.36,
 CUDA.jl 6.3, Julia 1.13.3, RTX 4080 SUPER (sm_89, Ada). Raw output of the last full run:
 `bench/results/quirks/report.txt`.
 
@@ -164,13 +164,26 @@ and time), the attention combine as a 3-D reduction (same time), and RMSNorm wit
 loads through a closure or reordered (same or slightly worse). The helpers in the GEMV and
 sampling kernels compile to the same SASS too (`helpers_*`).
 
-**Census** (`06_census.jl`, `bench/results/quirks/census.txt`): every kernel of a decode,
-64- and 512-token prefill step of Qwen3-0.6B and 4B at real shapes. No kernel spills and
-none uses a narrow `mmaf`. The slow ones are known design limits (PERFORMANCE.md, "What to
-optimize"), not codegen: `q_inputs_kernel` at 512 tokens (one block per token and head,
-~330 GB/s), the prefill GEMMs (70–75 % of the tensor-core peak). One oddity without cost:
-`rmsnorm_kernel` compiles to twice the SASS of `add_rmsnorm_kernel` (tileiras unrolls its
-loops twice: 26 vs 13 global loads), runs once per step, and is ≤ 0.5 µs slower.
+**Census** (`06_census.jl`, in `bench/results/quirks/report.txt`): every kernel of a decode
+step (1 token at 1,024 positions), a spec-decoding verify step (8 and 16 tokens at 1,024
+positions), and a 64- and 512-token prefill step, at the real shapes of Qwen3-0.6B and 4B
+in BFloat16 and INT8 and of Apertus 1.5 8B in INT8. None uses a narrow `mmaf`. The slow
+ones are mostly known design limits (PERFORMANCE.md, "What to optimize"), not codegen:
+`q_inputs_kernel` at 512 tokens (one block per token and head, ~330 GB/s), the prefill
+GEMMs (70–75 % of the tensor-core peak). One oddity without cost: `rmsnorm_kernel`
+compiles to twice the SASS of `add_rmsnorm_kernel` (tileiras unrolls its loops twice: 26
+vs 13 global loads), runs once per step, and is ≤ 0.5 µs slower. New on 2026-10-31:
+
+- **`gemm_int8_kernel` spills** at 512 tokens, on every model: 231–255 registers and 16
+  bytes of local memory per thread, where the BF16 `gemm_kernel` with the same tiles uses
+  222–236 and none (the Int8 → BF16 conversion of the weight tile adds live registers).
+  The INT8 prefill-512 GEMMs are 1.06–1.26× slower than BF16 (4B down: 327 vs 259 µs)
+  although they read half the weight bytes.
+- **Attention for 9–16 tokens leaves the decode kernels**: `DECODE_MAX_TOKENS = 8`, so a
+  16-token verify step (DFlash's block) runs the prefill kernel, 16–32 blocks over 1,024
+  positions: 27–28 µs on every model against 6–9 µs at 1 and 8 tokens. Not a codegen
+  quirk; a dispatch limit that costs ~0.6–0.7 ms per 16-token verify step (28–36 layers),
+  ~5 % of a 4B verify.
 
 **Knobs** (`07_knobs.jl`), never swept before on the heaviest kernels:
 

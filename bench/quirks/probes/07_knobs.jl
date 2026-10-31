@@ -89,7 +89,7 @@ for (label, heads, kv) in (("0.6B", 16, 8), ("4B", 32, 8))
     q, out = CuArray(BFloat16.(randn(Float32, D, heads, n))), CuArray{BFloat16}(undef, D, heads, n)
     bt, pos = CuVector{Int32}([1:pages; zeros(Int32, 16 - pages)]), CuVector{Int32}([0])
     args = (TI.heads_view(out), TI.heads_view(q), TI.pool_view(kp), TI.pool_view(vp), bt, pos, Float32(1 / sqrt(D)),
-            ct.Constant(D), ct.Constant(heads ÷ kv), ct.Constant(kv), ct.Constant(TI.PREFILL_TM), ct.Constant(P))
+            ct.Constant(D), ct.Constant(heads ÷ kv), ct.Constant(kv), ct.Constant(TI.PREFILL_TM), ct.Constant(P), ct.Constant(true))
     grid = (cld(n, TI.PREFILL_TM), heads)
     probe!("knobs_attention_prefill_$label", "prefill attention of $label, $n tokens: occupancy (the kernel asks for 2)",
            "occupancy = 1" => () -> @cuda(backend = cuTile, blocks = grid, occupancy = 1, TI.attention_prefill_kernel(args...)),

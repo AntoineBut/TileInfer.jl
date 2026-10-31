@@ -10,7 +10,7 @@ const TI = TileInfer
 function decode_attention_inlined(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                   V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                   qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, NT::Int,
-                                  PAGE::Int, SPLITS::Int) where {T}
+                                  PAGE::Int, SPLITS::Int, CAUSAL::Bool) where {T}
     ct.@compiler_options occupancy = 2
     h, s = ct.bid(1), ct.bid(2)
     start = Pos[Int32(1)]
@@ -20,6 +20,7 @@ function decode_attention_inlined(Part::ct.TileArray{Float32,3}, Q::ct.TileArray
     q = reshape(ct.load(Q; index = (h, Int32(1)), shape = (D * GROUP, NT),
                         padding_mode = ct.PaddingMode.Zero), (D, M))
     qpos = start .+ reshape(cld.(ct.arange(M; dtype = Int32), Int32(GROUP)), (1, M))
+    CAUSAL || (qpos = max.(qpos, start + size(Q, 2)))
     qk_scale = qk_scale * TI.LOG2_E
     m_i, l_i, acc = fill(TI.NEG_BIG, (1, M)), zeros(Float32, (1, M)), zeros(Float32, (D, M))
     for j in (s - Int32(1)) * per_split:min(s * per_split, pages) - Int32(1)
@@ -55,7 +56,7 @@ let (D, heads, kv, P, ctx) = (128, 16, 8, 64, 1024)
     group, splits = heads ÷ kv, size(part, 3) ÷ kv
     launch(k) = () -> @cuda backend = cuTile blocks = (kv, splits) k(
         part, TI.heads_view(q), TI.pool_view(kp), TI.pool_view(vp), bt, pos, Float32(1 / sqrt(D)), ct.Constant(D),
-        ct.Constant(group), ct.Constant(kv), ct.Constant(TI.decode_tokens(group, 1)), ct.Constant(P), ct.Constant(splits))
+        ct.Constant(group), ct.Constant(kv), ct.Constant(TI.decode_tokens(group, 1)), ct.Constant(P), ct.Constant(splits), ct.Constant(true))
     probe!("audit_decode_attention", "TileInfer's decode attention (1,024 positions) vs a copy with its helpers inlined",
            "TileInfer (attend_page helper)" => launch(TI.attention_decode_kernel), "helpers inlined" => launch(decode_attention_inlined);
            output = () -> Array(part))
