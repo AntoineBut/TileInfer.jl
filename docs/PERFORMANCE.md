@@ -630,3 +630,19 @@ moved as much): the chat replies stop at 300–850 positions, where the saving i
 of a ~16.5 ms step. 32 splits with the same limit was 3.5 % slower on the rename prompt.
 The gain grows with the context: ~1.4 ms per verify step at 2,048 positions (36 layers ×
 39 µs), ~8 % of a 4B verify, not measured end to end (the bench's replies are too short).
+
+Measured since on the two long prompts of `bench/speculative.jl` (a 2.2k-token Julia file,
+`bench/prompts/runner.jl`, to edit or explain; replies of 256 tokens, so 2,230–2,480
+positions), greedy, `DECODE_MAX_TOKENS` 8 (before) against 16, same session:
+
+| Prompt | plain | DFlash k = 7 (control) | DFlash k = 15 before → after | ms per verify step |
+|---|---|---|---|---|
+| long-edit | 77.0 / 77.0 | 367.0 / 367.1 | 419.2 → **454.2** (+8.3 %) | 19.1 → 17.6 |
+| long-explain | 77.0 / 77.0 | 182.7 / 182.6 | 153.7 → **169.4** (+10 %) | 18.9 → 17.3 |
+
+The ~1.5 ms per step matches the prediction. At these contexts the whole block still pays
+on the edit prompt (8.0 tokens per step; 5.9× over plain) but not on the open one, where
+k = 7 wins (2.37× vs 2.20×; 3.2 vs 2.9 tokens per step). Plain decoding runs at 77 tok/s
+(80 on the short prompts), and the 2.2k-token prefill takes 203 ms (11k tok/s, ~78
+TFLOP/s; 91 at 512 tokens). Rows of one run compare; between the full run (every method)
+and the DFlash-only runs, long-explain's DFlash rows differed by up to 11 %.

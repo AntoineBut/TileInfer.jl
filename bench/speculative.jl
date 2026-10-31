@@ -2,7 +2,8 @@
 # a draft model, an EAGLE-3 drafter and a DFlash drafter, for several draft lengths k
 # (DFlash also with its whole block). Acceptance depends on the text, so unlike
 # bench/run.jl this generates replies to fixed prompts, from one that copies its input to
-# open-ended ones.
+# open-ended ones. The two "long-" prompts work on a ~2.2k-token document (a frozen copy of
+# src/engine/runner.jl in bench/prompts/), where attention over the context weighs more.
 #
 #   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--eagle REPO|none]
 #       [--dflash REPO|none] [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled [--pq]] [--filter REGEX]
@@ -13,7 +14,8 @@
 # (--sampled: the model's recommended sampling, same seed for every method; --pq: the model
 # proposers sample their drafts too, verified by the p/q rule). Decode tok/s
 # runs from the first new token to the last, so it excludes the target's prefill but includes
-# the draft model's (it prefills during the first proposal). Each case is the best of
+# the draft model's (it prefills during the first proposal). Prefill is the time to the first
+# token: the target's prefill and first sample. Each case is the best of
 # `trials` runs after a warm-up run that compiles and captures every step.
 
 using CUDA
@@ -39,14 +41,16 @@ function rmsnorm!(y, x, w, eps)
 end
 """
 
+const LONG_DOCUMENT = read(joinpath(@__DIR__, "prompts", "runner.jl"), String)
+
 const PROMPTS = [
     "rename" => "Rename the variable `s` to `acc` and `r` to `scale` in this Julia function. Reply with the full code only.\n\n" * CODE,
     "document" => "Add a docstring and a comment on each loop to this Julia function. Reply with the full code only.\n\n" * CODE,
     "explain" => "Explain how a hash map handles collisions, with an example.",
     "story" => "Write a short story about a lighthouse keeper who finds a strange machine on the beach.",
+    "long-edit" => "Rename `ModelRunner` to `StepRunner` throughout this Julia file. Reply with the full file only.\n\n" * LONG_DOCUMENT,
+    "long-explain" => "Explain how this Julia file decides when to capture a CUDA graph and when to replay one.\n\n" * LONG_DOCUMENT,
 ]
-
-const MAX_TOKENS = 2048
 
 function main(args)
     _, opts = TileInfer.parse_args(args; flags = ("sampled", "pq"))
@@ -59,19 +63,25 @@ function main(args)
     trials = parse(Int, get(opts, "trials", "3"))
     filter = Regex(get(opts, "filter", ""))
 
-    target = TileInfer.load_model(target_name; backend = TileBackend(), max_len = MAX_TOKENS)
-    draft = draft_name == "none" ? nothing : TileInfer.load_model(draft_name; backend = TileBackend(), max_len = MAX_TOKENS)
     dir = model_dir(target_name)
     tok = load_tokenizer(dir)
+    prompts = [name => encode(tok, chat_prompt(TileInfer.load_config(dir).model_type, [ChatMessage("user", text)];
+                                               enable_thinking = false); add_special_tokens = false)
+               for (name, text) in PROMPTS if occursin(filter, name)]
+    # Room for the longest prompt, the reply and a last draft beyond it.
+    max_tokens = 256 * cld(maximum(length ∘ last, prompts) + n + 64, 256)
+
+    target = TileInfer.load_model(target_name; backend = TileBackend(), max_len = max_tokens)
+    draft = draft_name == "none" ? nothing : TileInfer.load_model(draft_name; backend = TileBackend(), max_len = max_tokens)
     defaults, stop_ids = generation_defaults(dir, target.config)
     sampling = haskey(opts, "sampled") ? defaults : TileInfer.SamplingParams()
-    runner = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens = MAX_TOKENS))
+    runner = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
     # EAGLE and DFlash make the target's steps keep hidden states (of different layers): a
     # runner of their own each keeps the others' steps as they are.
-    aux_runner() = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens = MAX_TOKENS))
-    eagle = eagle_name == "none" ? nothing : load_eagle3(eagle_name, target; max_len = MAX_TOKENS)
+    aux_runner() = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
+    eagle = eagle_name == "none" ? nothing : load_eagle3(eagle_name, target; max_len = max_tokens)
     eagle_runner = eagle === nothing ? nothing : aux_runner()
-    dflash = dflash_name == "none" ? nothing : load_dflash(dflash_name, target; max_len = MAX_TOKENS)
+    dflash = dflash_name == "none" ? nothing : load_dflash(dflash_name, target; max_len = max_tokens)
     dflash_runner = dflash === nothing ? nothing : aux_runner()
 
     methods = Tuple{String,Any,Any}[("plain", nothing, runner)]
@@ -81,25 +91,22 @@ function main(args)
     for k in ks
         push!(methods, ("ngram k=$k", NgramProposer(; k), runner))
         draft === nothing ||
-            push!(methods, ("draft$pq k=$k", DraftProposer(draft; k, sample, max_tokens = MAX_TOKENS), runner))
+            push!(methods, ("draft$pq k=$k", DraftProposer(draft; k, sample, max_tokens), runner))
         eagle === nothing ||
-            push!(methods, ("eagle$pq k=$k", Eagle3Proposer(eagle; k, sample, max_tokens = MAX_TOKENS), eagle_runner))
+            push!(methods, ("eagle$pq k=$k", Eagle3Proposer(eagle; k, sample, max_tokens), eagle_runner))
     end
     if dflash !== nothing
         for k in unique!([[k for k in ks if k < dflash.block_size]; dflash.block_size - 1])
-            push!(methods, ("dflash$pq k=$k", DFlashProposer(dflash; k, sample, max_tokens = MAX_TOKENS), dflash_runner))
+            push!(methods, ("dflash$pq k=$k", DFlashProposer(dflash; k, sample, max_tokens), dflash_runner))
         end
     end
 
     println("target $target_name, draft $draft_name, EAGLE-3 $eagle_name, DFlash $dflash_name, ",
             sampling.temperature == 0 ? "greedy" : "sampled $sampling", sample ? ", sampled drafts" : "",
             ", $n tokens, best of $trials")
-    @printf("%-9s %-14s %8s %7s %6s %6s %8s %11s\n", "prompt", "method", "tok/s", "speedup", "out", "steps",
-            "accept", "tokens/step")
-    for (name, text) in PROMPTS
-        occursin(filter, name) || continue
-        ids = encode(tok, chat_prompt(target.config.model_type, [ChatMessage("user", text)]; enable_thinking = false);
-                     add_special_tokens = false)
+    @printf("%-12s %6s %-14s %8s %7s %11s %6s %6s %8s %11s\n", "prompt", "len", "method", "tok/s", "speedup",
+            "prefill ms", "out", "steps", "accept", "tokens/step")
+    for (name, ids) in prompts
         base = NaN
         for (method, proposer, runner) in methods
             cache = runner.cache
@@ -108,17 +115,21 @@ function main(args)
                 stats = SpecStats()
                 first = Ref(0.0)
                 on_token(_) = first[] == 0 && (first[] = time())
+                start = time()
                 out = TileInfer.generate!(runner, seq, ids; max_new_tokens = n, stop_ids, sampling, rng = Xoshiro(1),
                                           on_token, speculative = proposer, spec_stats = stats)
                 rate = (length(out) - 1) / (time() - first[])
                 TileInfer.release!(cache, seq)
-                return rate, out, stats
+                return rate, first[] - start, out, stats
             end
             run()                                    # compile and capture
-            best = maximum(first(run()) for _ in 1:trials)
-            _, out, stats = run()
+            runs = [run() for _ in 1:trials]
+            best = maximum(r[1] for r in runs)
+            prefill = minimum(r[2] for r in runs)
+            _, _, out, stats = run()
             proposer === nothing && (base = best)
-            @printf("%-9s %-14s %8.1f %6.2f× %6d %6s %8s %11s\n", name, method, best, best / base, length(out),
+            @printf("%-12s %6d %-14s %8.1f %6.2f× %11.1f %6d %6s %8s %11s\n", name, length(ids), method, best, best / base,
+                    1e3 * prefill, length(out),
                     proposer === nothing ? "" : string(stats.steps),
                     proposer === nothing ? "" : @sprintf("%.2f", TileInfer.acceptance_rate(stats)),
                     proposer === nothing ? "" : @sprintf("%.2f", length(out) / stats.steps))
