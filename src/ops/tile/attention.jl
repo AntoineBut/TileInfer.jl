@@ -131,11 +131,19 @@ end
 # n = 512 by giving 256 blocks. Decode tiles padded from 2 to 16 query rows and occupancy 2
 # cut the decode kernel from 15 to 10 µs at 1024 positions (fewer spills, 2 blocks per SM).
 const PREFILL_TM = 32              # query rows per prefill block
-const DECODE_MAX_TOKENS = 8        # up to this many tokens use the split-KV decode kernels
+const DECODE_MAX_TOKENS = 16       # up to this many tokens use the split-KV decode kernels
 const DECODE_BLOCKS = 160          # target decode blocks (2 per SM)
 const DECODE_MIN_ROWS = 16         # pad packed decode query tiles to at least this many rows
+const VERIFY_SPLITS = 8            # splits for steps of more than 8 tokens
 
-decode_splits(kv_heads::Integer) = clamp(nextpow(2, cld(DECODE_BLOCKS, kv_heads)), 1, 64)
+# 9-16 tokens (DFlash's 16-token verify): the prefill kernel runs one block per head over
+# every page, 27 µs at 1,024 positions, while the decode kernels have a floor from the
+# combine of all splits, empty or not. 8 splits instead of 32 cut that floor (4B, 128
+# positions: 12.4 → 6.7 µs against the prefill kernel's 4.8) and win from ~200 positions
+# on (1,024: 9.5 µs, 2,048: 14.3 vs 54). A captured graph keeps its kernels as the
+# context grows, so the choice cannot depend on it.
+decode_splits(kv_heads::Integer, n::Integer = 1) =
+    n > 8 ? VERIFY_SPLITS : clamp(nextpow(2, cld(DECODE_BLOCKS, kv_heads)), 1, 64)
 
 uses_decode_kernel(group::Integer, n::Integer) = ispow2(group) && n <= DECODE_MAX_TOKENS
 
@@ -153,7 +161,7 @@ function decode_workspace(q::CuArray{<:Any,3}, k_pages::CuArray{<:Any,4})
     D, heads, n = size(q)
     kv_heads = size(k_pages, 3)
     rows = heads ÷ kv_heads * decode_tokens(heads ÷ kv_heads, n)
-    return CuArray{Float32}(undef, D + 2, rows, decode_splits(kv_heads) * kv_heads)
+    return CuArray{Float32}(undef, D + 2, rows, decode_splits(kv_heads, n) * kv_heads)
 end
 
 # The 2-D views the kernels take (no copies).

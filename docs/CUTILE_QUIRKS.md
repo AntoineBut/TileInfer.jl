@@ -183,7 +183,8 @@ vs 13 global loads), runs once per step, and is ≤ 0.5 µs slower. New on 2026-
   16-token verify step (DFlash's block) runs the prefill kernel, 16–32 blocks over 1,024
   positions: 27–28 µs on every model against 6–9 µs at 1 and 8 tokens. Not a codegen
   quirk; a dispatch limit that costs ~0.6–0.7 ms per 16-token verify step (28–36 layers),
-  ~5 % of a 4B verify.
+  ~5 % of a 4B verify. Now up to 16 tokens use the decode kernels, with 8 splits
+  (PERFORMANCE.md, "16-token verify attention").
 
 **Knobs** (`07_knobs.jl`), never swept before on the heaviest kernels:
 

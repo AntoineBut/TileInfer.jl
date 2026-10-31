@@ -173,7 +173,8 @@ using Random: randperm
         end
 
         # (head_dim, heads, kv_heads, page_size, start, n, causal): decode and verify (split-KV,
-        # a step that crosses a page boundary so some splits see no key of a query), prefill
+        # a step that crosses a page boundary so some splits see no key of a query; up to 16
+        # tokens, DFlash's verify, at groups 2 and 4, and 12 padded to 16), prefill
         # with and without cached context, group 4, and a group of 3 (prefill kernel only);
         # non-causal (DFlash blocks) on both kernels, with a partial last page.
         @testset "attention $case" for case in ((128, 16, 8, 64, 0, 1, true), (128, 16, 8, 64, 1023, 1, true),
@@ -181,6 +182,8 @@ using Random: randperm
                                                  (128, 16, 8, 64, 0, 37, true), (128, 16, 8, 64, 0, 512, true),
                                                  (128, 16, 8, 64, 200, 300, true), (128, 32, 8, 64, 700, 3, true),
                                                  (64, 12, 4, 16, 40, 5, true),
+                                                 (128, 16, 8, 64, 950, 16, true), (128, 32, 8, 64, 950, 16, true),
+                                                 (128, 32, 8, 64, 63, 12, true), (128, 32, 8, 64, 1000, 16, false),
                                                  (128, 16, 8, 64, 60, 4, false), (128, 16, 8, 64, 0, 20, false),
                                                  (128, 32, 8, 64, 300, 30, false), (128, 16, 8, 64, 10, 100, false))
             D, H, KVH, P, start, n, causal = case

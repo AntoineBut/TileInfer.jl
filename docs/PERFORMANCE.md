@@ -602,3 +602,31 @@ plus the KV cache, ~82 % of the 736 GB/s roofline; the suite's 95 % counts the w
 embedding table as read, as it does for every model. INT8 prefill is 8–11 % slower than
 BF16: the GEMM's Int8 → BF16 tile conversion is not hidden yet (down, K = 21504, is the
 worst at 0.73× of its BF16 GEMM), so fused dequantization in the GEMM is the next lever.
+
+## 16-token verify attention (2026-10-31)
+
+Steps of 9–16 tokens (DFlash's verify block, and the drafter's own pass) ran the prefill
+attention kernel: one block per query head walking every page, 16–32 blocks on 80 SMs, so
+its time grows with the context (~1.7 µs per 64-key page). `DECODE_MAX_TOKENS` is now 16,
+and those steps use the split-KV decode kernels with 8 splits (`VERIFY_SPLITS`) instead
+of decode's 32: the combine merges every split, empty or not, and with 32 it set a floor
+of 8 µs (0.6B) / 12 µs (4B) that lost to the prefill kernel below ~450 positions. The
+choice cannot depend on the context, since a captured graph is replayed as it grows.
+
+16-token attention per layer, µs (CUPTI, both kernels of a path):
+
+| positions | 0.6B prefill kernel | 0.6B decode, 32 splits | 0.6B 8 splits | 4B prefill kernel | 4B decode, 32 splits | 4B 8 splits |
+|---|---|---|---|---|---|---|
+| 128 | 4.5 | 8.3 | 5.5 | 4.8 | 12.4 | 6.7 |
+| 256 | 7.6 | 7.6 | 5.3 | 8.1 | 12.2 | 6.7 |
+| 512 | 14.3 | 7.9 | 5.7 | 14.8 | 12.6 | 7.2 |
+| 1024 | 27.4 | 8.8 | 6.7 | 26.9 | 13.6 | 9.5 |
+| 2048 | 53.4 | 11.2 | 9.8 | 53.6 | 17.4 | 14.3 |
+
+The decode kernel does not spill at 64 packed query rows (4B: group 4 × 16 tokens, 230
+registers). End to end on Qwen3-4B with DFlash k = 15 (`bench/speculative.jl`, greedy),
+the time per step is unchanged within the noise (±2 %; k = 7, which this does not touch,
+moved as much): the chat replies stop at 300–850 positions, where the saving is 0.2–0.4 ms
+of a ~16.5 ms step. 32 splits with the same limit was 3.5 % slower on the rename prompt.
+The gain grows with the context: ~1.4 ms per verify step at 2,048 positions (36 layers ×
+39 µs), ~8 % of a 4B verify, not measured end to end (the bench's replies are too short).
