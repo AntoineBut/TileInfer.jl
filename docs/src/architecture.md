@@ -40,7 +40,7 @@ External documentation and papers are listed in [References](references.md).
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ CLI  (tileinfer pull | ls | rm | run | chat | bench)                     │
 ├──────────────────────────────────────────────────────────────────────────┤
-│ Hub / ModelStore      HuggingFaceApi.jl → ~/.cache/huggingface/hub      │
+│ Hub / ModelStore      HuggingFaceApi.jl → ~/.cache/huggingface/hub       │
 │ Tokenizer + ChatTemplate (tokenizer.json, tokenizer_config.json)         │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ LLMEngine   add_request / step / generate (streaming iterator)           │
