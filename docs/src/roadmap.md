@@ -3,7 +3,7 @@
 TileInfer was built in milestones, each a working engine that the next one sped up or
 extended. This page shows where it stands, how it got there, and what comes next. The
 measurements behind every step, including the ideas that did not pan out, are in the
-[Performance log](performance.md).
+[Results by feature](performance.md).
 
 ## Where it stands
 
@@ -12,9 +12,9 @@ RTX 4080 SUPER, in BFloat16, with decode measured after 1,023 cached positions:
 
 | | Qwen3-0.6B | Qwen3-4B |
 |---|---|---|
-| Decode | 395 tok/s (70 % of the bandwidth roofline) | 77 tok/s (86 %) |
-| Decode with INT8 weights | 539 tok/s | 137 tok/s |
-| Prefill, 512-token prompt | 58k tok/s | 11.3k tok/s (91 TFLOP/s) |
+| Decode | 409 tok/s (73 % of the bandwidth roofline) | 79 tok/s (88 %) |
+| Decode with INT8 weights | 542 tok/s | 139 tok/s |
+| Prefill, 512-token prompt | 58k tok/s | 11.4k tok/s (91 TFLOP/s) |
 | Speculative decoding (DFlash) | — | 1.8× to 3.2× on open prompts, 8.5× on a code edit |
 
 Models: Llama 3, Mistral, Qwen3 and Apertus (Apertus 1.5 8B runs on 16 GB with INT8
@@ -63,8 +63,8 @@ help.
 | 2026-10-31 | DFlash drafts handed to the verify step on the device | +1.2 % |
 | 2026-11-01 | EAGLE-3 proposer removed | DFlash beat it on every prompt |
 
-The M8 target is 80 % of the decode bandwidth roofline: met on Qwen3-4B (86 %), not on
-Qwen3-0.6B (70 %), where per-kernel overheads weigh more.
+The M8 target is 80 % of the decode bandwidth roofline: met on Qwen3-4B (88 %), not on
+Qwen3-0.6B (73 %), where per-kernel overheads weigh more.
 
 ## Next
 
