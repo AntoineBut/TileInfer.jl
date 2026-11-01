@@ -119,8 +119,11 @@ TileInfer/
 │   ├── ops/
 │   │   ├── interface.jl        # abstract backend + op signatures, fused-op fallbacks
 │   │   ├── reference.jl        # RefBackend
+│   │   ├── quant.jl            # Int8Weight, Int8Pages (INT8 weights and KV cache)
 │   │   └── tile/               # TileBackend: one file per kernel family
-│   │       ├── norm.jl  elementwise.jl (rope, silu, kv_write, embed)  linear.jl (GEMV, GEMM)
+│   │       ├── norm.jl         # RMSNorm, fused residual add + RMSNorm
+│   │       ├── elementwise.jl  # rope, silu_mul, xielu, KV write, embedding
+│   │       ├── linear.jl       # GEMV (decode) and GEMM (prefill), BF16 and INT8
 │   │       ├── fused.jl        # attention inputs: q/k norm + rope + KV write
 │   │       ├── attention.jl    # paged flash-attention: prefill, split-KV decode + combine
 │   │       └── sampling.jl     # device top-k/top-p sampling, greedy as top-1 (spec_verify planned)
