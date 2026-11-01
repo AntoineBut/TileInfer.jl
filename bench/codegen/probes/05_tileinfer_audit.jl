@@ -1,6 +1,6 @@
 # TileInfer's own kernels against hand-edited copies that differ only in code layout
-# (helpers inlined by hand, closures expanded), on Qwen3-0.6B shapes. A difference here is
-# a quirk that costs TileInfer time.
+# (helpers inlined by hand, closures expanded), on Qwen3-0.6B shapes. A difference here means
+# the code layout itself costs TileInfer time.
 
 using TileInfer: TileInfer
 const TI = TileInfer

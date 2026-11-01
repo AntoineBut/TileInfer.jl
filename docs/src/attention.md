@@ -82,7 +82,7 @@ positions; with 8, the decode kernels win from ~200 positions on (at 2,048 posit
 
 Padding the packed query tile from 2 to 16 rows, with two blocks per SM, cut the decode kernel
 from 15 to 10 µs at 1,024 positions: tiles with fewer rows spill registers (see
-[cuTile quirks](cutile_quirks.md)). At 32k positions the BF16 decode kernel reads the cache at
+[cuTile design choices](cutile_design.md)). At 32k positions the BF16 decode kernel reads the cache at
 642 GB/s, 87 % of the bandwidth roofline.
 
 ## Fused attention inputs

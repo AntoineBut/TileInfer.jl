@@ -6,7 +6,7 @@ CurrentModule = TileInfer
 
 Everything that is documented but not public, grouped by source file. None of it is a stable
 interface: it is here because this project is meant to be read. The design behind it is in
-[Architecture](architecture.md); measured kernel rules are in [cuTile quirks](cutile_quirks.md).
+[Architecture](architecture.md); measured kernel rules are in [cuTile design choices](cutile_design.md).
 
 ## Configuration and loading
 

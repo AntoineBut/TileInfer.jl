@@ -237,7 +237,7 @@ arguments and array shape properties (divisibility, contiguity), and caches the 
 disk across sessions. A first reply in a fresh process therefore includes a few seconds of
 compilation. Arrays that grow during decoding, such as the block table, are padded so that
 their shape properties never change. Measured codegen rules are collected in
-[cuTile quirks](cutile_quirks.md).
+[cuTile design choices](cutile_design.md).
 
 ## Dependencies
 

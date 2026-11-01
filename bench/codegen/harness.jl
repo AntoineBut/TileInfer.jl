@@ -1,5 +1,5 @@
 # Probes of cuTile codegen: pairs (or more) of kernels that compute the same thing written
-# differently, measured side by side (see docs/src/cutile_quirks.md). For each variant the
+# differently, measured side by side (see docs/src/cutile_design.md). For each variant the
 # harness reports the GPU time of its kernels (CUPTI trace: minimum and mean over the second
 # half of ~0.3 s of eager launches, after a warm-up; CUPTI times come in steps of ~0.24 µs,
 # which the mean averages out), the block size, registers and shared memory of the launch,
@@ -11,9 +11,9 @@
 #   SASS     the cubin tileiras produced, disassembled with nvdisasm: instruction count and
 #            a few telling opcodes (barriers, shuffles, shared and local memory traffic).
 #
-# Files land in bench/results/quirks/<probe>/<variant>.{tileir,sass}. Probes other than
-# the TileInfer audit use only CUDA and cuTile, so a kernel pair can be pasted into an
-# upstream issue as is.
+# Files land in bench/results/codegen/<probe>/<variant>.{tileir,sass}. Probes other than
+# the TileInfer audit use only CUDA and cuTile, so each kernel pair is a self-contained
+# reproducer.
 
 using CUDA
 using BFloat16s: BFloat16
@@ -21,7 +21,7 @@ using cuTile: cuTile
 import cuTile as ct
 using Printf: @printf, @sprintf
 
-const OUT = joinpath(@__DIR__, "..", "results", "quirks")
+const OUT = joinpath(@__DIR__, "..", "results", "codegen")
 const NVDISASM = let a = joinpath(dirname(cuTile.tileiras_path()), "nvdisasm")
     isfile(a) ? a : nothing
 end

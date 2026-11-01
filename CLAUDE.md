@@ -23,7 +23,7 @@ julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO] [--dfla
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
-julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~11 min
+julia --project=bench bench/codegen/run.jl [filters]  # cuTile codegen probes and kernel census, ~11 min
 julia --project=docs docs/make.jl                    # documentation site into docs/build/, ~15 s, no GPU needed
 ```
 
@@ -129,12 +129,12 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
   kernels as the minimum over many short trials after a warm-up, never as one averaged loop.
 - Tile shapes change codegen a lot; code layout (helpers, closures, 3-D vs 2-D reductions,
   size-1 axes) measured no difference. Measured rules, with reproducers, in
-  [docs/src/cutile_quirks.md](docs/src/cutile_quirks.md): keep the M side of a `muladd` ≥ 16 and
+  [docs/src/cutile_design.md](docs/src/cutile_design.md): keep the M side of a `muladd` ≥ 16 and
   the N side ≥ 8 (in Julia's terms the second operand's columns and the first operand's
   rows; narrower is up to 8× slower and spills); each block-wide reduction costs ~0.15 µs
   whatever the tile, so reductions in a loop add up; blocks are always 128 threads.
 - Scalar shifts need a count of the operand's type (`x >> UInt32(16)` for a `UInt32`).
-- To check whether a rewrite changes codegen, add a probe to `bench/quirks/probes/`: it
+- To check whether a rewrite changes codegen, add a probe to `bench/codegen/probes/`: it
   compares time, registers, spills, Tile IR and SASS of equivalent kernels.
 
 ## Dependency notes

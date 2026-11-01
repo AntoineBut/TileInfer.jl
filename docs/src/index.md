@@ -41,7 +41,7 @@ the optimizations that did not pan out.
 - [History and roadmap](roadmap.md): where the project stands, the milestones that got it
   there, and what comes next.
 - [Performance log](performance.md), [Profiling](profiling.md) and
-  [cuTile quirks](cutile_quirks.md): what each optimization gained, how kernels are
+  [cuTile design choices](cutile_design.md): what each optimization gained, how kernels are
   measured, and the codegen rules learned along the way.
 - [Public API](api.md) and [Internals](internals.md): docstrings for the code itself.
 - [References](references.md): papers, engines and package sources this builds on.

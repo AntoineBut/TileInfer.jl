@@ -31,7 +31,7 @@ makedocs(;
         "Performance" => [
             "Performance log" => "performance.md",
             "Profiling" => "profiling.md",
-            "cuTile quirks" => "cutile_quirks.md",
+            "cuTile design choices" => "cutile_design.md",
         ],
         "API" => [
             "Public API" => "api.md",

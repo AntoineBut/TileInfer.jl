@@ -1,6 +1,6 @@
-# Runs the cuTile codegen probes of bench/quirks/probes (see harness.jl).
+# Runs the cuTile codegen probes of bench/codegen/probes (see harness.jl).
 #
-#   julia --project=bench bench/quirks/run.jl [NAME_FILTER...]
+#   julia --project=bench bench/codegen/run.jl [NAME_FILTER...]
 
 include("harness.jl")
 
