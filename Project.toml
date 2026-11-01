@@ -3,7 +3,7 @@ uuid = "88060c88-5af7-417f-86ab-5ff001da7709"
 version = "0.1.0"
 
 [workspace]
-projects = ["test", "bench"]
+projects = ["test", "bench", "docs"]
 
 [deps]
 BFloat16s = "ab4f0b2a-ad5b-11e8-123f-65d77653426b"

@@ -1,5 +1,5 @@
 # Probes of cuTile codegen: pairs (or more) of kernels that compute the same thing written
-# differently, measured side by side (see docs/CUTILE_QUIRKS.md). For each variant the
+# differently, measured side by side (see docs/src/cutile_quirks.md). For each variant the
 # harness reports the GPU time of its kernels (CUPTI trace: minimum and mean over the second
 # half of ~0.3 s of eager launches, after a warm-up; CUPTI times come in steps of ~0.24 µs,
 # which the mean averages out), the block size, registers and shared memory of the launch,

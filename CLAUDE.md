@@ -3,8 +3,8 @@
 A single-GPU LLM inference engine in Julia, built to learn how engines work.
 Hot kernels are written in cuTile.jl. Clear, measurable code wins over feature breadth.
 
-- Design and roadmap: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Check which milestone is current before adding features.
-- External docs, papers and local package-source paths: [docs/REFERENCES.md](docs/REFERENCES.md).
+- Design and roadmap: [docs/src/architecture.md](docs/src/architecture.md). Check which milestone is current before adding features.
+- External docs, papers and local package-source paths: [docs/src/references.md](docs/src/references.md).
   For cuTile questions, read `pkgdir(cuTile)/docs/src/man/` and `examples/` before searching the web.
 
 ## Commands
@@ -23,8 +23,8 @@ python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz
 julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~11 min
 ```
 
-Profiling workflow, model-step costs and how to read the summary: [docs/PROFILING.md](docs/PROFILING.md).
-What each milestone and optimization gained, including what did not pan out: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+Profiling workflow, model-step costs and how to read the summary: [docs/src/profiling.md](docs/src/profiling.md).
+What each milestone and optimization gained, including what did not pan out: [docs/src/performance.md](docs/src/performance.md).
 To tune a kernel, profile it before and after a change and read `ncu_summary.py --compare`
 rather than raw `ncu` output (`ncu` is in /usr/local/NVIDIA-Nsight-Compute). Take timings
 from bench/run.jl: `ncu` serializes kernels and locks clocks.
@@ -47,7 +47,7 @@ Expect ~±10 % run-to-run noise from GPU clocks; use `--seconds 2` for decisions
 Op benchmarks launch eagerly, so kernels under ~6 µs measure their launch (rmsnorm, rope,
 attention inputs, decode attention), not their GPU time. For what each kernel costs inside
 a real step (decode replayed from a graph), and its share of the step, use bench/breakdown.jl
-(see docs/PROFILING.md); decide what to optimize from it, and measure the change with run.jl.
+(see docs/src/profiling.md); decide what to optimize from it, and measure the change with run.jl.
 
 If `julia` is not on PATH, use `~/.juliaup/bin/julia`.
 `test/` and `bench/` are workspace projects that share the root `Manifest.toml`. Add
@@ -120,7 +120,7 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
   kernels as the minimum over many short trials after a warm-up, never as one averaged loop.
 - Tile shapes change codegen a lot; code layout (helpers, closures, 3-D vs 2-D reductions,
   size-1 axes) measured no difference. Measured rules, with reproducers, in
-  [docs/CUTILE_QUIRKS.md](docs/CUTILE_QUIRKS.md): keep the M side of a `muladd` ≥ 16 and
+  [docs/src/cutile_quirks.md](docs/src/cutile_quirks.md): keep the M side of a `muladd` ≥ 16 and
   the N side ≥ 8 (in Julia's terms the second operand's columns and the first operand's
   rows; narrower is up to 8× slower and spills); each block-wide reduction costs ~0.15 µs
   whatever the tile, so reductions in a loop add up; blocks are always 128 threads.
