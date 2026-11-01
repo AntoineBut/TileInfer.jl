@@ -2,6 +2,8 @@ LocalPreferences.toml
 bench/results/
 *.cov
 coverage/
-bench/ref/
+bench/ref/.venv/
+bench/ref/models/
 __pycache__/
 docs/build/
+bench/ref/results/
