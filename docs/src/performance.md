@@ -17,10 +17,13 @@ with the reason, so they are not retried blindly.
     gaps between steps disappearing; `_sampled` uses the model's recommended sampling
     (Qwen3: temperature 0.6, top-k 20, top-p 0.95), which is what `tileinfer run`/`chat` do.
   - `model/prefill{64,512}/<be>`: a 64- or 512-token prompt in one step.
-- **End-to-end race** (`bench/ref/tileinfer_race.jl`, `bench/ref/vllm_race.py`): 512-token
-  prompt, 256 greedy tokens, prefill = latency of generating 1 token, decode =
-  (256 − 1) / (latency(256) − latency(1)). Same prompt ids and the same first tokens on both
-  engines.
+- **End-to-end race** (`bench/ref/tileinfer_race.jl`, `bench/ref/vllm_race.py`, alternated by
+  `bench/ref/alternate.py`): 512-token prompt, 256 greedy tokens, prefill = latency of
+  generating 1 token, decode = (256 − 1) / (latency(256) − latency(1)), medians over trials
+  after a 1 s warm-up. Same prompt ids and the same first tokens on both engines. vLLM runs
+  from `bench/ref/.venv` (pinned in `bench/ref/requirements.txt`); `bench/ref/run_all.sh`
+  reruns the whole comparison into `bench/ref/results/<date>/`, which is not tracked (setup in
+  `bench/ref/README.md`).
 - **Kernel breakdowns**: `CUDA.@profile trace = true` over 20 generated tokens, summing
   kernel durations per name (the tracer adds ~5 % to wall time). Since 2026-10-29
   `bench/breakdown.jl` does this for decode and prefill steps of both models, per kernel role.
@@ -59,8 +62,9 @@ History on Qwen3-0.6B:
 | GEMM occupancy | 2.46 ms (sampled) | 407 | 8.8 ms | 58k | two GEMM blocks per SM on large grids (4B prefill 512: 1.06×) |
 | M7 (speculative decoding) | 2.49 ms (sampled) | 402 | 8.85 ms | 58k | plain decoding unchanged (re-measured); n-gram, draft-model, EAGLE-3, DFlash proposers and p/q verification on top |
 
-From M3: decode 15.7× faster, prefill 8.5×. Race: **418 tok/s decode, 53k tok/s prefill**,
-3.6 % faster end to end than vLLM on the same machine (see the end).
+From M3: decode 15.7× faster, prefill 8.5×. Race against vLLM on the same machine
+(2026-11-01, see "Comparison with vLLM"): **3.3 % faster end to end** on Qwen3-0.6B
+(416 vs 402 tok/s decode, 9.7 vs 10.1 ms for a 512-token prefill), a tie on Qwen3-4B.
 
 ## M4: cuTile kernels (2026-10-27)
 
@@ -161,45 +165,103 @@ Prefill GEMM tiling for few tokens, and two ideas that did not pay on the 4080S:
 
 ## Comparison with vLLM (same machine, `bench/ref`)
 
-`bench/ref/alternate.py`, 2026-10-28: 3 rounds alternating the engines (ABBA order), each a
-fresh process recording 10 trials of each latency after a warm-up; 30 trials per engine
-pooled. 512-token prompt, 256 greedy tokens, the same first tokens on both engines. Medians
-are the primary statistic (timings are heavy-tailed), with the interquartile range.
+Setup of every run below (2026-11-01): RTX 4080 SUPER, which also drove the desktop
+(compositor, VS Code and Discord on the GPU); TileInfer at commit 8528c2e on Julia 1.13.3;
+vLLM 0.31.0 with torch 2.13.0 (`bench/ref/requirements.txt`) with CUDA graphs and
+torch.compile; BF16 unless noted, prefix caching off and one sequence at a time.
 
-| Median [q1, q3] | vLLM 0.31 (CUDA graphs + torch.compile) | TileInfer perf branch | |
-|---|---|---|---|
-| **End to end** (latency of 256 tokens) | **0.6432 s** [0.6428, 0.6437] | **0.6200 s** [0.6196, 0.6202] | **3.6 % faster** |
-| 1-token request ("prefill") | 25.4 ms [24.7, 41.5] | 9.77 ms [9.74, 10.05] | |
-| Decode = (e2e − 1-token) / 255 | 2.42 ms/tok (413 tok/s) | 2.39 ms/tok (418 tok/s) | |
+`bench/ref/alternate.py`: 3 rounds alternating the engines
+(ABBA order), each a fresh process that warms up for 1 s, then records 10 trials of each
+latency; 30 trials per engine pooled. 512-token prompt, 256 greedy tokens, the same first
+tokens on both engines. Medians are the primary statistic (timings are heavy-tailed), with
+the interquartile range.
 
-End to end is the robust comparison. vLLM's 1-token latency is multimodal, with clusters at
-~11, ~25 and ~40–47 ms within the same process (sorted trials of one run: 10.8, 11.0, 11.1,
-11.1, 11.5, 28.4, 46.8, 47.2, 47.5, 47.9 ms), while its 256-token latency varies by under
-1 ms. So the extra 15–35 ms are per-request overhead that the 256-token request does not pay
-in full, not prefill compute. Its fast mode (~11 ms) is the best estimate of vLLM's prefill,
-so the subtraction above overstates its decode speed: with 11 ms, vLLM decodes at 2.48 ms/tok
-(403 tok/s), as in the earlier 10-trial runs that hit the fast mode. TileInfer's timings are
-unimodal (prefill IQR 0.3 ms).
+| Median [q1, q3] | Qwen3-0.6B: vLLM | Qwen3-0.6B: TileInfer | Qwen3-4B: vLLM | Qwen3-4B: TileInfer |
+|---|---|---|---|---|
+| **End to end** (latency of 256 tokens) | **0.6439 s** [0.6419, 0.6476] | **0.6227 s** [0.6203, 0.6263] | **3.328 s** [3.296, 3.350] | **3.309 s** [3.300, 3.318] |
+| 1-token request ("prefill") | 10.1 ms [9.9, 10.3] | 9.7 ms [9.6, 12.8] | 46.6 ms [45.5, 46.8] | 47.0 ms [45.4, 49.0] |
+| Decode = (e2e − 1-token) / 255 | 2.49 ms/tok (402 tok/s) | 2.40 ms/tok (416 tok/s) | 12.87 ms/tok (77.7 tok/s) | 12.79 ms/tok (78.2 tok/s) |
 
-Earlier single runs: vLLM `--eager` 172 tok/s decode / 39k tok/s prefill; TileInfer M6
-343 tok/s / 40k tok/s (e2e 0.755 s).
+On 0.6B TileInfer is **3.3 % faster end to end** (3.6 % on 2026-10-28), from fewer, fused
+kernels per step. On 4B the engines tie: TileInfer's median is 0.6 % lower, but vLLM's
+fastest round matches it (minimum 3.295 s vs 3.299 s), and both decode at ~87 % of the
+bandwidth roofline (8.1 GB of weights and KV per token ≈ 11.1 ms, 90 tok/s), where the
+per-kernel overheads that separate them at 0.6B are small next to 220 MB of weights per
+layer. The 4B prefill gap of 2026-10-28 (53.2 vs 48.0 ms, ≈ 10 %, from GEMMs at 0.87–0.92×
+cuBLAS) is closed, by the GEMM occupancy change and the per-shape tiles since.
 
-### Qwen3-4B (2026-10-28)
+**Warm the GPU before timing short requests.** Until 2026-10-31 the race warmed up with a
+single request. The GPU then runs the first ~0.2 s at 900–1,600 MHz instead of 2,775 MHz,
+so a 10 ms request took 16–40 ms; the 256-token request lasts long enough to ramp the
+clock and was not affected. That is what the 2026-10-28 run took for vLLM per-request
+overhead (1-token clusters at ~11, ~25 and ~45 ms); with the 1 s warm-up its 1-token
+latency is unimodal. On 0.6B the same change moved TileInfer's 1-token median from 27.8 to
+9.7 ms and vLLM's from 31.8 to 10.1 ms (the same race,
+run before the change).
 
-Same protocol (`alternate.py --model Qwen/Qwen3-4B`, 30 trials per engine), the first run of
-TileInfer on this model: no kernel changes, and the same first tokens as vLLM.
+TileInfer has 1–3 slow 1-token trials per process (20–70 ms, and one of 200–250 ms in
+every run, on both models), which widen its q3; vLLM has none. A traced repeat showed one
+such trial spending 31 ms in GC and 37 ms compiling, so they are host-side pauses in Julia,
+not GPU time.
 
-| Median [q1, q3] | vLLM 0.31 | TileInfer perf branch | |
-|---|---|---|---|
-| **End to end** (latency of 256 tokens) | **3.3013 s** [3.3008, 3.3019] | **3.3062 s** [3.3061, 3.3068] | 0.15 % slower |
-| 1-token request ("prefill") | 48.0 ms [46.7, 50.4] | 53.2 ms [49.7, 57.8] | ≈ 10 % slower |
-| Decode = (e2e − 1-token) / 255 | 12.76 ms/tok (78.4 tok/s) | 12.76 ms/tok (78.4 tok/s) | tie |
+Earlier runs (2026-10-28, single warm-up request): 0.6B e2e 0.6200 s vs vLLM 0.6432 s,
+4B 3.3062 s vs 3.3013 s, prefill 53.2 vs 48.0 ms. Single runs before that: vLLM `--eager`
+172 tok/s decode / 39k tok/s prefill; TileInfer M6 343 tok/s / 40k tok/s (e2e 0.755 s).
 
-At 4B both engines decode at ~87 % of the bandwidth roofline (8.1 GB of weights and KV per
-token ≈ 11.1 ms, 90 tok/s): the per-kernel overheads that separated them at 0.6B are small
-next to 220 MB of weights per layer. Prefill is compute-bound here, where TileInfer's GEMM
-is the gap (0.87–0.92× cuBLAS at n = 512, measured in "Two models" below); its prefill also
-has a wider spread (one run at 58 ms).
+### With INT8 and speculative decoding (2026-11-01)
+
+**INT8.** TileInfer's `quantize = :int8` against the same quantization in vLLM: a W8A16
+compressed-tensors copy of each checkpoint (`bench/ref/make_w8a16.py`: TileInfer's per-channel
+scales `max |W| / 127`, every linear and the untied `lm_head`; the embedding stays in BF16),
+which vLLM runs with its Marlin kernels. INT8 KV is TileInfer's `Int8Pages` against vLLM's
+`kv_cache_dtype = int8_per_token_head`, which moves vLLM to its Triton attention backend.
+Same race (`alternate.py --weights int8 --kv int8`), e2e medians over 30 trials per engine:
+
+| Latency of 256 tokens | 0.6B vLLM | 0.6B TileInfer | 4B vLLM | 4B TileInfer |
+|---|---|---|---|---|
+| BF16 (above) | 0.644 s | **0.623 s** (−3.3 %) | 3.328 s | 3.309 s (tie) |
+| INT8 weights | 0.532 s | **0.503 s** (−5.5 %) | 1.880 s | 1.884 s (tie) |
+| INT8 KV | 0.622 s | 0.625 s (tie) | **3.264 s** | 3.307 s (+1.3 %) |
+| INT8 weights + KV | 0.474 s | 0.470 s (tie) | **1.837 s** | 1.871 s (+1.8 %) |
+
+Decode with both: 553 vs 555 tok/s on 0.6B, 143 vs 140 tok/s on 4B. vLLM gains more from
+INT8 KV than the KV bytes explain (0.6B: −11 % against TileInfer's −6.6 %), probably from the
+backend switch; not profiled. With INT8 weights the first tokens can differ between the
+engines (vLLM stores the scales in BF16, TileInfer in Float32).
+
+**Speculative decoding, best configuration per engine.** `bench/ref/tileinfer_spec.jl` and
+`bench/ref/vllm_spec.py` on `bench/speculative.jl`'s six chat prompts (token ids exported by
+`bench/ref/spec_prompts.jl`, so both engines get the same tokens), greedy, up to 256 tokens
+stopping at EOS, median of 5 trials after a 1 s warm-up; decode = (n − 1) / (latency(n) −
+latency(1)). Each engine ran plain, DFlash k = 7 and k = 15 (4B), n-gram k = 4 (0.6B), each in
+BF16 and with INT8 weights + KV; the table keeps each engine's fastest per prompt. On 4B
+it is DFlash k = 15 with INT8 for both engines, except TileInfer's k = 7 on long-explain.
+
+| Qwen3-4B | vLLM tok/s (× its BF16 plain) | TileInfer tok/s (× its BF16 plain) | TileInfer / vLLM | tokens per step vLLM / TileInfer |
+|---|---|---|---|---|
+| rename | 1,150 (14.7×) | 947 (12.2×) | 0.82 | 11.0 / 10.0 |
+| document | 385 (4.9×) | 379 (4.9×) | 0.98 | 3.9 / 4.0 |
+| explain | 322 (4.1×) | 290 (3.7×) | 0.90 | 3.2 / 3.0 |
+| story | 255 (3.2×) | 219 (2.8×) | 0.86 | 2.5 / 2.3 |
+| long-edit (2.2k) | 494 (6.5×) | **698 (9.2×)** | **1.41** | 8.0 / 8.3 |
+| long-explain (2.2k) | 158 (2.1×) | **270 (3.5×)** | **1.70** | 2.6 / 3.0 |
+
+Acceptance is about the same on both engines, so the differences are step costs. On short
+prompts vLLM's DFlash steps are cheaper: in BF16 on rename both take 10 steps for 110 tokens,
+at 731 vs 558 tok/s (TileInfer's step is ~3.2 ms drafting + 13.3 ms verifying 16 tokens, see
+"DFlash drafting"), and its plain INT8 decode is ~4 % faster at these short contexts (145 vs
+139 tok/s; a tie at 768 positions in the race). At 2.2k positions vLLM's DFlash gains little
+(long-explain: 158 tok/s against 134 plain), while TileInfer's keeps its speedup; where vLLM
+loses that time is not profiled.
+
+On Qwen3-0.6B (no DFlash drafter) the comparison is noisier: with INT8, greedy replies differ
+in length between the engines on two prompts, and TileInfer's reply to long-edit ends after
+5 tokens. Where the replies match: n-gram helps TileInfer most on copying (rename: 1,725 vs
+1,236 tok/s, n-gram + INT8 on both), vLLM's plain INT8 decode is 7 % faster at short contexts
+(606 vs 563 tok/s on explain), and on long-explain TileInfer's n-gram + INT8 reaches 588 tok/s
+against vLLM's best of 469 (plain INT8). vLLM's n-gram slows open text down (story, BF16: 298
+tok/s against 405 plain), TileInfer's is neutral there (413 vs 428). vLLM counts only the steps
+that had drafts, so its n-gram tokens per step are not comparable and are left out.
 
 ## Two models in the benchmark suite (2026-10-29)
 
@@ -259,7 +321,7 @@ halves them). Attention is latency-bound at 38 % of DRAM for both (one page per 
 
 - **At n = 512 every GEMM is behind cuBLAS** (82–105 TFLOP/s for cuBLAS on 4B vs 72–96 for
   ours). On 4B the four GEMMs are 1,188 µs per layer, 42.8 ms of the 47.6 ms prefill; at
-  cuBLAS speed they would be 37.8 ms, which is the ~10 % prefill gap to vLLM in the race.
+  cuBLAS speed they would be 37.8 ms, which was the ~10 % prefill gap to vLLM in the 2026-10-28 race.
 - **0.6B down at n = 512 (0.77×)**: `gemm_config` picks 64 × 128 tiles, i.e. 64 blocks for
   80 SMs, each looping over K = 3,072. An under-filled GPU with a long K loop is the case
   where split-K (or stream-K) pays, unlike the n ≤ 64 shapes where split-K lost (see "Per-shape GEMM tiles").
