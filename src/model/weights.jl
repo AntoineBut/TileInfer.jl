@@ -6,7 +6,6 @@
 struct LayerWeights{T,M,V<:AbstractVector{T}}
     attn_norm::V                 # (hidden,)
     wqkv::M                      # (hidden, (heads + 2 kv_heads) * head_dim): q | k | v columns
-    bqkv::Union{Nothing,V}       # ((heads + 2 kv_heads) * head_dim,), Qwen2 only
     q_norm::Union{Nothing,V}     # (head_dim,), Qwen3 only
     k_norm::Union{Nothing,V}     # (head_dim,), Qwen3 only
     wo::M                        # (heads * head_dim, hidden)

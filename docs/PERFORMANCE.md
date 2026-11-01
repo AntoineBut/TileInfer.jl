@@ -476,6 +476,9 @@ does; combine both proposers (n-gram when it matches, the draft otherwise).
 
 ## EAGLE-3 drafting (2026-10-29)
 
+*Removed on 2026-11-01: DFlash (next section) beats it on every prompt, and its tests cost
+~36 s. The numbers below are kept as the record of a chained drafter on hidden states.*
+
 `Eagle3Proposer(load_eagle3("AngelSlim/Qwen3-4B_eagle3", target); k)`: target steps keep
 the residual stream after layers 2, 18 and 33 (`enable_aux!`, three strided copies per
 step); the drafter's one Llama layer reads [norm(embed(next token)); norm(fc(those states))]

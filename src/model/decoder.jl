@@ -1,4 +1,4 @@
-# Llama-style decoder (Llama 3, Mistral, Qwen2, Qwen3, Apertus) as plain structs plus an explicit
+# Llama-style decoder (Llama 3, Mistral, Qwen3, Apertus) as plain structs plus an explicit
 # forward pass over backend ops. Per-family differences are ModelConfig flags.
 
 """
@@ -53,7 +53,7 @@ Device memory for one forward step of `n` tokens: the step's inputs (token ids, 
 cache slots and a block table long enough for every page of the pool), every intermediate
 activation, and the logits of the last token, or of all tokens with `all_logits`. With
 `aux_layers`, the step also keeps the residual stream after each of those layers (1-based),
-stacked in `aux`, for an EAGLE drafter (see [`Eagle3Proposer`](@ref)). A step
+stacked in `aux`, for a DFlash drafter (see [`DFlashProposer`](@ref)). A step
 that only writes into these buffers allocates nothing, so on a backend that
 [`supports_graphs`](@ref) it can be captured in a CUDA graph and replayed (see
 [`ModelRunner`](@ref)).
@@ -163,7 +163,6 @@ function run_step!(model::DecoderLM{T}, cache::PagedKVCache{T}, b::StepBuffers{T
     rmsnorm!(be, b.h, b.x, first(w.layers).attn_norm, eps)
     for (l, layer) in enumerate(w.layers)
         linear!(be, b.qkv, layer.wqkv, b.h)
-        layer.bqkv === nothing || (b.qkv .+= layer.bqkv)
         attention_inputs!(be, b.q, cache.k[l], cache.v[l], b.qkv, layer.q_norm, layer.k_norm, model.rope,
                           b.positions, b.slots, eps)
         attention!(be, b.attn, b.attn_workspace, b.q, cache.k[l], cache.v[l], b.block_table,

@@ -1,15 +1,16 @@
 # Speculative decoding on real chat prompts: plain decoding (pipelined) against n-gram lookup,
-# a draft model, an EAGLE-3 drafter and a DFlash drafter, for several draft lengths k
+# a draft model and a DFlash drafter, for several draft lengths k
 # (DFlash also with its whole block). Acceptance depends on the text, so unlike
 # bench/run.jl this generates replies to fixed prompts, from one that copies its input to
 # open-ended ones. The two "long-" prompts work on a ~2.2k-token document (a frozen copy of
 # src/engine/runner.jl in bench/prompts/), where attention over the context weighs more.
 #
-#   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--eagle REPO|none]
-#       [--dflash REPO|none] [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled [--pq]] [--filter REGEX]
+#   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--dflash REPO|none]
+#       [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled [--pq]] [--filter REGEX]
 #
-# Defaults: Qwen/Qwen3-4B drafted by Qwen/Qwen3-0.6B, AngelSlim/Qwen3-4B_eagle3 and
-# z-lab/Qwen3-4B-DFlash-b16 (the last two for Qwen3-4B; none otherwise), k = 2, 4, 7,
+# Defaults: Qwen/Qwen3-4B drafted by n-gram lookup and z-lab/Qwen3-4B-DFlash-b16 (for
+# Qwen3-4B; none otherwise), k = 2, 4, 7; a draft model only with --draft (Qwen/Qwen3-0.6B
+# for Qwen3-4B),
 # 256 new tokens, greedy
 # (--sampled: the model's recommended sampling, same seed for every method; --pq: the model
 # proposers sample their drafts too, verified by the p/q rule). Decode tok/s
@@ -22,8 +23,8 @@ using CUDA
 using Printf: @printf, @sprintf
 using Random: Xoshiro
 using TileInfer
-using TileInfer: ChatMessage, DecoderLM, DFlashProposer, DraftProposer, Eagle3Proposer, NgramProposer, SpecStats,
-                 chat_prompt, encode, generation_defaults, load_dflash, load_eagle3, load_tokenizer, model_dir
+using TileInfer: ChatMessage, DecoderLM, DFlashProposer, DraftProposer, NgramProposer, SpecStats,
+                 chat_prompt, encode, generation_defaults, load_dflash, load_tokenizer, model_dir
 
 const CODE = """
 function rmsnorm!(y, x, w, eps)
@@ -55,8 +56,7 @@ const PROMPTS = [
 function main(args)
     _, opts = TileInfer.parse_args(args; flags = ("sampled", "pq"))
     target_name = get(opts, "model", "Qwen/Qwen3-4B")
-    draft_name = get(opts, "draft", "Qwen/Qwen3-0.6B")
-    eagle_name = get(opts, "eagle", target_name == "Qwen/Qwen3-4B" ? "AngelSlim/Qwen3-4B_eagle3" : "none")
+    draft_name = get(opts, "draft", "none")
     dflash_name = get(opts, "dflash", target_name == "Qwen/Qwen3-4B" ? "z-lab/Qwen3-4B-DFlash-b16" : "none")
     ks = parse.(Int, split(get(opts, "k", "2,4,7"), ','))
     n = parse(Int, get(opts, "tokens", "256"))
@@ -76,13 +76,10 @@ function main(args)
     defaults, stop_ids = generation_defaults(dir, target.config)
     sampling = haskey(opts, "sampled") ? defaults : TileInfer.SamplingParams()
     runner = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
-    # EAGLE and DFlash make the target's steps keep hidden states (of different layers): a
-    # runner of their own each keeps the others' steps as they are.
-    aux_runner() = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
-    eagle = eagle_name == "none" ? nothing : load_eagle3(eagle_name, target; max_len = max_tokens)
-    eagle_runner = eagle === nothing ? nothing : aux_runner()
+    # DFlash makes the target's steps keep hidden states: a runner of its own keeps the other
+    # methods' steps as they are.
     dflash = dflash_name == "none" ? nothing : load_dflash(dflash_name, target; max_len = max_tokens)
-    dflash_runner = dflash === nothing ? nothing : aux_runner()
+    dflash_runner = dflash === nothing ? nothing : TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
 
     methods = Tuple{String,Any,Any}[("plain", nothing, runner)]
     sample = haskey(opts, "pq")
@@ -92,8 +89,6 @@ function main(args)
         push!(methods, ("ngram k=$k", NgramProposer(; k), runner))
         draft === nothing ||
             push!(methods, ("draft$pq k=$k", DraftProposer(draft; k, sample, max_tokens), runner))
-        eagle === nothing ||
-            push!(methods, ("eagle$pq k=$k", Eagle3Proposer(eagle; k, sample, max_tokens), eagle_runner))
     end
     if dflash !== nothing
         for k in unique!([[k for k in ks if k < dflash.block_size]; dflash.block_size - 1])
@@ -101,7 +96,7 @@ function main(args)
         end
     end
 
-    println("target $target_name, draft $draft_name, EAGLE-3 $eagle_name, DFlash $dflash_name, ",
+    println("target $target_name, draft $draft_name, DFlash $dflash_name, ",
             sampling.temperature == 0 ? "greedy" : "sampled $sampling", sample ? ", sampled drafts" : "",
             ", $n tokens, best of $trials")
     @printf("%-12s %6s %-14s %8s %7s %11s %6s %6s %8s %11s\n", "prompt", "len", "method", "tok/s", "speedup",

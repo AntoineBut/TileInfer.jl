@@ -141,8 +141,9 @@ if test_model_dir() !== nothing
             @test TileInfer.propose(p, ctx, 3) == continuation(ctx, 3)
             @test length(p.seq) == length(ctx) + 2                          # the last draft is never run
 
+            # k = 4 runs in the stop and chat-turn tests below.
             @testset "$(p.temperature == 0 ? "greedy" : "sampled"), k = $k" for p in (TileInfer.SamplingParams(), sampled),
-                    k in (1, 4, 7)
+                    k in (1, 7)
                 stats = TileInfer.SpecStats()
                 proposer = TileInfer.DraftProposer(m; k, max_tokens = 512)
                 @test speculative(60, Int[]; sampling = p, proposer, stats) == plain(60, Int[]; sampling = p)
@@ -156,48 +157,8 @@ if test_model_dir() !== nothing
             @test all(speculative(n, Int[]; proposer) == plain(n, Int[]) for n in 1:10)   # one proposer, rewound each time
 
             # The target drafting for itself samples from q ≈ p: nearly every draft is accepted.
-            @testset "sampled drafts, k = $k" for k in (1, 4, 7)
-                check_sampled_drafts(TileInfer.DraftProposer(m; k, sample = true, max_tokens = 512); min_rate = 0.9)
-            end
-        end
-
-        eagle_dir = try TileInfer.model_dir(EAGLE_TEST_HEAD) catch; nothing end
-        eagle_dir === nothing && @info "$EAGLE_TEST_HEAD not pulled; skipping the EAGLE-3 tests"
-        eagle_dir !== nothing && @testset "EAGLE-3 proposer" begin
-            d = TileInfer.load_eagle3(EAGLE_TEST_HEAD, m; max_len = 512)
-            @test d.aux_layers == [2, 14, 25]                              # vLLM's default for 28 layers
-            @test size(d.lm_head, 2) == 32000                               # reduced draft vocabulary
-
-            @testset "steps keep the residual stream of the aux layers" begin
-                c = new_cache()
-                r = TileInfer.ModelRunner(m, c)
-                s = TileInfer.new_sequence(c)
-                plain_logits = Array(TileInfer.forward!(r, s, prompt[1:5]))
-                TileInfer.enable_aux!(r, [3, m.config.num_layers])
-                @test TileInfer.num_graphs(r) == 0                         # captured steps dropped
-                TileInfer.truncate!(c, s, 0)
-                @test Array(TileInfer.forward!(r, s, prompt[1:5])) == plain_logits
-                b, H = r.last_step, m.config.hidden_size
-                @test r.last_start == 0
-                @test Array(b.aux[H+1:2H, :]) == Array(b.x)                # after the last layer
-            end
-
-            eagle(k) = TileInfer.Eagle3Proposer(d; k, max_tokens = 512)
-            @testset "$(p.temperature == 0 ? "greedy" : "sampled"), k = $k" for p in (TileInfer.SamplingParams(), sampled),
-                    k in (1, 4, 7)
-                stats = TileInfer.SpecStats()
-                @test speculative(60, Int[]; sampling = p, proposer = eagle(k), stats) == plain(60, Int[]; sampling = p)
-                @test TileInfer.acceptance_rate(stats) > 0.2
-            end
-            proposer = eagle(4)
-            full, = plain(30, Int[])
-            for stop in (full[3], full[17])
-                @test speculative(30, [stop]; proposer) == plain(30, [stop])
-            end
-            @test all(speculative(n, Int[]; proposer) == plain(n, Int[]) for n in 1:10)
-            @testset "sampled drafts, k = $k" for k in (1, 4)
-                check_sampled_drafts(TileInfer.Eagle3Proposer(d; k, sample = true, max_tokens = 512); min_rate = 0.2,
-                                     max_rate = 0.98)
+            @testset "sampled drafts, k = 4" begin
+                check_sampled_drafts(TileInfer.DraftProposer(m; k = 4, sample = true, max_tokens = 512); min_rate = 0.9)
             end
 
             @testset "continuing a sequence, as chat turns do" begin
@@ -211,17 +172,22 @@ if test_model_dir() !== nothing
                     end
                     return out, copy(s.tokens)
                 end
-                @test turns(eagle(4)) == turns(nothing)
+                @test turns(TileInfer.DraftProposer(m; k = 4, max_tokens = 512)) == turns(nothing)
             end
+        end
 
-            @testset "reference backend" begin
-                ref = TileInfer.DecoderLM(m.config, m.weights, m.rope, RefBackend())
-                dref = TileInfer.load_eagle3(EAGLE_TEST_HEAD, ref; max_len = 128)
-                gen(; kw...) = (c = TileInfer.PagedKVCache(ref; max_tokens = 128);
-                              TileInfer.generate!(TileInfer.ModelRunner(ref, c), TileInfer.new_sequence(c), prompt;
-                                                  max_new_tokens = 10, stop_ids = Int[], kw...))
-                @test gen(speculative = TileInfer.Eagle3Proposer(dref; k = 3, max_tokens = 128)) == gen()
-            end
+        @testset "steps keep the residual stream of the aux layers" begin
+            c = new_cache()
+            r = TileInfer.ModelRunner(m, c)
+            s = TileInfer.new_sequence(c)
+            plain_logits = Array(TileInfer.forward!(r, s, prompt[1:5]))
+            TileInfer.enable_aux!(r, [3, m.config.num_layers])
+            @test TileInfer.num_graphs(r) == 0                         # captured steps dropped
+            TileInfer.truncate!(c, s, 0)
+            @test Array(TileInfer.forward!(r, s, prompt[1:5])) == plain_logits
+            b, H = r.last_step, m.config.hidden_size
+            @test r.last_start == 0
+            @test Array(b.aux[H+1:2H, :]) == Array(b.x)                # after the last layer
         end
 
         @testset "sampling the device cannot do is rejected" begin

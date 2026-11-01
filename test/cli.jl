@@ -48,7 +48,6 @@ end
         @test occursin("4 generated", err)
         # Speculative decoding, by n-gram lookup and with the model drafting for itself.
         specs = [("--speculate", "3"), ("--draft", TEST_MODEL)]
-        try TileInfer.model_dir(EAGLE_TEST_HEAD); push!(specs, ("--eagle", EAGLE_TEST_HEAD)) catch end
         for spec in specs
             code, out, err = run_cli("run", TEST_MODEL, "The capital of France is", "--raw",
                                      "--temperature", "0", "--max-tokens", "12", "--max-context", "256", spec...)
@@ -66,6 +65,6 @@ end
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--speculate", "8")
         @test code == 1 && occursin("--speculate expects 1 to 7", err)
         code, _, err = run_cli("run", TEST_MODEL, "hi", "--draft", TEST_MODEL, "--dflash", TEST_MODEL)
-        @test code == 1 && occursin("only one of --draft, --eagle and --dflash", err)
+        @test code == 1 && occursin("only one of --draft and --dflash", err)
     end
 end

@@ -5,8 +5,9 @@ written in cuTile.jl. The goal is to learn how the engine works, so the code
 favours being clear and easy to instrument over supporting many features.
 
 Status (2026-10-30): M0–M7 done, and the first M8 fusions. M7 (speculative decoding): verifier
-(greedy and sampled), n-gram, draft-model, EAGLE-3 and DFlash proposers, `--speculate` / `--draft` /
-`--eagle` / `--dflash` and `bench/speculative.jl`; adaptive k is a later option.
+(greedy and sampled), n-gram, draft-model and DFlash proposers, `--speculate` / `--draft` /
+`--dflash` and `bench/speculative.jl`; adaptive k is a later option. An EAGLE-3 proposer was built
+and removed on 2026-11-01: DFlash beat it on every prompt (see PERFORMANCE.md).
 Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB). Benchmarked on Qwen3-0.6B and Qwen3-4B.
 External documentation and papers are listed in [REFERENCES.md](REFERENCES.md).
 
@@ -51,7 +52,7 @@ External documentation and papers are listed in [REFERENCES.md](REFERENCES.md).
 │ ModelRunner  builds InputMetadata, owns static buffers, CUDA graphs      │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ Model  DecoderLM{T}: Embedding → N × DecoderLayer → RMSNorm → LMHead     │
-│   (Llama 3 / Qwen2.5 / Qwen3 / Mistral selected by config flags)         │
+│   (Llama 3 / Qwen3 / Mistral / Apertus selected by config flags)         │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ Ops (backend-dispatched)                                                 │
 │   RefBackend  : CUDA.jl broadcast + cuBLAS (+ CPU for tests)             │
@@ -114,7 +115,6 @@ TileInfer/
 │   │   ├── generate.jl         # generate!, generation defaults, TextStream
 │   │   ├── chat.jl             # ChatSession with prefix reuse
 │   │   ├── speculative.jl      # n-gram and draft-model proposers, verify step (device sampling per position), speculative generate (M7)
-│   │   ├── eagle.jl            # EAGLE-3 drafter (one layer on the target's hidden states) and its proposer
 │   │   └── dflash.jl           # DFlash drafter (a block of drafts in one non-causal pass) and its proposer
 │   ├── ops/
 │   │   ├── interface.jl        # abstract backend + op signatures, fused-op fallbacks
@@ -163,14 +163,13 @@ also what cuTile.jl's FMHA example does):
 One generic `DecoderLM{T}` covers the Llama-style family. Per-family
 differences are config flags:
 
-| Flag                  | Llama 3.x | Qwen2.5 | Qwen3 | Mistral | Apertus |
-|-----------------------|-----------|---------|-------|---------|---------|
-| QKV bias              |           | ✓       |       |         |         |
-| q/k RMSNorm           |           |         | ✓     |         | ✓       |
-| MLP                   | SwiGLU    | SwiGLU  | SwiGLU | SwiGLU | xIELU, ungated |
-| tied embeddings       | small     | small   | small |         |         |
-| RoPE scaling          | llama3    | (yarn)  |       |         | llama3  |
-| sliding window        |           |         |       | (v0.1)  |         |
+| Flag                  | Llama 3.x | Qwen3 | Mistral | Apertus |
+|-----------------------|-----------|-------|---------|---------|
+| q/k RMSNorm           |           | ✓     |         | ✓       |
+| MLP                   | SwiGLU    | SwiGLU | SwiGLU | xIELU, ungated |
+| tied embeddings       | small     | small |         |         |
+| RoPE scaling          | llama3    |       |         | llama3  |
+| sliding window        |           |       | (v0.1)  |         |
 
 Apertus (swiss-ai) uses xIELU, an activation with learned scalars per layer
 (`up → xIELU → down`, no gate projection). Apertus 1.5 is multimodal, so only its decoder
@@ -313,11 +312,12 @@ Build it in stages. Each stage reuses the verifier.
 3. **Draft-model proposer**: Qwen3-0.6B drafting for Qwen3-4B. It has its own
    `DecoderLM` and its own `PagedKVCache` but shares the `BlockManager` logic. The k
    draft steps form a natural CUDA graph.
-4. **EAGLE-3 drafter** (`src/engine/eagle.jl`): one layer reading the residual
-   stream of three target layers, which the target's steps keep (`enable_aux!`);
-   drafts chained one token at a time like the draft model.
+4. **EAGLE-3 drafter** (removed 2026-11-01, see PERFORMANCE.md): one layer reading the
+   residual stream of three target layers, drafts chained one token at a time like the
+   draft model. DFlash, which reads the same kind of states, beat it on every prompt.
 5. **DFlash drafter** (`src/engine/dflash.jl`): five Qwen3 layers whose keys and
-   values for context positions come from five target layers' states, and a block
+   values for context positions come from five target layers' states (which the
+   target's steps keep, `enable_aux!`), and a block
    of [next token, 15 masks] attending without the causal mask (`attention(…;
    causal = false)`), so one pass drafts 15 tokens; verify steps take up to 16.
 6. Later: dynamic k based on acceptance rate (DeepInfer's scheduler adapts using
@@ -417,7 +417,7 @@ Versions are as of 2026-10-26, checked against the repos.
 
 | Milestone | Deliverable | Success criterion |
 |-----------|-------------|-------------------|
-| M0 ✅ | Julia + CUDA.jl + cuTile.jl installed; run `examples/fmha.jl`, `matmul.jl` on the 4080S; CUDA-graph capture spike with a cuTile kernel | done 2026-10-26: `test/smoke/` 21/21 pass, `bench/m0_launch_overhead.jl` |
+| M0 ✅ | Julia + CUDA.jl + cuTile.jl installed; run `examples/fmha.jl`, `matmul.jl` on the 4080S; CUDA-graph capture spike with a cuTile kernel | done 2026-10-26: `test/smoke/` 21/21 pass, launch overhead measured (spike removed 2026-11-01) |
 | M1 ✅ | `pull/ls/rm`; config + safetensors loader; tokenizer (+ tests vs Python) | done 2026-10-26: own byte-level BPE matches HF `tokenizers` on the fixture corpus; Qwen3 chat template matches its Jinja template; weights load (fused qkv / gate_up, tied lm_head) in 0.17 s from page cache |
 | M2 ✅ | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | done 2026-10-26: Float32 logits match HF to ~1e-4 with identical 24-token greedy continuations; BF16 within 0.625 (≈5 ulps), top-1 equal except one exact tie; `tileinfer run` streams text at ~27–29 tok/s decode (Qwen3-0.6B, reference path, ≈5 % of the roofline), first token after ~13 s in a fresh process (JIT) |
 | M3 ✅ | Paged KV + BlockManager; `chat` with multi-turn | done 2026-10-26: paged reference path matches the HF Float32 fixtures (also with 4-position, fragmented pages); `tileinfer chat` reuses the cached common prefix across turns, and a reply with reuse equals a fresh run on the full prompt; decode ~20 tok/s (the reference attention gathers every page of the sequence at each step) |

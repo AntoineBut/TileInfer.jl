@@ -29,9 +29,9 @@ RMS-normalize `x` along its first dimension and scale by `w`; `x` is (hidden, to
 function rmsnorm end
 
 """
-    linear(backend, W, x, bias = nothing) -> (out, tokens)
+    linear(backend, W, x) -> (out, tokens)
 
-`Wᵀx (+ bias)` for a weight stored (in, out).
+`Wᵀx` for a weight stored (in, out).
 """
 function linear end
 
@@ -230,27 +230,6 @@ function accept_token!(::Backend, ids, mirror, logits, s, draft, (q_ids, q_probs
     copyto!(mirror, token)
     copyto!(s.state, UInt32[state[1], state[2], state[3] + 1])
     return ids
-end
-
-"""
-    map_token!(backend, ids, mirror, offsets)
-
-Map the 0-based token `ids[1]` of a reduced vocabulary to `ids[1] + offsets[ids[1] + 1]`, into
-`ids[1]` and `mirror[1]`: an EAGLE drafter's token to the target's (its `d2t` table).
-"""
-function map_token!(::Backend, ids, mirror, offsets)
-    id = Int(Array(ids)[1])
-    token = Int32[id + Array(offsets)[id+1]]
-    copyto!(ids, token)
-    copyto!(mirror, token)
-    return ids
-end
-
-# With the distribution the token was sampled from, whose ids are mapped too.
-function map_token!(be::Backend, ids, mirror, offsets, (q_ids, _))
-    q, off = Array(q_ids), Array(offsets)
-    copyto!(q_ids, [t < 0 ? t : t + off[t+1] for t in q])
-    return map_token!(be, ids, mirror, offsets)
 end
 
 """

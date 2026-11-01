@@ -187,7 +187,8 @@ end
 end
 
 # The real Apertus 1.5 8B in INT8 (it needs 16.1 GB in BFloat16) against transformers' Float32
-# run on the CPU (scripts/gen_apertus_fixtures.py real <model_dir>), when it is pulled: the
+# run on the CPU (scripts/gen_apertus_fixtures.py real <model_dir>), with TILEINFER_TEST_8B=1
+# and when it is pulled (the tiny random Apertus above covers the architecture): the
 # chat prompt tokenizes to the same ids, and argmax changes only at near-ties (measured:
 # 2 of 103 positions, at margins 0.2 and 0.02; greedy continuations were identical).
 function test_apertus_8b(dir)
@@ -209,7 +210,7 @@ function test_apertus_8b(dir)
     end
 end
 
-let dir = test_model_dir(APERTUS_TEST_MODEL)
+let dir = get(ENV, "TILEINFER_TEST_8B", "") == "1" ? test_model_dir(APERTUS_TEST_MODEL) : nothing
     if dir !== nothing
         @testset "Apertus 1.5 8B (int8) vs transformers" begin
             test_apertus_8b(dir)

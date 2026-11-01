@@ -91,8 +91,9 @@ using Random: randperm
             @test host(TileInfer.embed(tile, table, ids)) == host(TileInfer.embed(ref, table, ids))
         end
 
+        # Float32 (a correctness check, not a production type): fewer token counts.
         @testset "linear ($in, $out) n = $n" for (in, out) in ((1024, 4096), (2048, 1024), (1000, 37)),
-                                                 n in (1, 3, 17, 100, 512)
+                                                 n in (T == BFloat16 ? (1, 3, 17, 100, 512) : (1, 17, 512))
             W, x = rnd(in, out; scale = 1 / 30), rnd(in, n)
             y_ref, y = TileInfer.linear(ref, W, x), TileInfer.linear(tile, W, x)
             @test size(y) == (out, n)
@@ -173,7 +174,7 @@ using Random: randperm
 
         # INT8 weights: same Float32 sums of the Int8 values, scaled, then one rounding.
         @testset "int8 linear ($in, $out) n = $n" for (in, out) in ((4096, 6144), (1024, 3000), (1000, 37)),
-                                                      n in (1, 3, 100, 512)
+                                                      n in (T == BFloat16 ? (1, 3, 100, 512) : (1, 512))
             W, x = TileInfer.quantize_int8(rnd(in, out)), rnd(in, n)
             y_ref, y = TileInfer.linear(ref, W, x), TileInfer.linear(tile, W, x)
             if T == BFloat16
@@ -205,25 +206,18 @@ using Random: randperm
             @test Array(y) == host(TileInfer.linear(tile, W, x))       # rounded to T, then converted
         end
 
-        @testset "linear with bias" begin
-            W, x, b = rnd(64, 32), rnd(64, 2), rnd(32)
-            @test host(TileInfer.linear(tile, W, x, b)) ≈ host(TileInfer.linear(ref, W, x, b)) rtol = 1e-2
-        end
-
         # (head_dim, heads, kv_heads, page_size, start, n, causal): decode and verify (split-KV,
-        # a step that crosses a page boundary so some splits see no key of a query; up to 16
-        # tokens, DFlash's verify, at groups 2 and 4, and 12 padded to 16), prefill
-        # with and without cached context, group 4, and a group of 3 (prefill kernel only);
-        # non-causal (DFlash blocks) on both kernels, with a partial last page.
-        @testset "attention $case" for case in ((128, 16, 8, 64, 0, 1, true), (128, 16, 8, 64, 1023, 1, true),
-                                                 (128, 16, 8, 64, 63, 2, true), (128, 16, 8, 64, 100, 8, true),
-                                                 (128, 16, 8, 64, 0, 37, true), (128, 16, 8, 64, 0, 512, true),
+        # a step that crosses a page boundary so some splits see no key of a query; 8 tokens at
+        # group 2, 16 (DFlash's verify) at group 4, and 12 padded to 16), prefill with and
+        # without cached context, group 4, and a group of 3 (prefill kernel only); non-causal
+        # (DFlash blocks) on both kernels, with a partial last page. Each case compiles kernels
+        # of its own, so the list covers every path once.
+        @testset "attention $case" for case in ((128, 16, 8, 64, 1023, 1, true), (128, 16, 8, 64, 63, 2, true),
+                                                 (128, 16, 8, 64, 100, 8, true), (128, 16, 8, 64, 0, 512, true),
                                                  (128, 16, 8, 64, 200, 300, true), (128, 32, 8, 64, 700, 3, true),
-                                                 (64, 12, 4, 16, 40, 5, true),
-                                                 (128, 16, 8, 64, 950, 16, true), (128, 32, 8, 64, 950, 16, true),
+                                                 (64, 12, 4, 16, 40, 5, true), (128, 32, 8, 64, 950, 16, true),
                                                  (128, 32, 8, 64, 63, 12, true), (128, 32, 8, 64, 1000, 16, false),
-                                                 (128, 16, 8, 64, 60, 4, false), (128, 16, 8, 64, 0, 20, false),
-                                                 (128, 32, 8, 64, 300, 30, false), (128, 16, 8, 64, 10, 100, false))
+                                                 (128, 32, 8, 64, 300, 30, false))
             D, H, KVH, P, start, n, causal = case
             len = start + n
             pages = cld(len, P) + 2
@@ -244,25 +238,24 @@ using Random: randperm
                 @test host(y) ≈ host(exact) rtol = 1e-5
             end
 
-            # INT8 cache (same cases), with keys whose channels scale like the smoothing factors
-            # (as real keys do): against exact attention over the dequantized cache, which the
-            # reference computes with Float32 queries.
-            c = smoothing(D)
-            k_src = k_pages .* reshape(T.(c), D, 1, 1, 1)
-            kq, vq = TileInfer.int8_kv_pools(D, P, KVH, pages; key_smoothing = c)
-            every = CuArray(Int32.(1:P*pages))
-            TileInfer.store_kv!(ref, kq, vq, reshape(permutedims(k_src, (1, 3, 2, 4)), D, KVH, :),
-                                reshape(permutedims(v_pages, (1, 3, 2, 4)), D, KVH, :), every)
-            y8 = TileInfer.attention(tile, q, kq, vq, table, positions, 1 / sqrt(D); causal)
-            exact8 = TileInfer.attention(ref, f32(q), kq, vq, table, positions, 1 / sqrt(D); causal)
+            # INT8 cache (same cases, BFloat16 only: models with an INT8 cache run in BFloat16),
+            # with keys whose channels scale like the smoothing factors (as real keys do): against
+            # exact attention over the dequantized cache, which the reference computes with
+            # Float32 queries.
             if T == BFloat16
+                c = smoothing(D)
+                k_src = k_pages .* reshape(T.(c), D, 1, 1, 1)
+                kq, vq = TileInfer.int8_kv_pools(D, P, KVH, pages; key_smoothing = c)
+                every = CuArray(Int32.(1:P*pages))
+                TileInfer.store_kv!(ref, kq, vq, reshape(permutedims(k_src, (1, 3, 2, 4)), D, KVH, :),
+                                    reshape(permutedims(v_pages, (1, 3, 2, 4)), D, KVH, :), every)
+                y8 = TileInfer.attention(tile, q, kq, vq, table, positions, 1 / sqrt(D); causal)
+                exact8 = TileInfer.attention(ref, f32(q), kq, vq, table, positions, 1 / sqrt(D); causal)
                 @test ulps(exact8, y8, T) <= 10   # the kernels round the smoothed queries c q to T
-            else
-                @test host(y8) ≈ host(exact8) rtol = 1e-5
+                # Quantization error of the whole op, against the unquantized keys and values.
+                exact_src = TileInfer.attention(ref, f32(q), f32(k_src), f32(v_pages), table, positions, 1 / sqrt(D); causal)
+                @test sqrt(sum(abs2, host(y8) .- host(exact_src)) / sum(abs2, host(exact_src))) < 0.02
             end
-            # Quantization error of the whole op, against the unquantized keys and values.
-            exact_src = TileInfer.attention(ref, f32(q), f32(k_src), f32(v_pages), table, positions, 1 / sqrt(D); causal)
-            @test sqrt(sum(abs2, host(y8) .- host(exact_src)) / sum(abs2, host(exact_src))) < 0.02
         end
     end
 

@@ -49,10 +49,8 @@ function linear!(::RefBackend, y::CuMatrix{S}, W::Int8Weight, x::CuMatrix{T}) wh
     return y
 end
 
-function linear(be::Backend, W::Int8Weight, x::CuMatrix{T}, bias = nothing) where {T}
-    y = linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
-    bias === nothing || (y .+= bias)
-    return y
+function linear(be::Backend, W::Int8Weight, x::CuMatrix{T}) where {T}
+    return linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
 end
 
 # --- INT8 KV cache ---

@@ -14,10 +14,12 @@
 #   --kv int8          INT8 KV caches (keys start "<model>-kvint8"; the attention ops read Int8 pools)
 #   --context N        cached positions before decode steps and decode attention (default 1024;
 #                      keys say "ctxN" for the model steps)
+#   --ref              also benchmark the reference backend (broadcasts and cuBLAS); by default
+#                      only the cuTile kernels run
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
-# "x ref" is the speedup over the reference backend's version of the same benchmark.
+# "x ref" is the speedup over the reference backend's version of the same benchmark (--ref).
 
 include("suite.jl")
 using JSON: JSON
@@ -31,11 +33,16 @@ function parse_cli(args)
     opts = Dict{String,String}()
     i = 1
     while i <= length(args)
+        if args[i] == "--ref"                       # the only flag
+            opts["ref"] = "true"
+            i += 1
+            continue
+        end
         startswith(args[i], "--") && i < length(args) || error("usage: see the header of bench/run.jl")
         opts[args[i][3:end]] = args[i+1]
         i += 2
     end
-    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model", "quantize", "kv", "context"))
+    unknown = setdiff(keys(opts), ("filter", "save", "compare", "seconds", "model", "quantize", "kv", "context", "ref"))
     isempty(unknown) || error("unknown options: $(join(unknown, ", "))")
     return opts
 end
@@ -129,7 +136,8 @@ function main(args)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
         label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
                 (kv_quantize === nothing ? "" : "-kv$kv_quantize")
-        suite, model_info = build_suite(model, label; filter, sampling, kv_quantize, context)
+        backends = haskey(opts, "ref") ? BACKENDS : DEFAULT_BACKENDS
+        suite, model_info = build_suite(model, label; filter, sampling, kv_quantize, context, backends)
         if !isempty(leaves(suite))
             foreach(((_, b),) -> (b.params.seconds = seconds; b.params.samples = 10_000), leaves(suite))
             println("Running $(length(leaves(suite))) $label benchmarks on $(env["gpu"]) at $(env["commit"])...")

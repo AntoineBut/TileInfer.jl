@@ -10,8 +10,7 @@
 #   the layer and token count (gemm_config).
 #
 # Both round once to T at the end, like cuBLAS, then convert to the output's element type
-# S (Float32 logits straight from the lm_head, as the reference rounds then converts). A
-# bias is added afterwards in T, as in the reference backend.
+# S (Float32 logits straight from the lm_head, as the reference rounds then converts).
 
 function gemv_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{T,2}, X::ct.TileArray{T,2},
                      TK::Int, TM::Int) where {S,T}
@@ -142,10 +141,8 @@ function linear!(::TileBackend, y::CuMatrix{S}, W::CuMatrix{T}, x::CuMatrix{T}) 
     return y
 end
 
-function linear(be::TileBackend, W::CuMatrix{T}, x::CuMatrix{T}, bias = nothing) where {T}
-    y = linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
-    bias === nothing || (y .+= bias)
-    return y
+function linear(be::TileBackend, W::CuMatrix{T}, x::CuMatrix{T}) where {T}
+    return linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
 end
 
 # SwiGLU of the gate_up projection: fused into the GEMV for one token, otherwise a GEMM

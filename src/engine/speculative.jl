@@ -25,7 +25,7 @@
 #
 # Proposers: n-gram (prompt) lookup below, where the drafts are the tokens that followed the
 # latest earlier occurrence of the sequence's last n tokens; a draft model (end of this
-# file); EAGLE-3 (eagle.jl).
+# file); DFlash (dflash.jl).
 
 """
     NgramProposer(; k = 4, max_ngram = 3, min_ngram = 1)

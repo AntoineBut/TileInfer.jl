@@ -48,7 +48,7 @@ end
     enable_aux!(runner, layers)
 
 Make every later step keep the residual stream after `layers` (1-based) in its buffers'
-`aux`, for an EAGLE drafter; the latest step's buffers are `runner.last_step`. Drops the
+`aux`, for a DFlash drafter; the latest step's buffers are `runner.last_step`. Drops the
 captured steps when the layers change.
 """
 function enable_aux!(r::ModelRunner, layers)

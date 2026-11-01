@@ -11,8 +11,7 @@ using LinearAlgebra: dot
         y = Array(TileInfer.linear(be, CuArray(BFloat16.(W)), CuArray(BFloat16.(x))))
         ref = Float32.(BFloat16.(W))' * Float32.(BFloat16.(x))
         @test maximum(abs.(Float32.(y) .- ref) ./ ref) < 1e-2
-        b = rand(Float32, 96)
-        @test Array(TileInfer.linear(be, CuArray(W), CuArray(x), CuArray(b))) ≈ W' * x .+ b
+        @test Array(TileInfer.linear(be, CuArray(W), CuArray(x))) ≈ W' * x
     end
 
     @testset "rmsnorm" begin

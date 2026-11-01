@@ -16,8 +16,6 @@ end
 
 # Model used by tests that need a real checkpoint; they are skipped when it is not pulled.
 const TEST_MODEL = "Qwen/Qwen3-0.6B"
-# An EAGLE-3 drafter for TEST_MODEL; its tests are skipped when it is not pulled.
-const EAGLE_TEST_HEAD = "GavinLucky/SGLang-EAGLE3-Qwen3-0.6B-SpecForge"
 
 # Apertus 1.5, for its tokenizer only: the model does not fit the GPU in BFloat16.
 const APERTUS_TEST_MODEL = "swiss-ai/Apertus-v1.5-8B"

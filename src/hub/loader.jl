@@ -176,7 +176,6 @@ function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractStrin
     return LayerWeights(
         check_size(upload(T, c, p * attn_norm * ".weight"), (H,), "attn_norm"),
         q(check_size(upload_fused(T, c, qkv_names), (H, (cfg.num_heads + 2cfg.num_kv_heads) * D), "wqkv")),
-        cfg.qkv_bias ? upload_fused(T, c, replace.(qkv_names, "weight" => "bias")) : nothing,
         cfg.qk_norm ? check_size(upload(T, c, attn * "q_norm.weight"), (D,), "q_norm") : nothing,
         cfg.qk_norm ? check_size(upload(T, c, attn * "k_norm.weight"), (D,), "k_norm") : nothing,
         check_size(upload_weight(T, c, attn * "o_proj.weight", quantize), (cfg.num_heads * D, H), "wo"),

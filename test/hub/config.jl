@@ -36,19 +36,19 @@ const APERTUS15_CONFIG = Dict{String,Any}(
 @testset "config" begin
     q = TileInfer.parse_config(QWEN3_CONFIG)
     @test q.head_dim == 128          # explicit, ≠ hidden ÷ heads = 64
-    @test q.qk_norm && !q.qkv_bias
+    @test q.qk_norm
     @test q.tie_word_embeddings
     @test q.dtype == BFloat16
     @test q.eos_token_ids == [151645]
 
     l = TileInfer.parse_config(LLAMA32_CONFIG)
     @test l.head_dim == 64           # derived
-    @test !l.qk_norm && !l.qkv_bias
+    @test !l.qk_norm
     @test l.rope_scaling == TileInfer.Llama3RopeScaling(32.0, 1.0, 4.0, 8192)
     @test l.eos_token_ids == [128001, 128008, 128009]
 
-    qwen2 = TileInfer.parse_config(merge(QWEN3_CONFIG, Dict("model_type" => "qwen2")))
-    @test qwen2.qkv_bias && !qwen2.qk_norm
+    @test_throws ErrorException TileInfer.parse_config(merge(QWEN3_CONFIG, Dict("model_type" => "qwen2")))
+    @test_throws ErrorException TileInfer.parse_config(merge(QWEN3_CONFIG, Dict("attention_bias" => true)))
 
     # transformers ≥ 5 layout
     v5 = merge(filter(kv -> !(first(kv) in ("rope_theta", "rope_scaling", "torch_dtype")), QWEN3_CONFIG),
@@ -60,7 +60,7 @@ const APERTUS15_CONFIG = Dict{String,Any}(
     a = TileInfer.parse_config(APERTUS15_CONFIG)
     @test a.model_type == "apertus1p5"
     @test a.vocab_size == 131072     # text rows only
-    @test a.hidden_act == :xielu && a.qk_norm && !a.qkv_bias
+    @test a.hidden_act == :xielu && a.qk_norm
     @test (a.num_layers, a.num_heads, a.num_kv_heads, a.head_dim) == (32, 32, 8, 128)
     @test a.rope_theta == 4e6 && a.rope_scaling == TileInfer.Llama3RopeScaling(32.0, 1.0, 4.0, 8192)
     @test a.eos_token_ids == [2, 68, 72]

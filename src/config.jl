@@ -5,7 +5,7 @@
 using JSON: JSON
 using BFloat16s: BFloat16
 
-const SUPPORTED_MODEL_TYPES = ("llama", "mistral", "qwen2", "qwen3", "apertus", "apertus1p5")
+const SUPPORTED_MODEL_TYPES = ("llama", "mistral", "qwen3", "apertus", "apertus1p5")
 
 "Llama 3.x frequency-dependent RoPE scaling (`rope_type = \"llama3\"`)."
 struct Llama3RopeScaling
@@ -35,7 +35,6 @@ Base.@kwdef struct ModelConfig
     rope_scaling::Union{Nothing,Llama3RopeScaling}
     max_position_embeddings::Int
     tie_word_embeddings::Bool
-    qkv_bias::Bool             # Qwen2
     qk_norm::Bool              # Qwen3, Apertus: RMSNorm over head_dim on q and k before RoPE
     hidden_act::Symbol         # :silu (gated SwiGLU MLP) or :xielu (Apertus: ungated xIELU MLP)
     dtype::DataType            # checkpoint element type
@@ -61,6 +60,7 @@ function parse_config(c::AbstractDict)
     sliding = get(c, "use_sliding_window", model_type == "mistral") &&
               get(c, "sliding_window", nothing) !== nothing
     sliding && error("sliding-window attention is not supported yet")
+    get(c, "attention_bias", false) && error("attention biases are not supported")
     get(c, "mlp_bias", false) && error("MLP biases are not supported")
 
     # transformers ≥ 5 nests RoPE settings under `rope_parameters`.
@@ -88,7 +88,6 @@ function parse_config(c::AbstractDict)
         rope_scaling = parse_rope_scaling(scaling),
         max_position_embeddings = c["max_position_embeddings"],
         tie_word_embeddings = get(c, "tie_word_embeddings", false),
-        qkv_bias = model_type == "qwen2" || get(c, "attention_bias", false),
         qk_norm = get(c, "qk_norm", model_type == "qwen3"),
         hidden_act = Symbol(hidden_act),
         dtype = DTYPES[dtype_name],

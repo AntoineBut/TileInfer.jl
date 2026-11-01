@@ -1,5 +1,5 @@
 # DFlash drafting (Chen et al., https://arxiv.org/abs/2602.06036): a small block-diffusion
-# model drafts a whole block of tokens in one forward pass, where EAGLE and draft models run
+# model drafts a whole block of tokens in one forward pass, where draft models (and EAGLE) run
 # one pass per draft. Layout and conventions follow z-lab's reference `dflash.py`.
 #
 # The target keeps the residual stream after five of its layers for every token it runs;
@@ -116,8 +116,8 @@ Proposes the first `k` of the `block_size - 1` tokens that the DFlash `drafter` 
 [`load_dflash`](@ref)) drafts in one pass, on a KV cache of its own for up to `max_tokens`
 positions: the argmax at each block position, or, when `sample` and the target samples, a
 sample with the target's parameters (each position independently: the block's positions do
-not see each other's drafts, so q of draft j is the drafter's distribution at position j). Like [`Eagle3Proposer`](@ref), reads the hidden states of the target's latest
-step, which generation enables on the target's runner.
+not see each other's drafts, so q of draft j is the drafter's distribution at position j). Reads
+the hidden states of the target's latest step, which generation enables on the target's runner.
 """
 mutable struct DFlashProposer{D<:DFlashDrafter,T}
     const k::Int

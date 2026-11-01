@@ -1,6 +1,8 @@
-# Benchmark suite: every op at a model's real shapes (the primitive ops, and the fused ones a
-# step runs), at decode (1 token) and prefill (64 and 512 tokens) sizes, and end-to-end prefill and decode steps (eager, and replayed from a
-# CUDA graph where the backend supports it), for every backend that implements them. Keys
+# Benchmark suite: the ops a step runs at a model's real shapes (fused, and the primitive ones
+# they are built from; rope and store_kv, which only the unfused fallback calls, are left out),
+# at decode (1 token) and prefill (64 and 512 tokens) sizes, and end-to-end prefill and decode
+# steps (eager, and replayed from a CUDA graph where the backend supports it), on the cuTile
+# backend and optionally the reference one. Keys
 # start with the model ("Qwen3-4B/ops/linear_qkv/decode/tile"); bench/run.jl and
 # bench/profile.jl run the suite for each model of MODELS in turn.
 #
@@ -75,6 +77,8 @@ end
 Workload(reps, bytes, flops, tokens) = Workload(reps, bytes, flops, tokens, nothing)
 
 const BACKENDS = (RefBackend(), TileBackend())
+"Backends benchmarked by default: tracking the cuTile kernels is the point; the reference is opt-in."
+const DEFAULT_BACKENDS = (TileBackend(),)
 
 backend_name(::RefBackend) = "ref"
 backend_name(::TileBackend) = "tile"
@@ -91,20 +95,20 @@ end
 const L2_BYTES = CUDA.attribute(CUDA.device(), CUDA.DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
 
 """
-    add_op!(suite, info, filter, path, op, make_args; bytes, flops = 0)
+    add_op!(suite, info, filter, backends, path, op, make_args; bytes, flops = 0)
 
-Benchmark `op(backend, args...)` for each backend that has a method for these arguments.
+Benchmark `op(backend, args...)` for each of `backends` that has a method for these arguments.
 `bytes` is the call's minimum DRAM traffic. `make_args()` returns a fresh argument tuple;
 a sample cycles through enough independent copies (≥ 2× the L2 cache) that each call
 reads from DRAM, as it would in a model where 28 layers of weights stream through L2.
 """
-function add_op!(suite, info, filter, path, op, make_args; bytes, flops = 0.0)
-    keys = [join([path..., backend_name(be)], "/") for be in BACKENDS]
+function add_op!(suite, info, filter, backends, path, op, make_args; bytes, flops = 0.0)
+    keys = [join([path..., backend_name(be)], "/") for be in backends]
     any(k -> occursin(filter, k), keys) || return
     copies = clamp(cld(2 * L2_BYTES, round(Int, bytes)), 1, OP_REPS)
     argtypes = map(typeof, make_args())                 # one set, only for its types
     args = OpArgs(make_args, copies)
-    for be in BACKENDS
+    for be in backends
         key = [path..., backend_name(be)]
         # Skip backends without the op, and fallbacks that would only repeat another backend.
         occursin(filter, join(key, "/")) && hasmethod(op, Tuple{typeof(be), argtypes...}) &&
@@ -133,18 +137,19 @@ end
 
 """
     build_suite(model, label; filter = r"", sampling = SamplingParams(), kv_quantize = nothing,
-                context = CONTEXT) -> (suite, info)
+                context = CONTEXT, backends = DEFAULT_BACKENDS) -> (suite, info)
 
 Benchmarks for `model` (a DecoderLM; its backend is ignored), keyed
 "<label>/ops/<op>/<size>/<backend>" and "<label>/model/<step>/<backend>", restricted to keys
-matching `filter`. `info` maps keys to their [`Workload`](@ref). `sampling` is the model's
+matching `filter` and to `backends` (the cuTile one by default; `BACKENDS` adds the
+reference). `info` maps keys to their [`Workload`](@ref). `sampling` is the model's
 recommended sampling (see `TileInfer.generation_defaults`), for a sampled generation
 benchmark when it is not greedy. `kv_quantize = :int8` uses INT8 KV caches and pools;
 decode steps and attention run after `context - 1` cached positions.
 """
 function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex = r"",
                      sampling::SamplingParams = SamplingParams(), kv_quantize::Union{Nothing,Symbol} = nothing,
-                     context::Integer = CONTEXT) where {T}
+                     context::Integer = CONTEXT, backends = DEFAULT_BACKENDS) where {T}
     cfg, w = model.config, model.weights
     H, I, D, nq, nkv = cfg.hidden_size, cfg.intermediate_size, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads
     eps, B = cfg.rms_norm_eps, sizeof(T)
@@ -159,33 +164,31 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         ops(name) = [label, "ops", name, size_label]
         ids() = CuArray(rand(Int32(0):Int32(cfg.vocab_size - 1), n))
         # Reads one table column per token and writes it: the table is shared, not copied.
-        add_op!(suite, info, filter, ops("embed"), TileInfer.embed, () -> (w.embed, ids()); bytes = 2.0 * H * n * B)
-        add_op!(suite, info, filter, ops("rmsnorm"), TileInfer.rmsnorm, () -> (rnd(H, n), rnd(H), eps);
+        add_op!(suite, info, filter, backends, ops("embed"), TileInfer.embed, () -> (w.embed, ids()); bytes = 2.0 * H * n * B)
+        add_op!(suite, info, filter, backends, ops("rmsnorm"), TileInfer.rmsnorm, () -> (rnd(H, n), rnd(H), eps);
                 bytes = (2.0 * H * n + H) * B)
         for (name, (in, out)) in (("qkv", size(first(w.layers).wqkv)), ("o", size(first(w.layers).wo)),
                                   ("gate_up", size(first(w.layers).w_gate_up)),
                                   ("down", size(first(w.layers).w_down)))
-            add_op!(suite, info, filter, ops("linear_$name"), TileInfer.linear, () -> (weight(in, out), rnd(in, n));
+            # Decode runs gate_up only fused (linear_swiglu / linear_xielu below); prefill's
+            # fused op is this GEMM, then the activation.
+            name == "gate_up" && n == 1 && continue
+            add_op!(suite, info, filter, backends, ops("linear_$name"), TileInfer.linear, () -> (weight(in, out), rnd(in, n));
                     bytes = in * out * WB + (in + out) * n * B, flops = 2.0 * in * out * n)
         end
         # The lm_head as a step runs it: the last token only, into Float32 logits. The weight
         # is the real one (311 MB for 0.6B, 778 MB for 4B) rather than copies.
         # (`let`: argument closures run lazily, after later assignments in this loop body.)
         n == 1 && let (in, out) = size(w.lm_head)
-            add_op!(suite, info, filter, ops("linear_lm_head"), TileInfer.linear!,
+            add_op!(suite, info, filter, backends, ops("linear_lm_head"), TileInfer.linear!,
                     () -> (CuMatrix{Float32}(undef, out, 1), w.lm_head, rnd(in, 1));
                     bytes = in * out * WB + in * B + 4.0 * out, flops = 2.0 * in * out)
         end
-        # The model's own rope tables: a step reads n of their columns.
-        positions() = CuArray(Int32.(rand(0:length(model.rope)-1, n)))
-        add_op!(suite, info, filter, ops("rope"), TileInfer.rope,
-                () -> (rnd(D, nq, n), model.rope.cos, model.rope.sin, positions());
-                bytes = (2.0 * D * nq * n + 2.0 * D * n) * B)
         layer = first(w.layers)
         if layer.xielu === nothing
-            add_op!(suite, info, filter, ops("silu_mul"), TileInfer.silu_mul, () -> (rnd(2I, n),); bytes = 3.0 * I * n * B)
+            add_op!(suite, info, filter, backends, ops("silu_mul"), TileInfer.silu_mul, () -> (rnd(2I, n),); bytes = 3.0 * I * n * B)
         else
-            add_op!(suite, info, filter, ops("xielu"), TileInfer.xielu, () -> (rnd(I, n), layer.xielu); bytes = 2.0 * I * n * B)
+            add_op!(suite, info, filter, backends, ops("xielu"), TileInfer.xielu, () -> (rnd(I, n), layer.xielu); bytes = 2.0 * I * n * B)
         end
 
         # One layer's page pools, holding `len` positions of a single sequence.
@@ -199,39 +202,36 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
         # of a long context's pools would not fit next to the model.
         write_pools() = pools(cld(n, P))
         kv_bytes(positions) = 2.0 * positions * nkv * (kv_quantize === nothing ? D * B : D + 4)
-        add_op!(suite, info, filter, ops("store_kv"), TileInfer.store_kv!,
-                () -> (write_pools()..., rnd(D, nkv, n), rnd(D, nkv, n), CuArray(Int32.(1:n)));
-                bytes = 2 * kv_bytes(n))                        # read k, v and write n slots
         # Causal prefill visits about half of the (len × n) score matrix.
         visited = n == 1 ? len : n * (n + 1) / 2
-        add_op!(suite, info, filter, ops("attention"), TileInfer.attention,
+        add_op!(suite, info, filter, backends, ops("attention"), TileInfer.attention,
                 () -> (rnd(D, nq, n), pools()..., CuArray(Int32.(1:pages)), CuArray(Int32.(start:len-1)), 1 / sqrt(D));
                 bytes = kv_bytes(len) + 2.0 * D * nq * n * B, flops = 4.0 * D * nq * visited)
 
         # The fused ops of a step, in place as run_step! calls them (decode: 10 kernels per
         # layer, of which 6 are these). Their bytes are the unfused minimum, so % peak shows
         # what the fusion achieves.
-        add_op!(suite, info, filter, ops("add_rmsnorm"), TileInfer.add_rmsnorm!,
+        add_op!(suite, info, filter, backends, ops("add_rmsnorm"), TileInfer.add_rmsnorm!,
                 () -> (rnd(H, n), rnd(H, n), rnd(H, n), rnd(H), eps);
                 bytes = (4.0 * H * n + H) * B)                   # read x, delta; write x, h
         let (in, out) = size(layer.w_gate_up)
             if layer.xielu === nothing
-                add_op!(suite, info, filter, ops("linear_swiglu"), TileInfer.linear_swiglu!,
+                add_op!(suite, info, filter, backends, ops("linear_swiglu"), TileInfer.linear_swiglu!,
                         () -> (rnd(out ÷ 2, n), rnd(out, n), weight(in, out), rnd(in, n));
                         bytes = in * out * WB + (in + out ÷ 2) * n * B, flops = 2.0 * in * out * n)
             else
-                add_op!(suite, info, filter, ops("linear_xielu"), TileInfer.linear_xielu!,
+                add_op!(suite, info, filter, backends, ops("linear_xielu"), TileInfer.linear_xielu!,
                         () -> (rnd(out, n), weight(in, out), rnd(in, n), layer.xielu);
                         bytes = in * out * WB + (in + out) * n * B, flops = 2.0 * in * out * n)
             end
         end
         # q/k norm + rope from the fused qkv, keys and values into the pools.
-        add_op!(suite, info, filter, ops("attention_inputs"), TileInfer.attention_inputs!,
+        add_op!(suite, info, filter, backends, ops("attention_inputs"), TileInfer.attention_inputs!,
                 () -> (rnd(D, nq, n), write_pools()..., rnd((nq + 2nkv) * D, n), layer.q_norm, layer.k_norm, model.rope,
                        CuArray(Int32.(start:len-1)), CuArray(Int32.(1:n)), eps);
                 bytes = (2.0 * nq + 4.0 * nkv + 2.0) * D * n * B)  # qkv in, q and k/v out, rope table
         # Device sampling with the model's recommended settings (top-1 if it is greedy).
-        n == 1 && add_op!(suite, info, filter, ops("sample"), TileInfer.sample_token!,
+        n == 1 && add_op!(suite, info, filter, backends, ops("sample"), TileInfer.sample_token!,
                           () -> (CuVector{Int32}(undef, 1), CuVector{Int32}(undef, 1),
                                  CUDA.rand(Float32, cfg.vocab_size, 1),
                                  TileInfer.reset_sampler!(TileInfer.TokenSampler(cfg.vocab_size),
@@ -242,7 +242,7 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
 
     weights = Float64(TileInfer.weight_bytes(w))
     params = Float64(TileInfer.weight_count(w))
-    for be in BACKENDS
+    for be in backends
         name = backend_name(be)
         prefill_keys = ("$label/model/prefill$SHORT/$name", "$label/model/prefill$PREFILL/$name")
         decode_key = "$label/model/decode_ctx$context/$name"

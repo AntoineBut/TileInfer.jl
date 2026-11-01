@@ -38,7 +38,8 @@ function main(args)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
         label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
                 (kv_quantize === nothing ? "" : "-kv$kv_quantize")
-        suite, info = build_suite(model, label; filter = Regex(args[end]), sampling, kv_quantize, context)
+        suite, info = build_suite(model, label; filter = Regex(args[end]), sampling, kv_quantize, context,
+                                   backends = BACKENDS)
         benchmarks = sort!(collect(leaves(suite)); by = b -> join(first(b), "/"))
         found |= !isempty(benchmarks)
 

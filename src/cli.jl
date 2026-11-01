@@ -27,7 +27,6 @@ const USAGE = """
       --speculate K         speculative decoding with up to K drafts per step (1-7), by
                             n-gram lookup in the conversation, or by --draft
       --draft <model>       a smaller model with the same vocabulary drafts (K = 4 by default)
-      --eagle <drafter>     an EAGLE-3 drafter trained for the model drafts (K = 4 by default)
       --dflash <drafter>    a DFlash drafter trained for the model drafts a block in one pass
                             (K up to the block size - 1, all of it by default)
       --sample-drafts       with a drafter and a temperature > 0: the drafter samples its drafts
@@ -101,7 +100,7 @@ function parse_option(::Type{T}, options, name, default) where {T}
 end
 
 const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k", "top-p", "seed", "thinking",
-                            "backend", "speculate", "draft", "eagle", "dflash", "sample-drafts", "int8",
+                            "backend", "speculate", "draft", "dflash", "sample-drafts", "int8",
                             "kv-int8")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
@@ -124,13 +123,13 @@ function load_for_generation(model_name, options)
             speculative = load_proposer(model, options), kv_quantize = haskey(options, "kv-int8") ? :int8 : nothing)
 end
 
-# The proposer of --speculate / --draft / --eagle / --dflash, or nothing.
+# The proposer of --speculate / --draft / --dflash, or nothing.
 function load_proposer(model::DecoderLM, options)
-    drafters = filter(o -> haskey(options, o), ["draft", "eagle", "dflash"])
+    drafters = filter(o -> haskey(options, o), ["draft", "dflash"])
     sample = haskey(options, "sample-drafts")
-    sample && isempty(drafters) && throw(ArgumentError("--sample-drafts needs --draft, --eagle or --dflash"))
+    sample && isempty(drafters) && throw(ArgumentError("--sample-drafts needs --draft or --dflash"))
     haskey(options, "speculate") || !isempty(drafters) || return nothing
-    length(drafters) > 1 && throw(ArgumentError("use only one of --draft, --eagle and --dflash"))
+    length(drafters) > 1 && throw(ArgumentError("use only one of --draft and --dflash"))
     if haskey(options, "dflash")
         d = load_dflash(options["dflash"], model)
         k = parse_option(Int, options, "speculate", d.block_size - 1)
@@ -139,7 +138,6 @@ function load_proposer(model::DecoderLM, options)
     end
     k = parse_option(Int, options, "speculate", 4)
     1 <= k < MAX_GRAPH_TOKENS || throw(ArgumentError("--speculate expects 1 to $(MAX_GRAPH_TOKENS - 1) drafts, got $k"))
-    haskey(options, "eagle") && return Eagle3Proposer(load_eagle3(options["eagle"], model); k, sample)
     haskey(options, "draft") || return NgramProposer(; k)
     draft = load_model(model_dir(options["draft"]); T = eltype(model), backend = model.backend,
                        max_len = max_length(model), quantize = quantization(model.weights))

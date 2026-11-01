@@ -21,10 +21,8 @@ end
 linear!(::RefBackend, y::CuMatrix{T}, W::CuMatrix{T}, x::CuMatrix{T}) where {T} =
     CUBLAS.gemmEx!('T', 'N', true, W, x, false, y)
 
-function linear(be::RefBackend, W::CuMatrix{T}, x::CuMatrix{T}, bias = nothing) where {T}
-    y = linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
-    bias === nothing || (y .+= bias)
-    return y
+function linear(be::RefBackend, W::CuMatrix{T}, x::CuMatrix{T}) where {T}
+    return linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
 end
 
 function rope(::RefBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T},
