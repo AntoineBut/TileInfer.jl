@@ -21,6 +21,7 @@ ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
 julia --project=bench bench/quirks/run.jl [filters]   # cuTile codegen probes and kernel census, ~11 min
+julia --project=docs docs/make.jl                    # documentation site into docs/build/, ~15 s, no GPU needed
 ```
 
 Profiling workflow, model-step costs and how to read the summary: [docs/src/profiling.md](docs/src/profiling.md).
@@ -84,6 +85,11 @@ no clusters, and no BF16 atomic add (use FP32 workspaces).
 - **Backends:** every op has a `RefBackend` method (broadcast/cuBLAS) and a `TileBackend`
   method (cuTile). A new cuTile kernel lands together with its correctness test against the
   reference and a benchmark.
+- **Docstrings, not comments, on definitions:** describe a function, struct or kernel in a
+  `"""` docstring right above it (IDEs and the docs site show them), with code spans around
+  identifiers and shapes (a bare `head_dim` renders in italics). A new public name goes in
+  the `public` list of `src/TileInfer.jl` and in `docs/src/api.md`; the docs build fails if
+  it is missing (`checkdocs = :public`). Internals are listed automatically.
 - **Element type is a type parameter** (`DecoderLM{T}` …). BF16 is the default.
 - **No allocations or host syncs in the decode step**, so it stays CUDA-graph capturable
   (`ModelRunner` captures steps of ≤ 8 tokens). Every op has an in-place `op!` that
