@@ -2,7 +2,7 @@
 
 julia_version = "1.13.3"
 manifest_format = "2.1"
-project_hash = "619b3aea3d61492c8e7b15df55a805cf7cee4e9e"
+project_hash = "ccec1fbcea50fd36e5c83c949531401b8b139b60"
 
 [[deps.ANSIColoredPrinters]]
 git-tree-sha1 = "574baf8110975760d391c710b6341da1afa48d8c"
@@ -42,6 +42,13 @@ weakdeps = ["SparseArrays", "StaticArrays"]
     [deps.Adapt.extensions]
     AdaptSparseArraysExt = "SparseArrays"
     AdaptStaticArraysExt = "StaticArrays"
+
+[[deps.Aqua]]
+deps = ["Compat", "Pkg", "Test"]
+git-tree-sha1 = "4096262296646ab75ff2316c47798f8c2a92f641"
+registries = "General"
+uuid = "4c88cf16-eb10-579e-8560-4a9242c79595"
+version = "0.8.18"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -901,7 +908,7 @@ uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 version = "1.11.0"
 
 [[deps.TileInfer]]
-deps = ["BFloat16s", "CUDA", "HuggingFaceApi", "JSON", "LinearAlgebra", "NVTX", "PrecompileTools", "Random", "SafeTensors", "Unicode", "cuTile"]
+deps = ["BFloat16s", "CUDA", "HuggingFaceApi", "JSON", "LinearAlgebra", "NVTX", "Random", "SafeTensors", "Unicode", "cuTile"]
 path = "."
 uuid = "88060c88-5af7-417f-86ab-5ff001da7709"
 version = "0.1.0"
