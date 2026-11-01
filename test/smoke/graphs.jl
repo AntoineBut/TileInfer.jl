@@ -3,6 +3,8 @@
 
 using LinearAlgebra
 
+seed_rngs!()
+
 @testset "CUDA graphs" begin
     n = 1 << 16
     a = CUDA.rand(Float32, n)

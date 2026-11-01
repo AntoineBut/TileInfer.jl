@@ -5,6 +5,8 @@
 
 using Random: randperm
 
+seed_rngs!()
+
 @testset "tile kernels" begin
     ref, tile = RefBackend(), TileBackend()
     host(x) = Float32.(Array(x))

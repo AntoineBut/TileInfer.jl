@@ -2,6 +2,8 @@
 
 using LinearAlgebra: dot
 
+seed_rngs!()
+
 @testset "reference ops" begin
     be = RefBackend()
 

@@ -2,6 +2,8 @@
 # (`vadd!` from helpers.jl), scalar loads with runtime indices (the access pattern of
 # paged KV lookups).
 
+seed_rngs!()
+
 # Copies whole pages of `src` (D, PAGE, NPAGES) into `dst` following an Int32 page table:
 # a scalar load picks the page, then one dense tile load moves it.
 function page_copy_kernel(src::ct.TileArray{T,3}, dst::ct.TileArray{T,3},
