@@ -74,12 +74,12 @@ end
 """
     Int8Pages
 
-A key or value page pool stored as Int8 values `q` (head_dim, page_size, kv_heads, num_pages)
-with one Float32 `scale` (page_size, kv_heads, num_pages) per cached vector:
+A key or value page pool stored as Int8 values `q` `(head_dim, page_size, kv_heads, num_pages)`
+with one Float32 `scale` `(page_size, kv_heads, num_pages)` per cached vector:
 `pool[:, o, h, p] ≈ scale[o, h, p] * q[:, o, h, p]`. A layer's keys and values are the two
 halves of one Int8 array and one scale array (`layer_q`, `layer_scale`, keys first), so a
 kernel takes both pools as a single argument and stays under 32 parameters. Vectors are
-stored divided by `smooth` (head_dim), the keys' smoothing factors (ones for values):
+stored divided by `smooth` (`head_dim`), the keys' smoothing factors (ones for values):
 `pool[:, o, h, p] ≈ smooth .* scale[o, h, p] .* q[:, o, h, p]`. Made in pairs by
 [`int8_kv_pools`](@ref).
 """
@@ -112,7 +112,7 @@ end
     key_smoothing(k_norm) -> CuVector{Float32}
 
 The factors that keys normalized by the weight `k_norm` are divided by in an INT8 cache:
-max(|w_i|, |w_j|) for each rotary pair (i, j = i + head_dim/2), so the factor is the same
+max(|`w_i`|, |`w_j`|) for each rotary pair (i, j = i + `head_dim`/2), so the factor is the same
 on both channels a rotation mixes (1 where both are zero).
 """
 function key_smoothing(k_norm::CuVector)
@@ -123,17 +123,21 @@ function key_smoothing(k_norm::CuVector)
     return vcat(c, c)
 end
 
-# The layer arrays behind a key/value pair, for the kernels: Int8 values as
-# (head_dim, 2 page_size kv_heads num_pages), keys' columns first, the scales as one vector,
-# and the keys' smoothing.
+"""
+The layer arrays behind a key/value pair, for the kernels: Int8 values as
+`(head_dim, 2 page_size kv_heads num_pages)`, keys' columns first, the scales as one vector,
+and the keys' smoothing.
+"""
 function layer_arrays(k::Int8Pages, v::Int8Pages)
     k.layer_q === v.layer_q && pointer(k.q) == pointer(k.layer_q) ||
         throw(ArgumentError("keys and values must be the halves of one layer's pools (int8_kv_pools)"))
     return reshape(k.layer_q, size(k.q, 1), :), vec(k.layer_scale), k.smooth
 end
 
-# Quantization of the columns of x (Float32): q = floor(x 127 / max|x| + 1/2) and
-# s = max|x| / 127, as the kernels compute them (0 for an all-zero column).
+"""
+Quantization of the columns of x (Float32): q = floor(x 127 / max|x| + 1/2) and
+s = max|x| / 127, as the kernels compute them (0 for an all-zero column).
+"""
 function quantize_columns(x::CuMatrix{Float32})
     absmax = maximum(abs, x; dims = 1)
     inv = ifelse.(absmax .> 0, 127.0f0 ./ absmax, 0.0f0)
@@ -154,8 +158,10 @@ function store_kv!(::RefBackend, k_pages::Int8Pages, v_pages::Int8Pages, k::CuAr
     return nothing
 end
 
-# Dequantized and unsmoothed in Float32 (not rounded to T): the kernels scale Float32 scores
-# and probabilities.
+"""
+Dequantized and unsmoothed in Float32 (not rounded to T): the kernels scale Float32 scores
+and probabilities.
+"""
 function gather_pages(pages::Int8Pages, block_table::CuVector{Int32}, h::Integer, len::Integer)
     D, P = size(pages, 1), size(pages, 2)
     used = view(block_table, 1:cld(len, P))

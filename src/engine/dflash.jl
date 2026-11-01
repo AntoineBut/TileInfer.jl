@@ -28,7 +28,7 @@
     DFlashDrafter
 
 A DFlash drafter on the GPU: its Qwen3 layers, `fc` and norms, the target's embedding table
-and lm_head (shared), its RoPE table, the target layers it reads (`aux_layers`, 1-based),
+and `lm_head` (shared), its RoPE table, the target layers it reads (`aux_layers`, 1-based),
 the block size and the mask token. Load with [`load_dflash`](@ref).
 """
 struct DFlashDrafter{T,M<:AbstractMatrix{T},L,V<:AbstractVector{T},R<:RotaryTable{T},B<:Backend}
@@ -57,8 +57,12 @@ z-lab's checkpoints (`layers.*`, `fc`, `hidden_norm`, `dflash_config`).
 load_dflash(name::AbstractString, target::DecoderLM{T}; max_len::Integer = max_length(target)) where {T} =
     load_dflash(name, target.config, target.weights.embed, target.weights.lm_head, target.backend; max_len)
 
-# With the target's configuration, embedding table and lm_head given separately (the tests
-# run the drafter in Float32 without the whole target).
+"""
+    load_dflash(drafter, target_config, embed, lm_head, backend; max_len) -> DFlashDrafter
+
+The same, with the target's configuration, embedding table and `lm_head` given separately
+(the tests run the drafter in Float32 without the whole target).
+"""
 function load_dflash(name::AbstractString, tcfg::ModelConfig, embed::AbstractMatrix{T}, lm_head,
                      backend::Backend; max_len::Integer) where {T}
     dir = model_dir(name)
@@ -83,9 +87,11 @@ function load_dflash(name::AbstractString, tcfg::ModelConfig, embed::AbstractMat
                          embed, lm_head, RotaryTable{T}(cfg, max_len + B), backend)
 end
 
-# The target layers whose outputs the drafter reads, counted from 1. DFlash's
-# `target_layer_ids` index transformers' `hidden_states` minus one, i.e. number layer
-# outputs from 0; without them, they are spread evenly from layer 1 to L - 3.
+"""
+The target layers whose outputs the drafter reads, counted from 1. DFlash's
+`target_layer_ids` index transformers' `hidden_states` minus one, i.e. number layer
+outputs from 0; without them, they are spread evenly from layer 1 to L - 3.
+"""
 function dflash_layers(raw::AbstractDict, num_layers::Integer)
     ids = get(get(raw, "dflash_config", Dict()), "target_layer_ids", nothing)
     if ids === nothing
@@ -96,9 +102,11 @@ function dflash_layers(raw::AbstractDict, num_layers::Integer)
     return collect(Int, ids) .+ 1
 end
 
-# Buffers of one drafter step of c context positions and a block: the step's inputs and
-# per-column activations for n = c + B columns (b.h holds the layers' input: the context
-# states, then the normed block), and the target's stacked states of the context.
+"""
+Buffers of one drafter step of c context positions and a block: the step's inputs and
+per-column activations for n = c + B columns (b.h holds the layers' input: the context
+states, then the normed block), and the target's stacked states of the context.
+"""
 struct DFlashStep{T}
     b::StepBuffers{T}
     aux::CuMatrix{T}                 # (aux layers × hidden, c)
@@ -163,8 +171,10 @@ end
 
 draft_dists(p::DFlashProposer, r::ModelRunner) = samples_for(p.sample, r) ? p.dists : nothing
 
-# The drafter on a prepared step whose aux holds the target's context states; leaves the
-# logits of block positions 2:B in p.logits.
+"""
+The drafter on a prepared step whose aux holds the target's context states; leaves the
+logits of block positions 2:B in p.logits.
+"""
 function dflash_step!(p::DFlashProposer{<:DFlashDrafter{T}}, s::DFlashStep{T}) where {T}
     d, cache, b = p.drafter, p.cache, s.b
     cfg, be = d.config, d.backend
@@ -205,8 +215,10 @@ function propose(p::DFlashProposer, context::AbstractVector{<:Integer}, k::Integ
     return Int.(p.mirror_host[1:k])
 end
 
-# The drafts stay on the device, for the verify step to copy into its inputs: the host
-# enqueues the drafter's step and the target's verify step back to back and waits once.
+"""
+The drafts stay on the device, for the verify step to copy into its inputs: the host
+enqueues the drafter's step and the target's verify step back to back and waits once.
+"""
 function propose_on_device!(p::DFlashProposer, context::AbstractVector{<:Integer}, k::Integer)
     1 <= k <= p.k || return nothing
     r = p.target::ModelRunner
@@ -216,9 +228,11 @@ end
 
 drafted(p::DFlashProposer, k::Integer) = Int.(p.mirror_host[1:k])
 
-# Enqueue the drafting of the block after `context` into p.sink and p.mirror (and its logits
-# into p.logits), where the target's latest step ran positions start:length(context)-2 and
-# left their states in the first columns of `aux`. Does not wait for the drafts.
+"""
+Enqueue the drafting of the block after `context` into p.sink and p.mirror (and its logits
+into p.logits), where the target's latest step ran positions start:length(context)-2 and
+left their states in the first columns of `aux`. Does not wait for the drafts.
+"""
 function draft!(p::DFlashProposer, context::AbstractVector{<:Integer}, start::Integer, aux::CuMatrix)
     d, seq = p.drafter, p.seq
     L, B = length(context), d.block_size

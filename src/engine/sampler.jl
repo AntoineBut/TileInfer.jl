@@ -27,8 +27,10 @@ end
 "Whether tokens can be sampled with `p` on the device: greedy, or top-k with k ≤ $MAX_TOP_K."
 on_device(p::SamplingParams) = p.temperature == 0 || 1 <= p.top_k <= MAX_TOP_K
 
-# lowbias32 (Chris Wellons): a bijective mix of 32 bits with low avalanche bias. (cuTile
-# shifts need a shift count of the operand's type.)
+"""
+lowbias32 (Chris Wellons): a bijective mix of 32 bits with low avalanche bias. (cuTile
+shifts need a shift count of the operand's type.)
+"""
 @inline function mix32(x::UInt32)
     x = xor(x, x >> UInt32(16)) * 0x7feb352d
     x = xor(x, x >> UInt32(15)) * 0x846ca68b
@@ -44,7 +46,9 @@ pure function of its arguments, evaluated identically on the host and in kernels
 @inline sampling_uniform(seed::UInt32, counter::UInt32) =
     Float32(mix32(xor(mix32(seed), counter)) >> UInt32(8)) * 5.9604645f-8   # 24 bits × 2^-24
 
-# The ids of the k largest logits, best first, ties to the smaller id.
+"""
+The ids of the k largest logits, best first, ties to the smaller id.
+"""
 function top_candidates(logits::AbstractVector{<:Real}, k::Integer)
     k == length(logits) && return sortperm(logits; rev = true)             # stable
     t = partialsort(logits, k; rev = true)                                 # the k-th largest
@@ -75,9 +79,11 @@ function filtered_dist(logits::AbstractVector{<:Real}, p::SamplingParams)
     return ids, probs
 end
 
-# Inverse transform sampling over weights `w` (best first) by u ∈ [0, 1): the first entry whose
-# cumulative weight reaches u × the total, among those with positive weight (the last of them
-# on round-off).
+"""
+Inverse transform sampling over weights `w` (best first) by u ∈ [0, 1): the first entry whose
+cumulative weight reaches u × the total, among those with positive weight (the last of them
+on round-off).
+"""
 function pick_host(w::AbstractVector{<:Real}, u::Real)
     cum = cumsum(w)
     return something(findfirst(i -> w[i] > 0 && cum[i] >= u * cum[end], eachindex(w)), findlast(>(0), w))

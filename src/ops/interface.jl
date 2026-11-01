@@ -5,6 +5,13 @@
 # tensors (head_dim, heads, tokens), linear weights (in, out) applied as y = Wᵀx,
 # paged KV pools per layer (head_dim, page_size, kv_heads, num_pages).
 
+"""
+    Backend
+
+Selects the implementation of every op by dispatch: [`RefBackend`](@ref) (CUDA.jl
+broadcasts and cuBLAS, the ground truth) or [`TileBackend`](@ref) (cuTile kernels). A model
+holds its backend, so `load_model(…; backend = TileBackend())` runs it on the cuTile kernels.
+"""
 abstract type Backend end
 
 "Reference ops: CUDA.jl broadcasts and cuBLAS. Ground truth for correctness tests."
@@ -24,7 +31,7 @@ function embed end
     rmsnorm(backend, x, w, eps)
 
 RMS-normalize `x` along its first dimension and scale by `w`; `x` is (hidden, tokens) or
-(head_dim, heads, tokens).
+`(head_dim, heads, tokens)`.
 """
 function rmsnorm end
 
@@ -38,10 +45,10 @@ function linear end
 """
     rope(backend, x, cos, sin, positions) -> same shape
 
-Rotary embedding of `x` (head_dim, heads, n) for tokens at the 0-based `positions` (a
-device vector of n `Int32`). `cos`/`sin` are the model's full tables (head_dim, max_len),
+Rotary embedding of `x` `(head_dim, heads, n)` for tokens at the 0-based `positions` (a
+device vector of n `Int32`). `cos`/`sin` are the model's full tables `(head_dim, max_len)`,
 whose column p + 1 is position p. Uses the "rotate half" pairing of Llama/Qwen: element i is
-paired with element i + head_dim/2.
+paired with element i + `head_dim`/2.
 """
 function rope end
 
@@ -77,8 +84,8 @@ function xielu end
 """
     store_kv!(backend, k_pages, v_pages, k, v, slots)
 
-Write the keys and values (head_dim, kv_heads, n) of n tokens into the page pools
-(head_dim, page_size, kv_heads, num_pages) at the 1-based cache `slots` (a device vector,
+Write the keys and values `(head_dim, kv_heads, n)` of n tokens into the page pools
+`(head_dim, page_size, kv_heads, num_pages)` at the 1-based cache `slots` (a device vector,
 see [`slots`](@ref)): slot s is offset `(s - 1) % page_size` of page `(s - 1) ÷ page_size + 1`.
 """
 function store_kv! end
@@ -86,7 +93,7 @@ function store_kv! end
 """
     attention(backend, q, k_pages, v_pages, block_table, positions, scale; causal = true) -> (head_dim, heads, n)
 
-Causal grouped-query attention of the queries `q` (head_dim, heads, n) of one sequence, at
+Causal grouped-query attention of the queries `q` `(head_dim, heads, n)` of one sequence, at
 the consecutive 0-based `positions` (a device vector of n `Int32`), over its first
 `positions[end] + 1` cached positions. The sequence's keys and values are in the pages
 listed by `block_table` (a device vector, which may be padded past the sequence's pages).
@@ -96,34 +103,67 @@ of the later queries of the step (a DFlash drafter's block).
 function attention end
 
 """
-    embed!(backend, y, table, ids)
-    rmsnorm!(backend, y, x, w, eps)
-    linear!(backend, y, W, x)
-    rope!(backend, y, x, cos, sin, positions)
-    silu_mul!(backend, y, gate_up)
-    xielu!(backend, y, x, act)
-    attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale; causal = true)
+    embed!(backend, y, table, ids) -> y
 
-In-place forms of the ops, writing into the preallocated `y` (or `out`) and returning it.
-TileBackend writes directly and allocates nothing, so a step made of these calls can be
-captured in a CUDA graph. The fallbacks here run the allocating op and copy its result.
-`workspace` is the backend's scratch for `attention!`, from [`attention_workspace`](@ref).
+In-place [`embed`](@ref), writing into `y`.
+
+Every op has an in-place form like this one, which writes into a preallocated output and
+returns it. TileBackend writes directly and allocates nothing, so a step made of these calls
+can be captured in a CUDA graph. The generic fallbacks run the allocating op and copy its
+result.
 """
 embed!(be::Backend, y, args...) = copyto!(y, embed(be, args...))
+
+"""
+    rmsnorm!(backend, y, x, w, eps) -> y
+
+In-place [`rmsnorm`](@ref), writing into `y` (see [`embed!`](@ref)).
+"""
 rmsnorm!(be::Backend, y, args...) = copyto!(y, rmsnorm(be, args...))
+
+"""
+    linear!(backend, y, W, x) -> y
+
+In-place [`linear`](@ref), writing into `y` (see [`embed!`](@ref)).
+"""
 linear!(be::Backend, y, args...) = copyto!(y, linear(be, args...))
+
+"""
+    rope!(backend, y, x, cos, sin, positions) -> y
+
+In-place [`rope`](@ref), writing into `y` (see [`embed!`](@ref)).
+"""
 rope!(be::Backend, y, args...) = copyto!(y, rope(be, args...))
+
+"""
+    silu_mul!(backend, y, gate_up) -> y
+
+In-place [`silu_mul`](@ref), writing into `y` (see [`embed!`](@ref)).
+"""
 silu_mul!(be::Backend, y, args...) = copyto!(y, silu_mul(be, args...))
+
+"""
+    xielu!(backend, y, x, act) -> y
+
+In-place [`xielu`](@ref), writing into `y` (see [`embed!`](@ref)).
+"""
 xielu!(be::Backend, y, args...) = copyto!(y, xielu(be, args...))
+
+"""
+    attention!(backend, out, workspace, q, k_pages, v_pages, block_table, positions, scale; causal = true) -> out
+
+In-place [`attention`](@ref), writing into `out` (see [`embed!`](@ref)). `workspace` is the
+backend's scratch memory, from [`attention_workspace`](@ref).
+"""
 attention!(be::Backend, out, workspace, args...; kw...) = copyto!(out, attention(be, args...; kw...))
 
 """
     attention_inputs!(backend, q, k_pages, v_pages, qkv, q_norm, k_norm, table, positions, slots, eps)
 
-Everything between the fused q/k/v projection `qkv` ((heads + 2 kv_heads) head_dim, n) and
+Everything between the fused q/k/v projection `qkv` `((heads + 2 kv_heads) head_dim, n)` and
 attention, as one op: the optional Qwen3 q/k RMSNorm (`q_norm`/`k_norm` or `nothing`),
 rotary embedding with the [`RotaryTable`](@ref) `table` at `positions`, and writing the keys
-and values into the page pools at `slots`. Writes the queries into `q` (head_dim, heads, n)
+and values into the page pools at `slots`. Writes the queries into `q` `(head_dim, heads, n)`
 and returns it. The fallback chains the primitive ops; TileBackend fuses them.
 """
 function attention_inputs!(be::Backend, q, k_pages, v_pages, qkv, q_norm, k_norm, table, positions, slots, eps)
@@ -202,7 +242,7 @@ end
     sample_tokens!(backend, ids, mirror, logits, sampler, scratch, dists = nothing)
 
 [`sample_token!`](@ref) on each column j of `logits` (vocab, n) in turn, into `ids[j]` and
-`mirror[j]` (and with `dists`, a pair of (MAX_TOP_K, n) matrices, column j's distribution
+`mirror[j]` (and with `dists`, a pair of `(MAX_TOP_K, n)` matrices, column j's distribution
 into their column j), in a few launches on TileBackend. `scratch` is a zeroed
 [`sample_cols_scratch`](@ref).
 """

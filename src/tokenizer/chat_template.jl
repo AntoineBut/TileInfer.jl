@@ -22,11 +22,13 @@ chat_prompt(model_type::AbstractString, messages; kwargs...) =
 chat_prompt(::Val{T}, messages; kwargs...) where {T} =
     error("no chat template for model type \"$T\" yet")
 
-# Port of Qwen3's template without tool calling. Two details matter:
-# - assistant turns before the last user message drop their <think>…</think> reasoning,
-#   so earlier reasoning does not use up context;
-# - enable_thinking = false pre-fills an empty think block, which makes the model answer
-#   directly.
+"""
+Port of Qwen3's template without tool calling. Two details matter:
+- assistant turns before the last user message drop their <think>…</think> reasoning,
+  so earlier reasoning does not use up context;
+- `enable_thinking = false` pre-fills an empty think block, which makes the model answer
+  directly.
+"""
 function chat_prompt(::Val{:qwen3}, messages::AbstractVector{ChatMessage};
                      add_generation_prompt::Bool = true, enable_thinking::Bool = true)
     io = IOBuffer()
@@ -62,10 +64,12 @@ end
 const APERTUS15_DEFAULT_SYSTEM = "You are Apertus 1.5 Omni, a multimodal assistant developed by the Swiss AI \
     Initiative. Extended from Apertus 1 via continued pretraining, you understand images and audio and respond in text."
 
-# Port of Apertus 1.5's template (chat_template.jinja) for text messages without tools. A
-# system message may only come first; without one, the template's default is used. The
-# developer turn says whether the model may deliberate (think between <|inner_prefix|> and
-# <|inner_suffix|>). Consecutive assistant messages form one turn. Earlier reasoning is kept.
+"""
+Port of Apertus 1.5's template (`chat_template.jinja`) for text messages without tools. A
+system message may only come first; without one, the template's default is used. The
+developer turn says whether the model may deliberate (think between `<|inner_prefix|>` and
+`<|inner_suffix|>`). Consecutive assistant messages form one turn. Earlier reasoning is kept.
+"""
 function chat_prompt(::Val{:apertus1p5}, messages::AbstractVector{ChatMessage};
                      add_generation_prompt::Bool = true, enable_thinking::Bool = true)
     io = IOBuffer()

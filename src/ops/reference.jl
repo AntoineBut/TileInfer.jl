@@ -9,7 +9,11 @@ using CUDA: CUBLAS
 
 embed(::RefBackend, table::CuMatrix, ids::CuVector{<:Integer}) = table[:, ids .+ 1]
 
-# Qwen3RMSNorm / LlamaRMSNorm: normalize in Float32, round to T, then scale in T.
+"""
+    rmsnorm(::RefBackend, x, w, eps)
+
+As Qwen3RMSNorm / LlamaRMSNorm: normalize in Float32, round to T, then scale in T.
+"""
 function rmsnorm(::RefBackend, x::CuArray{T}, w::CuVector{T}, eps::Real) where {T}
     x32 = Float32.(x)
     inv_rms = 1f0 ./ sqrt.(sum(abs2, x32; dims = 1) ./ size(x, 1) .+ Float32(eps))
@@ -51,8 +55,12 @@ function xielu_scalar(x::T, alpha_p::T, alpha_n::T, beta::T, eps::T) where {T}
     return x > 0 ? alpha_p * x * x + bx : (T(expm1(Float32(min(x, eps)))) - x) * alpha_n + bx
 end
 
-# Scatter through a flat column view of the pools: the column of (offset o, head h, page p),
-# all 0-based, in (head_dim, page_size × kv_heads × num_pages) is o + P h + P H p + 1.
+"""
+    store_kv!(::RefBackend, k_pages, v_pages, k, v, slots)
+
+Scatter through a flat column view of the pools: the column of (offset o, head h, page p),
+all 0-based, in `(head_dim, page_size × kv_heads × num_pages)` is `o + P h + P H p + 1`.
+"""
 function store_kv!(::RefBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
                    k::CuArray{T,3}, v::CuArray{T,3}, slots::CuVector{Int32}) where {T}
     D, P, H, _ = size(k_pages)
@@ -65,17 +73,25 @@ function store_kv!(::RefBackend, k_pages::CuArray{T,4}, v_pages::CuArray{T,4},
     return nothing
 end
 
-# Keys (or values) of positions 1:len of one KV head, gathered from the sequence's pages
-# into a dense (head_dim, len) matrix.
+"""
+Keys (or values) of positions 1:len of one KV head, gathered from the sequence's pages
+into a dense `(head_dim, len)` matrix.
+"""
 function gather_pages(pages::CuArray{T,4}, block_table::CuVector{Int32}, h::Integer, len::Integer) where {T}
     D, P = size(pages, 1), size(pages, 2)
     used = view(block_table, 1:cld(len, P))
     return view(reshape(pages[:, :, h, used], D, :), :, 1:len)
 end
 
-# Eager attention, per KV head over its group of query heads at once:
-#   S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
-# The pools are (head_dim, page_size, kv_heads, num_pages) arrays or Int8Pages.
+"""
+    attention(::RefBackend, q, k_pages, v_pages, block_table, positions, scale; causal = true)
+
+Eager attention, per KV head over its group of query heads at once:
+
+    S = round(round(KᵀQ) * scale),  P = round(softmax(S + mask) in Float32),  O = round(V P)
+
+The pools are `(head_dim, page_size, kv_heads, num_pages)` arrays or Int8Pages.
+"""
 function attention(::RefBackend, q::CuArray{T,3}, k_pages, v_pages,
                    block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real;
                    causal::Bool = true) where {T}

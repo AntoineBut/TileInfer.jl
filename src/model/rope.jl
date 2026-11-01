@@ -2,8 +2,8 @@
 # inverse frequencies and angles in Float32, cos/sin rounded to the model's element type.
 
 """
-Per-position `cos`/`sin` tables (head_dim, max_len) on the device; column p+1 is position p.
-`cos_sin` holds both, interleaved as (head_dim, 2 max_len): columns 2p+1 and 2p+2 are the
+Per-position `cos`/`sin` tables `(head_dim, max_len)` on the device; column p+1 is position p.
+`cos_sin` holds both, interleaved as `(head_dim, 2 max_len)`: columns 2p+1 and 2p+2 are the
 cos and sin of position p, so a fused kernel needs one array argument for them.
 """
 struct RotaryTable{T,M<:AbstractMatrix{T}}
@@ -20,8 +20,10 @@ function inverse_frequencies(cfg::ModelConfig)
     return llama3_scaled(inv_freq, s)
 end
 
-# transformers' `_compute_llama3_parameters`: long wavelengths are divided by `factor`,
-# short ones kept, and the band in between interpolated smoothly.
+"""
+transformers' `_compute_llama3_parameters`: long wavelengths are divided by `factor`,
+short ones kept, and the band in between interpolated smoothly.
+"""
 function llama3_scaled(inv_freq::Vector{Float32}, s::Llama3RopeScaling)
     factor, low, high = Float32(s.factor), Float32(s.low_freq_factor), Float32(s.high_freq_factor)
     old_len = Float32(s.original_max_position_embeddings)

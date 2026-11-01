@@ -30,6 +30,12 @@ function load_model(model::AbstractString; T::Type = BFloat16, backend::Backend 
 end
 
 Base.eltype(::DecoderLM{T}) where {T} = T
+"""
+    max_length(model) -> Int
+
+The longest sequence `model` can process: the positions its RoPE tables cover, set by
+`max_len` in [`load_model`](@ref).
+"""
 max_length(m::DecoderLM) = length(m.rope)
 
 """
@@ -88,7 +94,11 @@ end
 StepBuffers(m::DecoderLM{T}, cache::PagedKVCache{T}, n::Integer; kwargs...) where {T} =
     StepBuffers{T}(m.config, m.backend, cache, n; kwargs...)
 
-# From a configuration, for drafters that are not a DecoderLM; `vocab` sizes the logits.
+"""
+    StepBuffers{T}(config, backend, cache, n; all_logits = false, aux_layers = Int[], vocab = config.vocab_size)
+
+[`StepBuffers`](@ref) from a configuration, for drafters that are not a DecoderLM; `vocab` sizes the logits.
+"""
 function StepBuffers{T}(cfg::ModelConfig, backend::Backend, cache::PagedKVCache{T}, n::Integer;
                         all_logits::Bool = false, aux_layers = Int[], vocab::Integer = cfg.vocab_size) where {T}
     H, D, nq, nkv, I = cfg.hidden_size, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate_size
@@ -185,7 +195,9 @@ function run_step!(model::DecoderLM{T}, cache::PagedKVCache{T}, b::StepBuffers{T
     return linear!(be, b.logits, w.lm_head, last)                  # Float32 logits
 end
 
-# Keep the residual stream after layer l if it is one of the step's aux layers.
+"""
+Keep the residual stream after layer l if it is one of the step's aux layers.
+"""
 function save_aux!(b::StepBuffers, l)
     b.aux === nothing && return
     i = findfirst(==(l), b.aux_layers)

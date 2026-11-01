@@ -33,8 +33,10 @@ const USAGE = """
                             too, which are accepted by the p/q rule (default: greedy drafts)
     """
 
-# Splits `args` into positionals and `--name value` options; names in `flags` take no
-# value and are set to "true".
+"""
+Splits `args` into positionals and `--name value` options; names in `flags` take no
+value and are set to "true".
+"""
 function parse_args(args; flags = ())
     positional = String[]
     options = Dict{String,String}()
@@ -104,7 +106,9 @@ const GENERATION_OPTIONS = ("max-tokens", "max-context", "temperature", "top-k",
                             "kv-int8")
 const BACKENDS = Dict("tile" => TileBackend(), "ref" => RefBackend())
 
-# Model, tokenizer and generation settings shared by `run` and `chat`.
+"""
+Model, tokenizer and generation settings shared by `run` and `chat`.
+"""
 function load_for_generation(model_name, options)
     thinking = get(options, "thinking", "on")
     thinking in ("on", "off") || throw(ArgumentError("--thinking expects on or off"))
@@ -123,7 +127,9 @@ function load_for_generation(model_name, options)
             speculative = load_proposer(model, options), kv_quantize = haskey(options, "kv-int8") ? :int8 : nothing)
 end
 
-# The proposer of --speculate / --draft / --dflash, or nothing.
+"""
+The proposer of --speculate / --draft / --dflash, or nothing.
+"""
 function load_proposer(model::DecoderLM, options)
     drafters = filter(o -> haskey(options, o), ["draft", "dflash"])
     sample = haskey(options, "sample-drafts")
@@ -146,7 +152,9 @@ function load_proposer(model::DecoderLM, options)
     return DraftProposer(draft; k, sample)
 end
 
-# Streams tokens to `io` and records when the first two arrived.
+"""
+Streams tokens to `io` and records when the first two arrived.
+"""
 mutable struct TimedStream
     stream::TextStream
     start::Float64
@@ -166,9 +174,11 @@ function (t::TimedStream)(id)
     t.stream(id)
 end
 
-# In a fresh process, time to first token includes compiling the prefill kernels, and the
-# first decode step compiles the single-token ones. Decode speed is measured from the
-# second token on so that it excludes both.
+"""
+In a fresh process, time to first token includes compiling the prefill kernels, and the
+first decode step compiles the single-token ones. Decode speed is measured from the
+second token on so that it excludes both.
+"""
 function timing_summary(t::TimedStream, generated::Integer)
     stop = time()
     rate = generated > 2 ? (generated - 2) / (stop - t.second_token) : NaN
