@@ -3,7 +3,10 @@
 A single-GPU LLM inference engine in Julia, built to learn how engines work.
 Hot kernels are written in cuTile.jl. Clear, measurable code wins over feature breadth.
 
-- Design and roadmap: [docs/src/architecture.md](docs/src/architecture.md). Check which milestone is current before adding features.
+- Design: [docs/src/architecture.md](docs/src/architecture.md), with pages for the
+  [KV cache](docs/src/kv_cache.md), [attention kernels](docs/src/attention.md) and
+  [speculative decoding](docs/src/speculative.md). Progress, priorities and what was dropped:
+  [docs/src/roadmap.md](docs/src/roadmap.md). Check which milestone is current before adding features.
 - External docs, papers and local package-source paths: [docs/src/references.md](docs/src/references.md).
   For cuTile questions, read `pkgdir(cuTile)/docs/src/man/` and `examples/` before searching the web.
 

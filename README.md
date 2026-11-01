@@ -24,6 +24,7 @@ julia --project -m TileInfer chat Qwen/Qwen3-0.6B
 Requires Julia 1.13 and an NVIDIA GPU that cuTile.jl supports.
 
 Read the **[documentation](https://antoinebut.github.io/TileInfer.jl/dev/)** for the
-Julia API, the [architecture](docs/src/architecture.md), and the
+Julia API, the [architecture](docs/src/architecture.md), the
+[history and roadmap](docs/src/roadmap.md), and the
 [performance log](docs/src/performance.md), which records what each optimization gained,
 including the ones that did not pan out.

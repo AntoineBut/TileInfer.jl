@@ -1,478 +1,256 @@
-# TileInfer — Architecture Draft
+# Architecture
 
-A single-GPU, single-client LLM inference engine in Julia. Every hot kernel is
-written in cuTile.jl. The goal is to learn how the engine works, so the code
-favours being clear and easy to instrument over supporting many features.
-
-Status (2026-10-30): M0–M7 done, and the first M8 fusions. M7 (speculative decoding): verifier
-(greedy and sampled), n-gram, draft-model and DFlash proposers, `--speculate` / `--draft` /
-`--dflash` and `bench/speculative.jl`; adaptive k is a later option. An EAGLE-3 proposer was built
-and removed on 2026-11-01: DFlash beat it on every prompt (see [Performance](performance.md)).
-Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB). Benchmarked on Qwen3-0.6B and Qwen3-4B.
-External documentation and papers are listed in [References](references.md).
-
----
-
-## 1. Design principles
-
-1. **Copy vLLM's and DeepInfer's structure, not their size.** Keep the layers they
-   have (engine → scheduler → model runner → model → kernels) and leave out
-   distributed execution, the multi-tenant scheduler and the request queues.
-2. **Plain Julia structs, no NN framework.** We never need autodiff. A model
-   is a struct of `CuArray`s plus an explicit `forward!`. This makes every
-   tensor allocation, layout and kernel launch visible.
-3. **Kernels behind a narrow interface.** Each op (`rmsnorm!`, `rope!`,
-   `linear!`, `attention_prefill!`, `attention_decode!`, …) has a
-   *reference* implementation (CPU / cuBLAS / broadcast) and a *cuTile*
-   implementation. Both are selected by a backend type parameter, so every new kernel is
-   correctness-tested against the reference and benchmarked from day one.
-4. **Element type as a type parameter everywhere** (`DecoderLM{T}`,
-   `PagedKVCache{T}`). Only BF16 is supported early on, but FP16/FP32 (and quantized
-   types later) only need a recompile of the kernels.
-5. **No allocations in the decode loop.** Buffers are preallocated, so the
-   decode step can be captured in a CUDA graph.
-
----
-
-## 2. Layered architecture
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│ CLI  (tileinfer pull | ls | rm | run | chat | bench)                     │
-├──────────────────────────────────────────────────────────────────────────┤
-│ Hub / ModelStore      HuggingFaceApi.jl → ~/.cache/huggingface/hub       │
-│ Tokenizer + ChatTemplate (tokenizer.json, tokenizer_config.json)         │
-├──────────────────────────────────────────────────────────────────────────┤
-│ LLMEngine   add_request / step / generate (streaming iterator)           │
-│   ├─ Scheduler        (single sequence: prefill chunks → decode steps)   │
-│   ├─ BlockManager     (page allocator + block tables, prefix reuse later)│
-│   ├─ SpecDecoder      (proposer + verifier + rejection sampler)          │
-│   └─ Sampler          (greedy / temperature / top-k / top-p on GPU)      │
-├──────────────────────────────────────────────────────────────────────────┤
-│ ModelRunner  builds InputMetadata, owns static buffers, CUDA graphs      │
-├──────────────────────────────────────────────────────────────────────────┤
-│ Model  DecoderLM{T}: Embedding → N × DecoderLayer → RMSNorm → LMHead     │
-│   (Llama 3 / Qwen3 / Mistral / Apertus selected by config flags)         │
-├──────────────────────────────────────────────────────────────────────────┤
-│ Ops (backend-dispatched)                                                 │
-│   RefBackend  : CUDA.jl broadcast + cuBLAS (+ CPU for tests)             │
-│   TileBackend : cuTile.jl kernels                                        │
-├──────────────────────────────────────────────────────────────────────────┤
-│ CUDA.jl 6 (CUDACore): CuArray, streams, events, graphs, memory pool      │
-└──────────────────────────────────────────────────────────────────────────┘
+```@meta
+CurrentModule = TileInfer
 ```
 
-### Mapping to DeepInfer / vLLM
+TileInfer is a single-GPU, single-client inference engine for Llama-style models. It keeps
+the layers of production engines such as [vLLM](https://github.com/vllm-project/vllm) and
+DeepSeek's DeepInfer (generation loop, model runner, model, paged KV cache, kernels) and
+leaves out everything that exists to serve many users at once: request queues, a batch
+scheduler, distributed execution. What remains is small enough to read in an afternoon, and
+every hot kernel in it is a [cuTile.jl](https://github.com/JuliaGPU/cuTile.jl) kernel.
 
-| TileInfer            | DeepInfer (`deepinfer/…`)                         | vLLM (v1)                     |
-|----------------------|---------------------------------------------------|-------------------------------|
-| `LLMEngine`          | `engine/llm_engine.py` (`LLMEngine.step`)         | `v1/engine/core.py`           |
-| `Scheduler`          | C++ scheduler (`scheduler.schedule`)              | `v1/core/sched/scheduler.py`  |
-| `BlockManager`       | `worker/cache_engine.py` (GPU cache interface)    | `v1/core/kv_cache_manager.py` |
-| `ModelRunner`        | `worker/model_runner.py`                          | `v1/worker/gpu_model_runner.py` |
-| CUDA graph capture   | `worker/cuda_graph_runner.py` (batch-size buckets)| `CUDAGraphWrapper`            |
-| `InputMetadata`      | `model_executor/input_metadata/`                  | `AttentionMetadata`           |
-| `Sampler`            | `model_executor/layers/sampler.py`                | `v1/sample/sampler.py`        |
-| `SpecDecoder`        | MTP / NextN draft (`mtp_info_pool.py`, `dflash`)  | `v1/spec_decode/`             |
-| `ops/` cuTile kernels| `layers/tilelang_ops`, FlashMLA, DeepGEMM         | `csrc/`, FlashAttention, FlashInfer |
+This page describes the layers from the top down. The three most involved parts have pages
+of their own: the [KV cache](kv_cache.md), the [attention kernels](attention.md) and
+[speculative decoding](speculative.md). Progress and plans are in
+[History and roadmap](roadmap.md).
 
-DeepInfer's `step()` has the same shape we want:
-`schedule → (copy/clone KV blocks) → execute_model_step → sample → post_process`.
-It also overlaps CPU scheduling of step *n+1* with GPU execution of step *n*
-("async scheduling"). With one client and CUDA graphs this matters less, but the
-overlap is worth adding later. The released DeepInfer is Blackwell- and
-multi-GPU-oriented, and its KV-cache system is not included in the release. Use
-vLLM as the reference for the paged KV design.
+## Design principles
 
----
+1. **Copy the structure of vLLM and DeepInfer, not their size.** The same layers, one
+   sequence at a time.
+2. **Plain Julia structs, no NN framework.** Nothing needs autodiff. A model is a struct of
+   `CuArray`s and an explicit forward pass, so every allocation, layout and kernel launch is
+   visible.
+3. **Kernels behind a narrow interface.** Every op has a reference implementation (CUDA.jl
+   broadcasts and cuBLAS) and a cuTile one, selected by a backend type. Each new kernel is
+   tested against the reference and benchmarked from the start.
+4. **The element type is a type parameter** (`DecoderLM{T}`, `PagedKVCache{T}`). BFloat16
+   by default; Float32 runs are how outputs are checked against Hugging Face transformers.
+5. **No allocations and no host synchronization in a decode step**, so that it can be
+   captured once as a CUDA graph and replayed.
 
-## 3. Module layout
-
-As built so far; files for later milestones (scheduler, spec decoding) are marked *(planned)*.
-
-```
-TileInfer/
-├── Project.toml                # [apps] tileinfer = {} (Julia ≥ 1.12 Pkg apps)
-├── src/
-│   ├── TileInfer.jl
-│   ├── config.jl               # ModelConfig parsed from config.json
-│   ├── hub/
-│   │   ├── store.jl            # pull/list/remove via HuggingFaceApi.jl
-│   │   └── loader.jl           # safetensors (mmap) → CuArray, name mapping
-│   ├── tokenizer/
-│   │   ├── bpe.jl              # own byte-level BPE from tokenizer.json
-│   │   └── chat_template.jl    # per-family templates, ported by hand
-│   ├── model/
-│   │   ├── weights.jl          # ModelWeights / LayerWeights (fused qkv, gate_up)
-│   │   ├── rope.jl             # RotaryTable
-│   │   └── decoder.jl          # DecoderLM{T}, StepBuffers, prepare_step!, run_step!, forward!
-│   ├── kv/
-│   │   ├── paged_cache.jl      # PagedKVCache{T}: per-layer page pools
-│   │   └── block_manager.jl    # Sequence, free list, block tables, truncate (spec rollback)
-│   ├── engine/
-│   │   ├── runner.jl           # ModelRunner: CUDA graphs per token count, pipelined decode
-│   │   ├── sampler.jl          # SamplingParams, sampling_uniform, host reference, TokenSampler
-│   │   ├── generate.jl         # generate!, generation defaults, TextStream
-│   │   ├── chat.jl             # ChatSession with prefix reuse
-│   │   ├── speculative.jl      # n-gram and draft-model proposers, verify step (device sampling per position), speculative generate (M7)
-│   │   └── dflash.jl           # DFlash drafter (a block of drafts in one non-causal pass) and its proposer
-│   ├── ops/
-│   │   ├── interface.jl        # abstract backend + op signatures, fused-op fallbacks
-│   │   ├── reference.jl        # RefBackend
-│   │   ├── quant.jl            # Int8Weight, Int8Pages (INT8 weights and KV cache)
-│   │   └── tile/               # TileBackend: one file per kernel family
-│   │       ├── norm.jl         # RMSNorm, fused residual add + RMSNorm
-│   │       ├── elementwise.jl  # rope, silu_mul, xielu, KV write, embedding
-│   │       ├── linear.jl       # GEMV (decode) and GEMM (prefill), BF16 and INT8
-│   │       ├── fused.jl        # attention inputs: q/k norm + rope + KV write
-│   │       ├── attention.jl    # paged flash-attention: prefill, split-KV decode + combine
-│   │       └── sampling.jl     # device top-k/top-p sampling, greedy as top-1 (spec_verify planned)
-│   └── cli.jl
-├── test/                       # per-op tests vs reference; e2e vs HF logits
-├── bench/                      # per-kernel + end-to-end tok/s, NVTX ranges
-└── docs/
-```
-
----
-
-## 4. Data layout conventions (Julia is column-major)
-
-Julia arrays are column-major and PyTorch tensors are row-major. If we reverse
-every shape, the memory stays identical, so that is the convention here (it is
-also what cuTile.jl's FMHA example does):
-
-| Tensor            | PyTorch (row-major)          | TileInfer (column-major)               |
-|-------------------|------------------------------|----------------------------------------|
-| hidden states     | `(tokens, hidden)`           | `(hidden, tokens)`                     |
-| Q                 | `(tokens, heads, d)`         | `(d, heads, tokens)` or `(d, tokens, heads)` per kernel |
-| Linear weight     | `(out, in)`                  | `(in, out)` → `y = Wᵀ x`               |
-| Paged K/V cache   | `(pages, page, kvh, d)`      | `(d, page, kvh, pages)` per layer      |
-| Block table       | `(seqs, max_pages)`          | `(max_pages, seqs)` Int32              |
-
-- **Weights load without a transpose copy.** SafeTensors.jl 1.3 memory-maps
-  the file and returns a `PermutedDimsArray` over the row-major buffer.
-  `parent()` of it is exactly the `(in, out)` column-major array, so it can go
-  straight into a `CuArray` (in BF16 via BFloat16s.jl).
-- Put the reduction dimension first (contiguous) for GEMM/GEMV.
-- One K and one V pool per layer, `CuArray{T,4}` of shape
-  `(head_dim, PAGE, n_kv_heads, n_pages)`, with `PAGE` = attention `TILE_N`
-  (64 or 128). A KV tile is then exactly one page, and a `ct.load` with a
-  runtime page index is a single dense, aligned tile load.
-
----
-
-## 5. Model
-
-One generic `DecoderLM{T}` covers the Llama-style family. Per-family
-differences are config flags:
-
-| Flag                  | Llama 3.x | Qwen3 | Mistral | Apertus |
-|-----------------------|-----------|-------|---------|---------|
-| q/k RMSNorm           |           | ✓     |         | ✓       |
-| MLP                   | SwiGLU    | SwiGLU | SwiGLU | xIELU, ungated |
-| tied embeddings       | small     | small |         |         |
-| RoPE scaling          | llama3    |       |         | llama3  |
-| sliding window        |           |       | (v0.1)  |         |
-
-Apertus (swiss-ai) uses xIELU, an activation with learned scalars per layer
-(`up → xIELU → down`, no gate projection). Apertus 1.5 is multimodal, so only its decoder
-is loaded: the decoder settings are nested under `text_config`, its tensors sit under
-`model.language_model.`, and the embedding rows past the 131,072 text tokens (image and
-audio codes) are skipped. `pull` leaves out the image and audio tokenizer shards. Its
-tokenizer has 136k added tokens and a normalizer that rewrites reasoning markers. The 8B
-needs 16.1 GB in BFloat16, so it runs with weight-only INT8 (`--int8`, 8.6 GB, 80 tok/s;
-see [Performance](performance.md)). Correctness is checked on a tiny random Apertus and, when the 8B is
-pulled, against transformers' Float32 run of it on the CPU (`scripts/gen_apertus_fixtures.py`).
-
-Suggested targets on 16 GB in BF16: **Qwen3-0.6B / 1.7B / 4B**, and
-**Llama-3.2-1B / 3B**. For speculative decoding: Qwen3-4B target with
-Qwen3-0.6B draft (same tokenizer, about 9.5 GB combined, which leaves room for
-the KV cache).
-
-Forward pass for one step (`T` = tokens in this step):
+## Layers
 
 ```
-x = embed[ids]                                  # gather          (H, T)
-for layer in layers
-    h = rmsnorm(x)                              # fused add+norm after layer 0
-    qkv = linear(h, Wqkv)                       # one fused projection
-    q, k = rope(q, k, positions)  (+ q/k norm)  # fused
-    kv_write!(cache, k, v, slot_mapping)        # scatter into pages
-    o = attention(q, cache, metadata)           # prefill | decode | verify
-    x = x + linear(o, Wo)
-    h = rmsnorm(x)
-    x = x + linear(swiglu(linear(h, Wgate_up)), Wdown)
-logits = linear(rmsnorm(x)[:, last_positions], Wlm)
+┌───────────────────────────────────────────────────────────────────────┐
+│ CLI         tileinfer pull | ls | rm | run | chat                     │
+├───────────────────────────────────────────────────────────────────────┤
+│ Generation  generate, generate!, ChatSession                          │
+│             speculative decoding: proposers + verify steps            │
+├───────────────────────────────────────────────────────────────────────┤
+│ ModelRunner step buffers, CUDA graphs, pipelined decode,              │
+│             sampling on the device                                    │
+├───────────────────────────────────┬───────────────────────────────────┤
+│ Model       DecoderLM{T}          │ KV cache    PagedKVCache          │
+│             prepare_step!         │             BlockManager          │
+│             run_step!             │             Sequence              │
+├───────────────────────────────────┴───────────────────────────────────┤
+│ Ops         RefBackend: CUDA.jl broadcasts + cuBLAS                   │
+│             TileBackend: cuTile kernels                               │
+├───────────────────────────────────────────────────────────────────────┤
+│ CUDA.jl (arrays, streams, graphs, cuBLAS) and cuTile.jl (Tile IR)     │
+└───────────────────────────────────────────────────────────────────────┘
+  Beside the stack: Hub (pull, safetensors loading), tokenizer and chat
+  templates, ModelConfig.
 ```
 
-The checkpoint's separate `q_proj`, `k_proj`, `v_proj` and `gate_proj`, `up_proj` weights are concatenated once at load time
-(as vLLM does), so there are fewer, larger GEMMs.
+### Hub, configuration and tokenizer
 
----
+[`pull`](@ref) downloads a model's safetensors, configs and tokenizer into the Hugging Face
+hub cache (`~/.cache/huggingface/hub`, shared with Python), and [`model_dir`](@ref) finds them
+again offline. [`load_config`](@ref) reads `config.json` into a [`ModelConfig`](@ref).
+Weights are memory-mapped with SafeTensors.jl and uploaded straight to the GPU without a
+transpose (see [Data layout](#Data-layout)); the q, k, v projections and the gate and up
+projections are concatenated at load time, so each layer runs two fewer GEMMs.
 
-## 6. KV cache & block manager
+The tokenizer is TileInfer's own byte-level BPE ([`BPETokenizer`](@ref)), read from
+`tokenizer.json` and checked against Hugging Face `tokenizers`. Chat templates are ported by
+hand per model family ([`chat_prompt`](@ref)) instead of running a Jinja engine, and checked
+against the real templates' output.
 
-- At startup, measure free memory after loading weights and allocating
-  activations. Allocate `n_pages` for a configured fraction of what remains
-  (vLLM's `gpu_memory_utilization`).
-- `BlockManager`: a free list of page ids, and for each sequence a block table
-  (`Vector{Int32}`, mirrored into a device `CuMatrix{Int32}`) plus `seq_len`.
-- `slot_mapping` (token → `(page, offset)`) is computed on the host per step,
-  uploaded into a static device buffer, and consumed by `kv_write!`.
-- **Truncating is free.** Rolling back a sequence (rejected speculative
-  tokens, or a regenerate in chat) only decrements `seq_len` and returns
-  surplus pages. No data is moved.
-- **Prefix reuse in chat (M3):** a `ChatSession` keeps one sequence alive, re-renders
-  the conversation each turn, truncates the sequence to the longest token prefix it
-  shares with the new prompt, and prefills only the rest. Templates that rewrite
-  history (Qwen3 drops earlier `<think>` blocks) shorten the reusable prefix to the
-  start of the previous reply; that is the model's training format, so it is followed.
-- Later: **prefix caching across sequences** (hash full pages of the token prefix,
-  refcount pages), once several sequences share the pool.
+### Generation
 
-Even with a single sequence, paging pays off: chat sessions can grow without
-reallocation, rollback is trivial, prefix caching becomes possible, and the
-attention kernels are the real thing. "Batch" in the kernels is
-always ≥ 1 (target + draft, or later several sequences), so we never bake in a
-batch size of 1.
+[`generate!`](@ref) is the loop that production engines call `LLMEngine.step`: prefill the
+prompt in one forward pass, then decode one token per step until a stop token or the token
+budget. With a single sequence there is nothing to schedule, so the loop is the scheduler.
+[`ChatSession`](@ref) keeps one sequence alive across turns and only runs the tokens a turn
+adds (see [KV cache](kv_cache.md#Prefix-reuse-in-chat)).
 
----
+With a proposer, decoding becomes speculative: a cheap proposer guesses several tokens, one
+forward step of the model checks them all, and the sequence is rolled back past the first
+wrong guess. See [Speculative decoding](speculative.md).
 
-## 7. Kernels (cuTile.jl)
+### Model runner
 
-| # | Kernel | Phase | Notes |
-|---|--------|-------|-------|
-| 1 | `rmsnorm!` (+ fused residual add) | prefill/decode | row reduction per token; start from `examples/layernorm.jl` |
-| 2 | `rope!` (+ Qwen3 q/k norm) | both | in-place on Q/K, positions from metadata |
-| 3 | `kv_write!` | both | `ct.scatter` or per-page `ct.store` driven by `slot_mapping` |
-| 4 | `linear!` GEMM | prefill | start from `examples/matmul.jl`; cuBLAS as baseline |
-| 5 | `linear!` GEMV / skinny GEMM | decode | memory-bound; split-K, wide loads; the most important kernel for decode tok/s |
-| 6 | `silu_mul!` | both | later fused into the gate_up GEMM epilogue |
-| 7 | `attention_prefill!` | prefill | FA-2 online softmax from `examples/fmha.jl`, walking the block table one page (= one KV tile) per step; only diagonal pages masked |
-| 8 | `attention_decode!` | decode/verify (≤ 8 tokens) | flash-decoding: GQA-packed query tile, fixed split count (grid independent of context), FP32 partials, combine kernel |
-| 9 | `sample_token!` | decode | temperature / top-k (≤ 64) / top-p, greedy as top-1: per-chunk top-k by repeated argmax, then one block merges and samples by inverse transform with a counter-based uniform; done 2026-10-29 |
-| 10 | `spec_verify!` | spec | parallel rejection sampling over k drafts, accept-length per sequence |
-| 11 | `embedding!` | both | `ct.gather` on rows |
+[`ModelRunner`](@ref) owns everything that makes a step fast without changing what it
+computes:
 
-### Attention: one kernel family, three uses
+- **Static step buffers.** A step of n tokens reads and writes only a preallocated
+  `StepBuffers`: its inputs (token ids, positions, cache slots, block table), every
+  intermediate activation, and the logits. [`prepare_step!`](@ref)
+  reserves cache pages and uploads the inputs in one asynchronous copy from pinned memory.
+- **CUDA graphs.** Steps of up to 8 tokens (decode, short verify steps) run eagerly the first
+  time, which compiles their kernels, and are then captured. Later steps of that size upload
+  their inputs and replay the graph: one launch instead of hundreds. Kernels read every
+  per-step value from device buffers, never from launch arguments, which a graph would
+  freeze. Longer steps (prefill) run eagerly.
+- **Sampling on the device.** Greedy, temperature, top-k and top-p sampling run inside the
+  captured step ([`sample_token!`](@ref)). A sampled token is a pure function of the logits,
+  the parameters and a counter-based random number, so the device sampler and its host
+  reference pick the same tokens.
+- **Pipelined decoding.** Two sets of step buffers alternate: each step samples its token
+  straight into the next step's inputs and into host-mapped memory, so the host launches step
+  n + 1 before reading the token of step n. The GPU does not wait for the host between steps.
 
-The attention variants differ in the number of query rows per sequence:
+### Model
 
-- **chunked prefill**: `M = chunk` (e.g. 512) against past pages plus the current chunk
-- **decode**: `M = 1`
-- **spec verify**: `M = k + 1` against past pages, with a causal mask among the k+1 tokens
+[`DecoderLM`](@ref) is a configuration, the weights, RoPE tables and a backend. One struct
+covers the Llama-style family; the differences between families are configuration flags:
 
-So the core is one **paged FlashAttention** kernel, with the KV loop walking
-the block table:
+| | Llama 3.x | Mistral | Qwen3 | Apertus |
+|---|---|---|---|---|
+| q/k RMSNorm before RoPE | | | ✓ | ✓ |
+| MLP | SwiGLU | SwiGLU | SwiGLU | xIELU, ungated |
+| RoPE scaling | llama3 | | | llama3 |
+| tied embeddings | small models | | small models | |
 
-```julia
-for j in 0:n_pages-1
-    page = block_table[j + 1, seq]                       # scalar load
-    k = ct.load(Kc; index=(1, 1, kvh, page), shape=(D, PAGE, 1, 1))
-    ...online softmax, muladd(v, p, acc)...
-end
-```
+Apertus 1.5 is multimodal: only its decoder is loaded, and the image and audio tokenizers
+are skipped at download time. Sliding-window attention (older Mistral checkpoints) is not
+supported.
 
-With Tile IR ≥ 13.3, *sparse views* (`@view Kc[:, :, kvh, page_tile]`) gather
-several pages in one load. Measure both.
-
-When M is small (decode/verify), a 128-row Q tile is mostly empty. Two fixes:
-- **GQA packing**: put the `group_size × (k+1)` query rows that share a KV head
-  into the M dimension of one tile (Qwen3-4B: 32 Q / 8 KV heads → 4 rows per token).
-- **Split-KV (flash-decoding)**: grid over `(kv_heads, splits)`, write partial
-  `(acc, m, l)` in FP32, then run a small combine kernel. This is needed to fill
-  80 SMs at batch 1. Use an FP32 workspace: BF16 atomic add needs sm_90.
-
-### Ada-specific constraints (from cuTile.jl compatibility docs)
-
-- Tile IR on sm_89 needs bytecode ≥ v13.2. cuTile.jl 1.0 targets v13.1–13.4.
-  Driver ≥ 580 (this machine: 615).
-- Supported element types: BF16/FP16/TF32/FP32. **No FP8 in Tile IR on Ada**,
-  even though the hardware has it, so quantization would mean INT8 or
-  weight-only schemes.
-- No TMA, wgmma or thread-block clusters (`num_cta_in_cga = 1`), and no
-  programmatic dependent launch. Kernels compile to `mma.sync`-style code, so
-  tile-size tuning and the `latency` hints matter most.
-- The 4080 SUPER has about 736 GB/s of memory bandwidth, so the decode roofline
-  ≈ 736 GB/s ÷ weight bytes: about 90 tok/s for Qwen3-4B in BF16 and about 580 tok/s
-  for 0.6B. These are the numbers to aim for.
-
----
-
-## 8. Speculative decoding
-
-Build it in stages. Each stage reuses the verifier.
-
-1. **Verifier + rejection sampler** (model-agnostic): run the target on
-   `[last_token, d1..dk]` (M = k+1 per sequence, paged causal attention),
-   accept the longest valid prefix (greedy match, or Leviathan/Chen rejection
-   sampling for temperature > 0: the target's own sample for deterministic drafts,
-   the p/q rule for drafts sampled from a recorded q), sample a bonus token, and
-   truncate the KV of rejected positions.
-2. **N-gram / prompt-lookup proposer**: no draft model, all on the CPU. It
-   exercises the full verify path and is very effective on chat or code that
-   repeats earlier context.
-3. **Draft-model proposer**: Qwen3-0.6B drafting for Qwen3-4B. It has its own
-   `DecoderLM` and its own `PagedKVCache` but shares the `BlockManager` logic. The k
-   draft steps form a natural CUDA graph.
-4. **EAGLE-3 drafter** (removed 2026-11-01, see [Performance](performance.md)): one layer reading the
-   residual stream of three target layers, drafts chained one token at a time like the
-   draft model. DFlash, which reads the same kind of states, beat it on every prompt.
-5. **DFlash drafter** (`src/engine/dflash.jl`): five Qwen3 layers whose keys and
-   values for context positions come from five target layers' states (which the
-   target's steps keep, `enable_aux!`), and a block
-   of [next token, 15 masks] attending without the causal mask (`attention(…;
-   causal = false)`), so one pass drafts 15 tokens; verify steps take up to 16.
-6. Later: dynamic k based on acceptance rate (DeepInfer's scheduler adapts using
-   measured forward/sample times).
-
-The engine's `step()` becomes: `propose → verify → accept → rollback → emit
-1..k+1 tokens`.
-
----
-
-## 9. ModelRunner & CUDA graphs
-
-Implemented in M6 (`src/model/decoder.jl`, `src/engine/runner.jl`):
-
-- **One forward pass, written in place.** `run_step!` runs a step entirely on the device,
-  writing only into a `StepBuffers` (every activation, the logits) and the KV cache. Every
-  op has an in-place form (`rmsnorm!`, `linear!`, …); TileBackend's allocate nothing, and
-  RefBackend falls back to "compute, then copy", so both backends share the same layer
-  loop. `forward!(model, cache, seq, ids)` is that step with buffers allocated for it.
-- **Inputs on the device.** The step's metadata (the vLLM `InputMetadata` for one
-  sequence): token ids, 0-based positions, cache slots, and the block table zero-padded to
-  the pool's page count (a multiple of 16, so its length never changes). `prepare_step!`
-  reserves pages and uploads them with `copyto!` before the step (synchronous pageable
-  copies for now; pinned async copies later). Kernels read `start` and positions from
-  these buffers, never as scalar launch arguments, which a graph would freeze.
-- **`ModelRunner(model, cache)`.** Steps of up to 8 tokens (decode, spec verify) keep a
-  `StepBuffers` per token count. The first step of a count runs eagerly (that compiles its
-  kernels), then is captured with `CUDA.capture`/`instantiate`; later steps upload their
-  inputs and `CUDA.launch` the graph. Longer steps (prefill) run eagerly. Graphs are
-  keyed by tokens per step only, as there is one sequence; with several sequences the key
-  becomes `(num_seqs, tokens_per_seq)` buckets, as in DeepInfer's `build_graph_batch_sizes`.
-  The graph holds the addresses of weights, pools and buffers, so it is valid for the
-  runner's lifetime. `generate!` and `ChatSession` (graphs persist across turns) use it.
-- **Correctness:** a replayed step's logits are bit-identical to an eager step's, and a
-  decode step allocates no GPU memory (`test/engine/runner.jl`).
-- Graphs remove the host cost of the ~540 launches of a decode step (≈ 5 µs each), but not
-  their GPU-side cost: tiny kernels still take 2–3 µs each, so fusion (M8+) is what
-  reduces the step further. Replaying the graph itself costs ~0.34 ms of host time, which
-  overlaps with the GPU.
-
----
-
-## 10. Compilation & startup latency
-
-- cuTile specializes on `ct.Constant` arguments (tile sizes, head_dim, flags)
-  and element types. It caches compiled CUBINs across sessions in Julia's
-  object cache (the `disk_cache` preference, on by default).
-- `TileInfer.warmup(model)` compiles every kernel specialization the model needs
-  at load time. Do it inside a `PrecompileTools` workload for the Julia side.
-- CLI start time: install with **Julia 1.12 Pkg apps** (`[apps]` in
-  Project.toml → `~/.julia/bin/tileinfer`). Keep `chat` as a long-lived
-  process. `juliac --trim` is not realistic with the GPU compiler stack.
-
----
-
-## 11. CLI
+A step (`run_step!`) runs entirely on the device:
 
 ```
-tileinfer pull Qwen/Qwen3-4B [--revision main]   # *.safetensors, config, tokenizer
-tileinfer ls                                     # cached models (shared with Python HF cache)
-tileinfer rm Qwen/Qwen3-4B
-tileinfer run Qwen/Qwen3-4B "Hello" [--max-tokens 256 --temperature 0.7 --top-k 20 --top-p 0.9 --seed 1 --thinking off --raw]
-tileinfer chat Qwen/Qwen3-4B [--draft Qwen/Qwen3-0.6B | --ngram 3] [--k 4]
-tileinfer bench Qwen/Qwen3-4B [--prompt-len 512 --gen 256] [--backend ref|tile]
+x = embed(ids)                                      # (hidden, n)
+h = rmsnorm(x)
+for each layer
+    qkv = linear(h, Wqkv)                           # one fused projection
+    q = attention_inputs!(qkv, positions, slots)    # q/k norm, RoPE, write k and v to the cache
+    o = attention!(q, cache, block_table)           # paged flash-attention
+    x += linear(o, Wo);  h = rmsnorm(x)             # one fused op
+    a = linear_swiglu!(h, Wgate_up)                 # GEMV with a SwiGLU epilogue at n = 1
+    x += linear(a, Wdown);  h = rmsnorm(x)          # the next layer's norm, or the final one
+logits = linear(h[:, last], Wlm_head)               # Float32 logits
 ```
 
-`pull` = `HuggingFaceApi.list_repo_files` filtered to the allowed patterns, then
-`hf_hub_download` per file. This gives the same cache layout as Python's
-`huggingface_hub` and honours `HF_TOKEN`, `HF_HOME` and `HF_HUB_OFFLINE`.
+### Ops and backends
 
----
+Each op is a generic function with a method per backend ([`Backend`](@ref)):
+[`RefBackend`](@ref) composes CUDA.jl broadcasts and cuBLAS and rounds where PyTorch rounds,
+so it is the ground truth in tests; [`TileBackend`](@ref) runs cuTile kernels, one file per
+kernel family in `src/ops/tile/`. Every op also has an in-place form that writes into the
+step buffers, and fused ops ([`attention_inputs!`](@ref), [`add_rmsnorm!`](@ref),
+[`linear_swiglu!`](@ref)) have generic fallbacks that chain the primitive ops, so a backend
+only needs to implement what it wants to speed up.
 
-## 12. Reused Julia packages
+| Kernel family | File | What it does |
+|---|---|---|
+| Normalization | `norm.jl` | RMSNorm, and residual add + RMSNorm in one pass |
+| Element-wise | `elementwise.jl` | RoPE, SwiGLU, xIELU, KV-cache writes, embedding lookup |
+| Linear | `linear.jl` | GEMV for decode, GEMM with per-shape tiles for prefill, BF16 and INT8 weights |
+| Attention inputs | `fused.jl` | q/k norm + RoPE + KV write in one launch per step |
+| Attention | `attention.jl` | paged flash-attention: prefill, split-KV decode + combine ([details](attention.md)) |
+| Sampling | `sampling.jl` | top-k/top-p sampling and speculative acceptance on the device |
 
-Versions are as of 2026-10-26, checked against the repos.
+## Mapping to vLLM and DeepInfer
 
-| Package | Use | Verdict |
-|---------|-----|---------|
-| **cuTile.jl** 1.0 (JuliaGPU) | all hot kernels | **Core.** Has `load/store/gather/scatter`, sparse views, `muladd` (MMA), reductions, atomics, `ct.Constant` specialization, CUBIN disk cache. FMHA, matmul, layernorm, softmax and MoE examples are good starting points. |
-| **CUDA.jl** 6.3 (CUDACore + libs) | arrays, streams, events, graphs, memory pool, cuBLAS baseline, NVTX | **Core.** Held at 6.3: the registered cuTile 1.0.0 caps `CUDA_Compiler_jll` at 0.5, while CUDA 6.4 needs 0.6 (cuTile main already allows it). |
-| **HuggingFaceApi.jl** 0.2 | `pull`, cache, auth, `list_repo_files` | **Use.** Light deps (Downloads, JSON, ProgressMeter), Python-compatible cache, actively maintained (Oct 2026). No snapshot function, but it takes about 10 lines on top of `list_repo_files`. |
-| **SafeTensors.jl** 1.3 (FluxML) | weight loading | **Use.** Memory-maps files, supports BF16 (via BFloat16s) and FP8 (DLFP8Types). Take `parent()` of the returned permuted view for zero-transpose upload. |
-| **BFloat16s.jl** | host-side BF16 | Use (already pulled in by cuTile). |
-| **BytePairEncoding.jl** / **TextEncodeBase.jl** | — | **Not used.** TextEncodeBase 0.8.3 fails to precompile on Julia 1.13 (a docstring `@macroexpand` hack in `vocab.jl`). Replaced by our own byte-level BPE (`src/tokenizer/bpe.jl`), tested against HF `tokenizers` fixtures. |
-| **Transformers.jl** | — | **Reference only, do not depend on it.** Last commit 2025-03. Pins `CUDA = "5"`, Flux 0.14 and Zygote, which conflicts with cuTile/CUDA 6. Built for training and research, with no paged KV. Useful for its HF config/weight-name mapping and tokenizer loading code (llama, phi, gpt-neox implementations). |
-| Flux.jl / Lux.jl / NNlib.jl | — | **Skip.** No autodiff needed. Layer abstractions would hide exactly what we want to see. Plain Julia/CPU references are enough for tests. |
-| NeuralAttentionlib.jl | — | Optional test oracle for attention variants; plain Julia is probably simpler. |
-| **OteraEngine.jl** 1.1 | — | **Not used for now.** Chat templates are ported by hand per family (`src/tokenizer/chat_template.jl`, Qwen3 without tools so far) and checked against the model's real Jinja template rendered by jinja2 (`scripts/gen_fixtures.py chat`). |
-| **Comonicon.jl** | CLI subcommands | Use, or keep a tiny hand-written argument parser plus Pkg apps. |
-| JSON.jl | config.json, tokenizer.json | Use (already a transitive dep). |
-| NVTX.jl, BenchmarkTools.jl | profiling (Nsight Systems/Compute), micro-benchmarks | Dev deps. |
-| PythonCall.jl (test env only) | golden logits/tokens from HF `transformers` + `tokenizers` | Strongly recommended for e2e tests. |
+| TileInfer | vLLM (v1) | DeepInfer |
+|---|---|---|
+| [`generate!`](@ref), [`ChatSession`](@ref) | `v1/engine/core.py` | `engine/llm_engine.py` |
+| (one sequence, no scheduler) | `v1/core/sched/scheduler.py` | C++ scheduler |
+| `BlockManager`, [`PagedKVCache`](@ref) | `v1/core/kv_cache_manager.py` | `worker/cache_engine.py` |
+| [`ModelRunner`](@ref) and its CUDA graphs | `v1/worker/gpu_model_runner.py`, `CUDAGraphWrapper` | `worker/model_runner.py`, `cuda_graph_runner.py` |
+| `StepBuffers` (positions, slots, block table) | `AttentionMetadata` | `model_executor/input_metadata/` |
+| device sampling ([`sample_token!`](@ref)) | `v1/sample/sampler.py` | `model_executor/layers/sampler.py` |
+| proposers and verify steps | `v1/spec_decode/` | MTP / NextN drafts, DFlash |
+| `src/ops/tile/` | `csrc/`, FlashAttention, FlashInfer | TileLang ops, FlashMLA, DeepGEMM |
 
----
+DeepInfer's release targets Blackwell and several GPUs and leaves its KV-cache system out,
+so vLLM is the reference for the paged KV design.
 
-## 13. Roadmap
+## Module layout
 
-| Milestone | Deliverable | Success criterion |
-|-----------|-------------|-------------------|
-| M0 ✅ | Julia + CUDA.jl + cuTile.jl installed; run `examples/fmha.jl`, `matmul.jl` on the 4080S; CUDA-graph capture spike with a cuTile kernel | done 2026-10-26: `test/smoke/` 21/21 pass, launch overhead measured (spike removed 2026-11-01) |
-| M1 ✅ | `pull/ls/rm`; config + safetensors loader; tokenizer (+ tests vs Python) | done 2026-10-26: own byte-level BPE matches HF `tokenizers` on the fixture corpus; Qwen3 chat template matches its Jinja template; weights load (fused qkv / gate_up, tied lm_head) in 0.17 s from page cache |
-| M2 ✅ | `DecoderLM` with **RefBackend** (cuBLAS + broadcasts, contiguous KV) | done 2026-10-26: Float32 logits match HF to ~1e-4 with identical 24-token greedy continuations; BF16 within 0.625 (≈5 ulps), top-1 equal except one exact tie; `tileinfer run` streams text at ~27–29 tok/s decode (Qwen3-0.6B, reference path, ≈5 % of the roofline), first token after ~13 s in a fresh process (JIT) |
-| M3 ✅ | Paged KV + BlockManager; `chat` with multi-turn | done 2026-10-26: paged reference path matches the HF Float32 fixtures (also with 4-position, fragmented pages); `tileinfer chat` reuses the cached common prefix across turns, and a reply with reuse equals a fresh run on the full prompt; decode ~20 tok/s (the reference attention gathers every page of the sequence at each step) |
-| M4 ✅ | cuTile kernels one by one (norm, rope, kv_write, silu, GEMV, GEMM) | done 2026-10-27 (`src/ops/tile/`): element-wise kernels bit-identical to the reference, linear ≤ 1 BF16 ulp; whole model on TileBackend matches the HF Float32 fixtures (identical greedy continuations). Decode GEMV 68–93 % of the DRAM roofline (1.0–1.3× cuBLAS); prefill GEMM 0.70–0.92× cuBLAS; rope/rmsnorm/store_kv/embed 3–29× the reference. End to end: prefill 1.47×, decode only 1.13× — the reference attention fallback (≈1 ms/layer, ~6k GPU allocations per token, GC spikes) dominates until M5; tiny decode kernels sit at the ~5.5 µs launch floor until CUDA graphs (M6) |
-| M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
-| M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
-| M7 ✅ | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report. Verifier + n-gram proposer done 2026-10-29 (`src/engine/speculative.jl`): verify steps (all-token logits + device sampling per position with plain decoding's counters, which for a deterministic proposer is rejection sampling) captured as graphs; same tokens and cache state as plain greedy and sampled decoding in Float32. Code-editing prompt: 4.15× (0.6B) / 3.75× (4B) at k = 7; open-ended text with nothing to copy 0.96× / 1.05×; the same with Qwen3's recommended sampling. Draft-model proposer (Qwen3-0.6B for 4B, greedy drafts as a chain of graphs) on chat prompts (`bench/speculative.jl`): 1.4–1.8× on explanations and stories, 1.8–1.9× on code edits, greedy or sampled; n-gram up to 4.2× when the reply copies the prompt. EAGLE-3 (AngelSlim/Qwen3-4B_eagle3: target layers 2/18/33 kept by the steps, one drafter layer, 32k draft vocabulary): 1.46–1.82× on open prompts, best on stories (1.57× sampled), acceptance as AngelSlim reports. DFlash (z-lab/Qwen3-4B-DFlash-b16, 2026-10-30; drafts match a transcription of z-lab's reference in Float32): one non-causal pass of five layers drafts 15 tokens for 3.2 ms (lm_head included, 80 % of its roofline), a 16-token verify costs 5 % more than a decode step; at k = 15, 8.5× on the rename prompt and 1.9–3.0× on open prompts (1.75–3.2× sampled), best of all proposers on every prompt. Sampled drafts with the general p/q rule (2026-10-30, `sample = true`, `--sample-drafts`): drafters record each draft's q, the verify step accepts with min(1, p/q) or resamples max(p − q, 0) on the device; with Qwen3's sampling, +8 % on the open "explain" prompt, −3–12 % on the code one, mixed on the others, so greedy drafts stay the default. CLI `--speculate K`, `--draft MODEL`, `--eagle DRAFTER`, `--dflash DRAFTER`, `--sample-drafts` |
-| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant (weight-only INT8 done 2026-10-31), multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see [Performance](performance.md)): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device sampling (greedy, temperature / top-k / top-p) inside the graph with pipelined decode, per-shape GEMM tiles. Decode is at 73 % of the roofline on 0.6B and 88 % on 4B, sampled as fast as greedy (M8 target met on 4B only). Not pursued: attention combine fused into the split kernel (slower) |
+```
+src/
+├── TileInfer.jl            # module, public API, includes
+├── config.jl               # ModelConfig from config.json
+├── cli.jl                  # the tileinfer command line
+├── hub/
+│   ├── store.jl            # pull / list / remove in the hub cache
+│   └── loader.jl           # safetensors (memory-mapped) → CuArray, fused projections, INT8
+├── tokenizer/
+│   ├── bpe.jl              # byte-level BPE from tokenizer.json
+│   └── chat_template.jl    # chat templates, ported by hand per family
+├── model/
+│   ├── weights.jl          # ModelWeights, LayerWeights
+│   ├── rope.jl             # RotaryTable
+│   └── decoder.jl          # DecoderLM, StepBuffers, prepare_step!, run_step!, forward!
+├── kv/
+│   ├── block_manager.jl    # Sequence, BlockManager: pages, block tables, rollback
+│   └── paged_cache.jl      # PagedKVCache: page pools per layer
+├── engine/
+│   ├── runner.jl           # ModelRunner: CUDA graphs, pipelined decode
+│   ├── sampler.jl          # SamplingParams, host reference sampler, TokenSampler
+│   ├── generate.jl         # generate, generate!, generation_defaults, TextStream
+│   ├── chat.jl             # ChatSession with prefix reuse
+│   ├── speculative.jl      # verify steps, n-gram and draft-model proposers
+│   └── dflash.jl           # DFlash drafter and proposer
+└── ops/
+    ├── interface.jl        # Backend, op signatures, generic fallbacks
+    ├── reference.jl        # RefBackend
+    ├── quant.jl            # Int8Weight, Int8Pages
+    └── tile/               # TileBackend: norm, elementwise, linear, fused, attention, sampling
+```
 
-### M8 priorities (2026-10-31)
+## Data layout
 
-Chosen for what each teaches and demos, not only for raw speed; (+++) were taken first (results in [Performance](performance.md)).
+Julia arrays are column-major and PyTorch tensors row-major. Reversing every shape keeps the
+bytes identical, so that is the convention throughout (it is also what cuTile.jl's
+attention example does):
 
-| Item | Why |
+| Tensor | PyTorch | TileInfer |
+|---|---|---|
+| hidden states | `(tokens, hidden)` | `(hidden, tokens)` |
+| per-head tensors | `(tokens, heads, head_dim)` | `(head_dim, heads, tokens)` |
+| linear weight | `(out, in)` | `(in, out)`, applied as `y = Wᵀx` |
+| paged K or V pool, per layer | `(pages, page_size, kv_heads, head_dim)` | `(head_dim, page_size, kv_heads, pages)` |
+
+- **Weights load without a transpose.** SafeTensors.jl returns a `PermutedDimsArray` over
+  the memory-mapped row-major file; its `parent()` is already the `(in, out)` column-major
+  matrix, which is uploaded as is.
+- **The reduction dimension comes first**, contiguous in memory, for every GEMM and GEMV.
+- **A KV tile is a page.** The keys of one page and one KV head form a dense
+  `(head_dim, page_size)` tile, so the attention kernels load a page in one aligned load.
+
+## Hardware and compilation
+
+TileInfer is developed and tuned on an RTX 4080 SUPER (Ada, sm_89, 80 SMs, 16 GB,
+~736 GB/s). On Ada, Tile IR has no FP8, no TMA, no thread-block clusters and no BF16 atomic
+add, so quantization means INT8 and cross-block reductions use Float32 workspaces. At batch
+size 1, decode reads every weight once per token, so its speed limit is memory bandwidth:
+about 90 tok/s for Qwen3-4B in BFloat16 and 560 tok/s for Qwen3-0.6B, at 1,024 positions.
+
+cuTile compiles a kernel on its first launch for each combination of element types, constant
+arguments and array shape properties (divisibility, contiguity), and caches the result on
+disk across sessions. A first reply in a fresh process therefore includes a few seconds of
+compilation. Arrays that grow during decoding, such as the block table, are padded so that
+their shape properties never change. Measured codegen rules are collected in
+[cuTile quirks](cutile_quirks.md).
+
+## Dependencies
+
+| Package | Used for |
 |---|---|
-| **INT8 KV cache** (+++) — done: keys smoothed by the k_norm weight; attention in 32-key tiles and head-dim halves (no spills, 79 % of DRAM bandwidth); 4B decode at 32k positions 1.19× the BF16 cache | Long-context decode: at 32k positions Qwen3-4B reads ~4.7 GB of KV per token against 8 GB of weights, and decode attention already runs at 600–660 GB/s, so only fewer bytes help. Also doubles the context that fits |
-| Chunked prefill | `forward!` sizes the step buffers for the whole prompt (a 32k prompt on 4B: ~1.3 GB for gate_up alone); fixed-size chunks bound the activation memory |
-| Prefill attention for long prompts | Attention catches up with the GEMMs at long prompts: GQA packing (the group's heads share K/V loads), tiles chosen per n, heaviest causal blocks first. Needs prefill benchmarks at 4k–16k tokens first |
-| **INT8 GEMM with fused dequantization** (+++) — tiles and occupancy of its own: 1.6–2.0× at 64 tokens, prefill 512 at 0.97× BF16; next: conversion without registers to spare (prepacked layout) | INT8 prefill is 8–11 % slower than BF16: the Int8 → BF16 tile conversion is not hidden (down 0.73×) |
-| n = 512 GEMMs to cuBLAS speed | 0.87–0.92× cuBLAS, ~5 ms of a 45 ms 4B prefill: larger tiles, deeper pipelining, L2-aware block order |
-| **DFlash without host round-trips** (+++) — done: one wait per step, batched drafter sampling; +1.2 % (the round trip was ~0.2 ms of 16.5) | Drafts written on the device into the verify step's ids, one batched argmax instead of 15 sampling launches |
-| Tree verification (EAGLE/DFlash) | Several candidate branches verified in one step, with a tree attention mask |
+| cuTile.jl | every hot kernel |
+| CUDA.jl | arrays, streams, events, CUDA graphs, cuBLAS (reference backend), memory pool |
+| HuggingFaceApi.jl | downloads and the hub cache |
+| SafeTensors.jl, BFloat16s.jl | memory-mapped weights in BFloat16 |
+| JSON.jl | configs and tokenizer files |
+| NVTX.jl | ranges for Nsight Systems timelines |
 
-Not a priority: more weight quantization (INT4, group-wise). It would speed up decode
-(~1.5× over INT8) but adds little to experiment with beyond what INT8 already showed.
-
-## 14. Open questions / spikes
-
-Answered by M0 (environment: Julia 1.13.3, CUDA.jl 6.3, cuTile 1.0.0, tileiras 13.3 / bytecode v13.3, driver 615):
-
-1. ✅ **cuTile launches capture into CUDA graphs.** Capture works when mixed with CUDA.jl
-   broadcasts and cuBLAS `mul!`, and replays read the live contents of captured
-   buffers (`test/smoke/graphs.jl`). Kernels must be compiled (launched once)
-   before capture.
-2. ✅ **Host overhead of a cuTile launch ≈ a native `@cuda` launch:** about 5.2 vs 5.5 µs
-   to enqueue. `cuLaunchKernelEx` itself is about 1.8 µs; the rest is Julia-side
-   argument handling. Graph replay brings enqueue cost per kernel to about 0.01 µs.
-   For tiny dependent kernels, wall time is about 5–6 µs per kernel either way,
-   because the GPU-side launch and DRAM round trip set the floor (possibly also
-   idle clocks). Graphs therefore matter whenever per-kernel GPU time is under
-   ~5 µs, which is the case for norm, rope and activation kernels at batch 1.
-   Fusion still matters even with graphs.
-
-Still open:
-
-3. Paged KV loads: a runtime-indexed `ct.load` per page vs sparse-view gather. M5 uses one
-   runtime-indexed load per page; sparse views (several pages per load) are not measured yet.
-4. ~~GEMV performance in cuTile at M = 1 vs cuBLAS.~~ Answered at M4: the cuTile GEMV is
-   1.0–1.3× cuBLAS, so decode linears have no cuBLAS fallback. M = k+1 (verify) uses the
-   GEMM with per-shape tiles; a split-K GEMM did not beat it at n = 2…64.
-
-Resolved in M1:
-
-5. ~~OteraEngine.jl coverage of real HF chat templates.~~ Not needed: templates are
-   ported by hand per family and checked against jinja2's rendering of the real one.
+Deliberately not used: Flux.jl and Lux.jl (no autodiff needed, and their layers would hide
+the launches this project wants to see), Transformers.jl (it pins CUDA.jl 5; used as
+reference code only), and BytePairEncoding.jl (it does not precompile on Julia 1.13, hence
+the own tokenizer).

@@ -21,7 +21,13 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Getting started" => "usage.md",
-        "Architecture" => "architecture.md",
+        "Design" => [
+            "Architecture" => "architecture.md",
+            "KV cache" => "kv_cache.md",
+            "Attention kernels" => "attention.md",
+            "Speculative decoding" => "speculative.md",
+        ],
+        "History and roadmap" => "roadmap.md",
         "Performance" => [
             "Performance log" => "performance.md",
             "Profiling" => "profiling.md",

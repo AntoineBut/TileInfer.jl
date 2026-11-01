@@ -34,7 +34,12 @@ the optimizations that did not pan out.
 ## Where to go next
 
 - [Getting started](usage.md): install, the command line, and the Julia API in a few lines.
-- [Architecture](architecture.md): the layers of the engine, data layouts, and the roadmap.
+- [Architecture](architecture.md): the layers of the engine, from the command line down to
+  the kernels, and how they map to vLLM's. The [KV cache](kv_cache.md),
+  [attention kernels](attention.md) and [speculative decoding](speculative.md) have pages of
+  their own.
+- [History and roadmap](roadmap.md): where the project stands, the milestones that got it
+  there, and what comes next.
 - [Performance log](performance.md), [Profiling](profiling.md) and
   [cuTile quirks](cutile_quirks.md): what each optimization gained, how kernels are
   measured, and the codegen rules learned along the way.
