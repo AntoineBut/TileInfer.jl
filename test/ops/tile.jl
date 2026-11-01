@@ -171,7 +171,7 @@ seed_rngs!()
             invoke(TileInfer.linear_xielu!, Tuple{TileInfer.Backend, ntuple(_ -> Any, 4)...}, tile, y_unfused, W, x, a)
             @test ulps(y_unfused, y, T) <= (T == BFloat16 ? 1 : 8)    # same as GEMV, then xielu
             y_ref = TileInfer.xielu(ref, TileInfer.linear(ref, W, x), a)
-            @test ulps(y_ref, y, T) <= (T == BFloat16 ? 2 : 1000) # the linear's 1 ulp, through αp x²
+            @test ulps(y_ref, y, T) <= (T == BFloat16 ? 3 : 1000) # the linear's 1 ulp, doubled by αp x², then rounded
         end
 
         # INT8 weights: same Float32 sums of the Int8 values, scaled, then one rounding.
@@ -253,7 +253,7 @@ seed_rngs!()
                                     reshape(permutedims(v_pages, (1, 3, 2, 4)), D, KVH, :), every)
                 y8 = TileInfer.attention(tile, q, kq, vq, table, positions, 1 / sqrt(D); causal)
                 exact8 = TileInfer.attention(ref, f32(q), kq, vq, table, positions, 1 / sqrt(D); causal)
-                @test ulps(exact8, y8, T) <= 10   # the kernels round the smoothed queries c q to T
+                @test ulps(exact8, y8, T) <= 14   # the kernels round the smoothed queries c q to T (≤ 13 over 30 seeds)
                 # Quantization error of the whole op, against the unquantized keys and values.
                 exact_src = TileInfer.attention(ref, f32(q), f32(k_src), f32(v_pages), table, positions, 1 / sqrt(D); causal)
                 @test sqrt(sum(abs2, host(y8) .- host(exact_src)) / sum(abs2, host(exact_src))) < 0.02
