@@ -16,6 +16,7 @@ const KERNEL_TESTS = [
     "smoke/environment.jl",
     "smoke/kernels.jl",
     "smoke/graphs.jl",
+    "aqua.jl",
     "hub/store.jl",
     "hub/config.jl",
     "hub/loader.jl",

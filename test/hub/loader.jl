@@ -1,5 +1,7 @@
 using SafeTensors: SafeTensors
 
+seed_rngs!()
+
 @testset "loader" begin
     @testset "file layout and fusion" begin
         mktempdir() do dir

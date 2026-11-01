@@ -3,6 +3,7 @@
 # BlockManager. A page holds `page_size` consecutive positions of one sequence, so the
 # keys of a page and KV head form a dense (head_dim, page_size) tile.
 
+"Positions per KV-cache page unless the cache is built with another `page_size`."
 const DEFAULT_PAGE_SIZE = 64
 
 """
@@ -45,7 +46,9 @@ bytes_per_token(cfg::ModelConfig, quantize::Symbol) =
     quantize === :int8 ? 2 * cfg.num_layers * cfg.num_kv_heads * (cfg.head_dim + sizeof(Float32)) :
     throw(ArgumentError("unsupported KV cache quantization $quantize"))
 
+"Positions per page of `cache`."
 page_size(c::PagedKVCache) = c.blocks.page_size
+"Total pages of `cache` (free or held by a sequence)."
 num_pages(c::PagedKVCache) = c.blocks.num_pages
 
 "A new, empty sequence in `cache`."

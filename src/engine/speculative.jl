@@ -87,8 +87,10 @@ Prepare `proposer` to draft for the target model of `runner`, before a generatio
 """
 attach!(::Any, ::ModelRunner) = nothing
 
-# Run a proposer's `step`: replay `graph`, or run it eagerly and capture it when the proposer
-# uses graphs. Returns the graph.
+"""
+Run a proposer's `step`: replay `graph`, or run it eagerly and capture it when the proposer
+uses graphs. Returns the graph.
+"""
 function run_captured!(step, p, graph)
     p.graphs || return (step(); nothing)
     graph === nothing || (CUDA.launch(graph); return graph)
@@ -107,6 +109,7 @@ Base.@kwdef mutable struct SpecStats
     accepted::Int = 0
 end
 
+"Fraction of drafted tokens that were accepted (`NaN` before any draft)."
 acceptance_rate(s::SpecStats) = s.drafted == 0 ? NaN : s.accepted / s.drafted
 
 """
@@ -135,8 +138,10 @@ target's own samples).
 """
 draft_dists(::Any, ::ModelRunner) = nothing
 
-# Whether a proposer that can sample its drafts does so for `runner`: only when the target
-# samples (with greedy decoding, both draft and target take the argmax).
+"""
+Whether a proposer that can sample its drafts does so for `runner`: only when the target
+samples (with greedy decoding, both draft and target take the argmax).
+"""
 samples_for(sample::Bool, r::ModelRunner) = sample && r.sampler.sampling.temperature > 0
 
 # Reset a drafter's sampler for a generation of `runner`'s: the target's parameters when it
@@ -147,11 +152,13 @@ reset_draft_sampler!(s::TokenSampler, sample::Bool, r::ModelRunner) =
 "Verify steps take up to this many tokens (a DFlash block); all are captured in CUDA graphs."
 const MAX_VERIFY_TOKENS = 16
 
-# A step that returns the token the target model samples after each of its n inputs: the
-# forward step with the logits of every token, then the runner's sampler on each column
-# (counters c, c + 1, …), all captured together in a CUDA graph. With the distributions of
-# sampled drafts, the columns of drafted positions apply the p/q rule instead. The tokens
-# land in host-mapped memory.
+"""
+A step that returns the token the target model samples after each of its n inputs: the
+forward step with the logits of every token, then the runner's sampler on each column
+(counters c, c + 1, …), all captured together in a CUDA graph. With the distributions of
+sampled drafts, the columns of drafted positions apply the p/q rule instead. The tokens
+land in host-mapped memory.
+"""
 mutable struct VerifyStep{T}
     buffers::StepBuffers{T}
     dists::Union{Nothing,DraftDists}
@@ -351,9 +358,11 @@ end
 attach!(p::DraftProposer, r::ModelRunner) = (reset_draft_sampler!(p.runner.sampler, p.sample, r); p)
 draft_dists(p::DraftProposer, r::ModelRunner) = samples_for(p.sample, r) ? p.dists : nothing
 
-# Where the sample of chain step i (or of the forward step before the chain, i = 0) goes.
-# A proposer that can sample always records q (one-hot when greedy), so that its captured
-# chain serves greedy and sampled generations alike.
+"""
+Where the sample of chain step i (or of the forward step before the chain, i = 0) goes.
+A proposer that can sample always records q (one-hot when greedy), so that its captured
+chain serves greedy and sampled generations alike.
+"""
 next_ids(p::DraftProposer, i) = i < p.k - 1 ? p.buffers[i+1].ids : p.sink
 function sample_draft!(p::DraftProposer, i, logits)
     args = (p.runner.model.backend, next_ids(p, i), view(p.mirror, i+1:i+1), logits, p.runner.sampler)

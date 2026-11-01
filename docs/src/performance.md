@@ -387,7 +387,7 @@ Kernel time per token inside the 0.6B graph (`bench/breakdown.jl`), chunk kernel
 
 ## GEMM occupancy (2026-10-29)
 
-From the codegen audit (docs/CUTILE_QUIRKS.md): the prefill GEMM never set the `occupancy`
+From the codegen audit ([cuTile quirks](cutile_quirks.md)): the prefill GEMM never set the `occupancy`
 hint. With `occupancy = 2`, tileiras fits two blocks per SM by trimming each block's
 registers and shared memory: grids of ≥ 2 blocks per SM gain latency hiding, smaller grids
 only lose resources. `gemm_occupancy` applies it to grids of ≥ 160 blocks. Baseline
@@ -702,7 +702,7 @@ from shared memory, the INT8 one converts each (64, 128) tile to BF16 in registe
 Dropping the `latency` hints on its loads changed nothing.
 
 **Fixing the spills.** The probe `int8_attention` (bench/quirks/probes/08_int8_attention.jl,
-CUTILE_QUIRKS.md #9) converts K, V or both: either conversion alone fits (178 and 232
+[cuTile quirks](cutile_quirks.md) #9) converts K, V or both: either conversion alone fits (178 and 232
 registers), both together do not. Variants that fit, at 32k positions (probe kernel, mean µs):
 
 | Decode attention, Int8 K and V | µs | registers | spills | note |

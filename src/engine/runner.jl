@@ -11,6 +11,7 @@
 "Steps of up to this many tokens are captured in CUDA graphs."
 const MAX_GRAPH_TOKENS = 8
 
+"The static buffers of a step of one token count, and its CUDA graph once captured."
 mutable struct CapturedStep{T}
     buffers::StepBuffers{T}
     graph::Union{Nothing,CUDA.CuGraphExec}
@@ -113,6 +114,7 @@ num_graphs(r::ModelRunner) =
 # one, reads its token, checks for a stop token and streams it. The GPU no longer idles
 # between steps.
 
+"State of [`generate_pipelined!`](@ref): two step buffers, their graphs and the host-mapped tokens."
 mutable struct DecodePipeline{T}
     buffers::NTuple{2,StepBuffers{T}}
     graphs::Vector{Union{Nothing,CUDA.CuGraphExec}}

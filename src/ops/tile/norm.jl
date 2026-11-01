@@ -40,9 +40,11 @@ end
 rmsnorm(be::TileBackend, x::CuArray{T}, w::CuVector{T}, eps::Real) where {T} =
     rmsnorm!(be, similar(x), x, w, eps)
 
-# Residual add + RMSNorm, one block per column: pass 1 sums the squares of x + delta, pass
-# 2 recomputes it, stores it into x and the normalized value into H. Each tile is read in
-# pass 2 before it is overwritten, and pass 1 never sees stored values.
+"""
+Residual add + RMSNorm, one block per column: pass 1 sums the squares of x + delta, pass
+2 recomputes it, stores it into x and the normalized value into H. Each tile is read in
+pass 2 before it is overwritten, and pass 1 never sees stored values.
+"""
 function add_rmsnorm_kernel(X::ct.TileArray{T,2}, H::ct.TileArray{T,2}, Delta::ct.TileArray{T,2},
                             W::ct.TileArray{T,1}, eps::Float32, TILE::Int) where {T}
     col = ct.bid(1)

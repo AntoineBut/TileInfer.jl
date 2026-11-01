@@ -7,9 +7,11 @@
 # qkv as (head_dim, all_heads × n), whose column for head j of token t is j + all_heads (t-1)
 # (q heads first, then k, then v); the rope table as interleaved cos/sin columns.
 
-# Head `col` of qkv, RMS-normalized with `W` when NORM (as rmsnorm_kernel: round the
-# normalized value to T, scale, round again) and rotated by the angles of position `pos`,
-# as two (HALF, 1) halves (as rope_kernel).
+"""
+Head `col` of qkv, RMS-normalized with `W` when NORM (as `rmsnorm_kernel`: round the
+normalized value to T, scale, round again) and rotated by the angles of position `pos`,
+as two (HALF, 1) halves (as `rope_kernel`).
+"""
 @inline function norm_rope(QKV, col, CS, pos, W, eps, NORM, ::Type{T}, D, HALF) where {T}
     f32(tile) = convert(ct.Tile{Float32}, tile)
     rnd(tile) = f32(convert(ct.Tile{T}, tile))
@@ -31,7 +33,9 @@
     return convert(ct.Tile{T}, y1), convert(ct.Tile{T}, y2)
 end
 
-# Grid (n, heads): query heads into Q (head_dim, heads × n).
+"""
+Grid (n, heads): query heads into Q `(head_dim, heads × n)`.
+"""
 function q_inputs_kernel(Q::ct.TileArray{T,2}, QKV::ct.TileArray{T,2}, CS::ct.TileArray{T,2},
                          W::ct.TileArray{T,1}, Pos::ct.TileArray{Int32,1}, eps::Float32, D::Int,
                          HEADS::Int, ALL_HEADS::Int, NORM::Bool) where {T}
@@ -43,8 +47,10 @@ function q_inputs_kernel(Q::ct.TileArray{T,2}, QKV::ct.TileArray{T,2}, CS::ct.Ti
     return nothing
 end
 
-# Grid (n, kv_heads): key head h (normalized, rotated) and value head h into the pools,
-# viewed as (head_dim, page_size × kv_heads × pages) as in store_kv_kernel.
+"""
+Grid `(n, kv_heads)`: key head h (normalized, rotated) and value head h into the pools,
+viewed as `(head_dim, page_size × kv_heads × pages)` as in `store_kv_kernel`.
+"""
 function kv_inputs_kernel(KP::ct.TileArray{T,2}, VP::ct.TileArray{T,2}, QKV::ct.TileArray{T,2},
                           CS::ct.TileArray{T,2}, W::ct.TileArray{T,1}, Pos::ct.TileArray{Int32,1},
                           Slots::ct.TileArray{Int32,1}, eps::Float32, D::Int, P::Int, Q_HEADS::Int,
@@ -61,8 +67,10 @@ function kv_inputs_kernel(KP::ct.TileArray{T,2}, VP::ct.TileArray{T,2}, QKV::ct.
     return nothing
 end
 
-# The same into an INT8 cache: KV, S and C are the layer's Int8 pools, scales and the keys'
-# smoothing (store_int8!).
+"""
+The same into an INT8 cache: KV, S and C are the layer's Int8 pools, scales and the keys'
+smoothing (`store_int8!`).
+"""
 function kv_inputs_int8_kernel(KV::ct.TileArray{Int8,2}, S::ct.TileArray{Float32,1}, C::ct.TileArray{Float32,1},
                                QKV::ct.TileArray{T,2},
                                CS::ct.TileArray{T,2}, W::ct.TileArray{T,1}, Pos::ct.TileArray{Int32,1},

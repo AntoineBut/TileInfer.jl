@@ -14,16 +14,20 @@ const MAX_TOP_K = 64
 const SAMPLE_CHUNK = 4096
 const SAMPLE_PARTS = 64            # ≥ chunks of the vocabulary: MAX_TOP_K × SAMPLE_PARTS candidates
 
-# The (value, position) pair that is larger, ties to the smaller position: `argmax` without
-# its NaN handling (logits are never NaN, padding is -Inf), which shortens the reduction.
+"""
+The (value, position) pair that is larger, ties to the smaller position: `argmax` without
+its NaN handling (logits are never NaN, padding is -Inf), which shortens the reduction.
+"""
 struct FirstMax end
 @inline function (::FirstMax)((va, ia), (vb, ib))
     a = (va > vb) | ((va == vb) & (ia < ib))
     return ifelse(a, va, vb), ifelse(a, ia, ib)
 end
 
-# The 1-based positions of the k (≤ K) largest entries of the N-tile x, best first, ties to
-# the smaller position; 0 past k.
+"""
+The 1-based positions of the k (≤ K) largest entries of the N-tile x, best first, ties to
+the smaller position; 0 past k.
+"""
 @inline function top_k_positions(x, k, K::Int, N::Int)
     pos, slot = ct.arange((N,)), ct.arange((K,))
     at = zeros(Int32, K)
@@ -44,11 +48,13 @@ function topk_chunks_kernel(Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Flo
     return nothing
 end
 
-# The survivors among the chunks' candidates `Ids`: their 1-based ids (best first, 0 past
-# top_k), their probabilities under temperature and top-k, zeroed outside the top-p prefix,
-# and the mask of survivors. With several columns of logits (`sample_tokens!`), Ids and
-# Logits are the flat arrays and `col` the column: its candidates are entries
-# (col - 1) N + 1 : col N of Ids, and its logits start at (col - 1) V + 1.
+"""
+The survivors among the chunks' candidates `Ids`: their 1-based ids (best first, 0 past
+`top_k`), their probabilities under temperature and top-k, zeroed outside the top-p prefix,
+and the mask of survivors. With several columns of logits (`sample_tokens!`), Ids and
+Logits are the flat arrays and `col` the column: its candidates are entries
+(col - 1) N + 1 : col N of Ids, and its logits start at (col - 1) V + 1.
+"""
 @inline function survivors(Ids, Logits, Params, State, K::Int, N::Int, col = Int32(1), V = Int32(0))
     k = State[Int32(1)] % Int32
     shift(i, offset) = ifelse.(i .> Int32(0), i .+ offset, Int32(0))       # 0 stays padding
@@ -67,8 +73,10 @@ end
     return ids, ifelse.(keep, p, 0f0), keep
 end
 
-# The id at the first slot whose cumulative weight reaches u × the total, among the slots
-# with positive weight (the last of them on round-off), as `pick_host`.
+"""
+The id at the first slot whose cumulative weight reaches u × the total, among the slots
+with positive weight (the last of them on round-off), as `pick_host`.
+"""
 @inline function pick(ids, w, u, K::Int)
     slot = ct.arange((K,))
     live = w .> 0f0
@@ -91,8 +99,10 @@ function topk_sample_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{I
     return nothing
 end
 
-# `topk_sample_kernel` that also writes the distribution it samples from: the survivors'
-# 0-based ids (-1 past them) and their probabilities.
+"""
+`topk_sample_kernel` that also writes the distribution it samples from: the survivors'
+0-based ids (-1 past them) and their probabilities.
+"""
 function topk_sample_dist_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
                                  QIds::ct.TileArray{Int32,1}, QProbs::ct.TileArray{Float32,1},
                                  Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
@@ -109,8 +119,10 @@ function topk_sample_dist_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileAr
     return nothing
 end
 
-# The token emitted at a position drafted as Draft[1] from the distribution (QIds, QProbs),
-# as `accept_host`: the draft with probability min(1, p/q), else a sample of max(p - q, 0).
+"""
+The token emitted at a position drafted as Draft[1] from the distribution (QIds, QProbs),
+as `accept_host`: the draft with probability min(1, p/q), else a sample of max(p - q, 0).
+"""
 function accept_kernel(Token::ct.TileArray{Int32,1}, Mirror::ct.TileArray{Int32,1},
                        Draft::ct.TileArray{Int32,1}, QIds::ct.TileArray{Int32,1}, QProbs::ct.TileArray{Float32,1},
                        Ids::ct.TileArray{Int32,1}, Logits::ct.TileArray{Float32,1},
@@ -208,7 +220,9 @@ end
 "Scratch for [`sample_token!`](@ref): the top-k candidate ids of every vocabulary chunk."
 sample_scratch(vocab::Integer) = CuVector{Int32}(undef, cld(vocab, SAMPLE_CHUNK) * MAX_TOP_K)
 
-# The candidates of every chunk of the vocabulary, into the sampler's scratch.
+"""
+The candidates of every chunk of the vocabulary, into the sampler's scratch.
+"""
 function topk_chunks!(logits, s)
     cand = s.scratch
     chunks = length(cand) ÷ MAX_TOP_K

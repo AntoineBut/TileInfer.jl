@@ -17,6 +17,12 @@ end
 
 Base.length(s::Sequence) = length(s.tokens)
 
+"""
+    OutOfPagesError(needed, free)
+
+Thrown by [`reserve!`](@ref) when the KV cache has fewer free pages than a step needs. A
+[`ChatSession`](@ref) can recover with [`reset!`](@ref).
+"""
 struct OutOfPagesError <: Exception
     needed::Int
     free::Int
@@ -40,9 +46,15 @@ end
 BlockManager(num_pages::Integer, page_size::Integer) =
     BlockManager(page_size, num_pages, collect(Int32, num_pages:-1:1))
 
+"Number of pages not held by any sequence."
 num_free_pages(b::BlockManager) = length(b.free)
 
-"Make sure `seq` has pages for `n` more positions."
+"""
+    reserve!(blocks, seq, n)
+
+Make sure `seq` has pages for `n` more positions; throws an [`OutOfPagesError`](@ref) when
+the pool runs out.
+"""
 function reserve!(b::BlockManager, seq::Sequence, n::Integer)
     needed = cld(length(seq) + n, b.page_size) - length(seq.block_table)
     needed > num_free_pages(b) && throw(OutOfPagesError(needed, num_free_pages(b)))
@@ -52,7 +64,13 @@ function reserve!(b::BlockManager, seq::Sequence, n::Integer)
     return seq
 end
 
-"Drop the cached positions of `seq` after the first `n` and return its unused pages."
+"""
+    truncate!(blocks_or_cache, seq, n)
+
+Drop the cached positions of `seq` after the first `n` and return its unused pages to the
+pool. Speculative decoding uses it to roll back rejected drafts, and chat to roll back to
+the prefix a new turn shares with the cache.
+"""
 function truncate!(b::BlockManager, seq::Sequence, n::Integer)
     0 <= n <= length(seq) || throw(ArgumentError("cannot truncate a sequence of length $(length(seq)) to $n"))
     resize!(seq.tokens, n)
@@ -62,7 +80,11 @@ function truncate!(b::BlockManager, seq::Sequence, n::Integer)
     return seq
 end
 
-"Return all pages of `seq` to the pool."
+"""
+    release!(blocks_or_cache, seq)
+
+Return all pages of `seq` to the pool.
+"""
 release!(b::BlockManager, seq::Sequence) = truncate!(b, seq, 0)
 
 """

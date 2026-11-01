@@ -26,9 +26,11 @@ const LOG2_E = Float32(1 / log(2))
 # split then gets m = NEG_BIG, l = 0 (no -∞ - -∞ = NaN), and weight 0 when combined.
 const NEG_BIG = -floatmax(Float32)
 
-# The online-softmax update for the scores qk (KEYS, M) of keys at positions
-# first_key + 1 : first_key + KEYS, for queries at positions qpos (1, M): the probabilities
-# p (Float32), the factor alpha that rescales the accumulator, and the new running max and sum.
+"""
+The online-softmax update for the scores qk (KEYS, M) of keys at positions
+`first_key + 1 : first_key + KEYS`, for queries at positions qpos (1, M): the probabilities
+p (Float32), the factor alpha that rescales the accumulator, and the new running max and sum.
+"""
 @inline function softmax_step(qk, qpos, m_i, l_i, first_key, qk_scale, MASK, KEYS)
     if MASK
         kpos = first_key .+ reshape(ct.arange(KEYS; dtype = Int32), (KEYS, 1))
@@ -41,10 +43,12 @@ const NEG_BIG = -floatmax(Float32)
     return p, alpha, m_ij, l_i .* alpha .+ sum(p; dims = 1)
 end
 
-# One key tile of the online softmax for the query tile q (D, M) at positions qpos (1, M):
-# its KEYS keys, at positions first_key + 1 : first_key + KEYS, are tile column kcol of K
-# (width KEYS) and their values tile column vcol of V. S holds the scales of an INT8 cache
-# (Int8Pages), at the same tile index as their vectors; it is `nothing` otherwise.
+"""
+One key tile of the online softmax for the query tile q (D, M) at positions qpos (1, M):
+its KEYS keys, at positions `first_key + 1 : first_key + KEYS`, are tile column kcol of K
+(width KEYS) and their values tile column vcol of V. S holds the scales of an INT8 cache
+(Int8Pages), at the same tile index as their vectors; it is `nothing` otherwise.
+"""
 @inline function attend(K, V, ::Nothing, kcol, vcol, q, qpos, m_i, l_i, acc, first_key, qk_scale, MASK,
                         ::Type{T}, D, KEYS, M) where {T}
     k = ct.load(K; index = (kcol, Int32(1)), shape = (KEYS, D), order = (2, 1), latency = 2)
@@ -54,11 +58,13 @@ end
     return m_i, l_i, muladd(v, convert(ct.Tile{T}, p), acc .* alpha)
 end
 
-# An INT8 cache: the keys and values are converted to T for the tensor cores, the key's scale
-# multiplies its row of scores (s_k q_kᵀ x) and the value's scale its probability
-# (V diag(s_v) p). Converting whole (64, 128) pages of keys and values takes 255 registers
-# and spills, so the kernels take 32 keys at a time, and K, V, the queries and the
-# accumulator in two halves of the head dimension: q = (q1, q2), acc = (acc1, acc2).
+"""
+An INT8 cache: the keys and values are converted to T for the tensor cores, the key's scale
+multiplies its row of scores (`s_k q_kᵀ x`) and the value's scale its probability
+(`V diag(s_v) p`). Converting whole (64, 128) pages of keys and values takes 255 registers
+and spills, so the kernels take 32 keys at a time, and K, V, the queries and the
+accumulator in two halves of the head dimension: q = (q1, q2), acc = (acc1, acc2).
+"""
 @inline function attend(K, V, S, kcol, vcol, (q1, q2), qpos, m_i, l_i, (acc1, acc2), first_key, qk_scale, MASK,
                         ::Type{T}, D, KEYS, M) where {T}
     k1 = ct.load(K; index = (kcol, Int32(1)), shape = (KEYS, D ÷ 2), order = (2, 1), latency = 2)
@@ -72,7 +78,9 @@ end
     return m_i, l_i, (muladd(convert(ct.Tile{T}, v1), p, acc1 .* alpha), muladd(convert(ct.Tile{T}, v2), p, acc2 .* alpha))
 end
 
-# Keys per step of the KV loop: a page, or half of one for an INT8 cache.
+"""
+Keys per step of the KV loop: a page, or half of one for an INT8 cache.
+"""
 key_tile(::Nothing, PAGE) = PAGE
 key_tile(S, PAGE) = PAGE ÷ 2
 
@@ -114,9 +122,11 @@ end
 @inline partial(acc, D, M) = reshape(acc, (D, M, 1))
 @inline partial((acc1, acc2)::Tuple, D, M) = (partial(acc1, D ÷ 2, M), partial(acc2, D ÷ 2, M))
 
-# The kernels take the pools as K and V with S = nothing, or an INT8 layer as KV (keys, then
-# values from VALUES key tiles on) with its scales S and the keys' smoothing C, which
-# multiplies the queries (`attend_operands`).
+"""
+The kernels take the pools as K and V with S = nothing, or an INT8 layer as KV (keys, then
+values from VALUES key tiles on) with its scales S and the keys' smoothing C, which
+multiplies the queries (`attend_operands`).
+"""
 function attention_prefill_kernel(Out::ct.TileArray{T,2}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                   V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                   qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, TM::Int,
@@ -166,10 +176,12 @@ end
     return nothing
 end
 
-# Grid (kv_heads, SPLITS). Column c of the packed query tile is head (h - 1) GROUP + g of
-# token t, with c = g + GROUP (t - 1); NT ≥ n is the padded token count (decode_tokens).
-# The partial of split s goes to column (h - 1) SPLITS + s of the workspace: acc in rows
-# 1:D, m in row D + 1 and l in row D + 2.
+"""
+Grid `(kv_heads, SPLITS)`. Column c of the packed query tile is head (h - 1) GROUP + g of
+token t, with c = g + GROUP (t - 1); NT ≥ n is the padded token count (`decode_tokens`).
+The partial of split s goes to column (h - 1) SPLITS + s of the workspace: acc in rows
+1:D, m in row D + 1 and l in row D + 2.
+"""
 function attention_decode_kernel(Part::ct.TileArray{Float32,3}, Q::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                                  V::ct.TileArray{T,2}, BT::ct.TileArray{Int32,1}, Pos::ct.TileArray{Int32,1},
                                  qk_scale::Float32, D::Int, GROUP::Int, KV_HEADS::Int, NT::Int,
@@ -216,7 +228,9 @@ end
     return nothing
 end
 
-# Grid (GROUP n, kv_heads): merges the splits of one packed query column.
+"""
+Grid `(GROUP n, kv_heads)`: merges the splits of one packed query column.
+"""
 function attention_combine_kernel(Out::ct.TileArray{T,2}, Part::ct.TileArray{Float32,3},
                                   D::Int, GROUP::Int, SPLITS::Int) where {T}
     c, h = ct.bid(1), ct.bid(2)
@@ -250,15 +264,17 @@ decode_splits(kv_heads::Integer, n::Integer = 1) =
 
 uses_decode_kernel(group::Integer, n::Integer) = ispow2(group) && n <= DECODE_MAX_TOKENS
 
-# Padded token count of the packed decode query tile: at least DECODE_MIN_ROWS rows.
+"""
+Padded token count of the packed decode query tile: at least `DECODE_MIN_ROWS` rows.
+"""
 decode_tokens(group::Integer, n::Integer) = max(nextpow(2, n), cld(DECODE_MIN_ROWS, group))
 
 """
     decode_workspace(q, k_pages) -> CuArray{Float32,3}
 
-Split-KV partials for decode attention of the queries `q` (head_dim, heads, n): for each
-packed query row, split and KV head, the unnormalized output (rows 1:head_dim), running
-max and running sum (rows head_dim + 1 and + 2).
+Split-KV partials for decode attention of the queries `q` `(head_dim, heads, n)`: for each
+packed query row, split and KV head, the unnormalized output (rows `1:head_dim`), running
+max and running sum (rows `head_dim` + 1 and + 2).
 """
 function decode_workspace(q::CuArray{<:Any,3}, k_pages)
     D, heads, n = size(q)
@@ -267,7 +283,9 @@ function decode_workspace(q::CuArray{<:Any,3}, k_pages)
     return CuArray{Float32}(undef, D + 2, rows, decode_splits(kv_heads, n) * kv_heads)
 end
 
-# The 2-D views the kernels take (no copies).
+"""
+The 2-D views the kernels take (no copies).
+"""
 pool_view(pages::CuArray{<:Any,4}) = reshape(pages, size(pages, 1), :)
 heads_view(x::CuArray{<:Any,3}) = reshape(x, :, size(x, 3))
 
@@ -333,7 +351,11 @@ const KVPool{T} = Union{CuArray{T,4},Int8Pages}
 attention_workspace(::TileBackend, q::CuArray{<:Any,3}, k_pages::KVPool) =
     uses_decode_kernel(size(q, 2) ÷ size(k_pages, 3), size(q, 3)) ? decode_workspace(q, k_pages) : nothing
 
-# The decode kernels when there is a split-KV workspace, the prefill kernel otherwise.
+"""
+    attention!(::TileBackend, out, workspace, q, k_pages, v_pages, block_table, positions, scale; causal = true)
+
+The decode kernels when there is a split-KV workspace, the prefill kernel otherwise.
+"""
 function attention!(be::TileBackend, out::CuArray{T,3}, workspace::Union{Nothing,CuArray{Float32,3}},
                     q::CuArray{T,3}, k_pages::KVPool{T}, v_pages::KVPool{T},
                     block_table::CuVector{Int32}, positions::CuVector{Int32}, scale::Real;

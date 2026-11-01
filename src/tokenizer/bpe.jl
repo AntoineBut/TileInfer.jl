@@ -58,8 +58,10 @@ function AddedTokens(ids::Dict{String,Int})
     return AddedTokens(ids, lengths)
 end
 
-# Calls f(piece, nothing) for each run of text between added tokens and f(token, id) for
-# each added token, in order.
+"""
+Calls f(piece, nothing) for each run of text between added tokens and f(token, id) for
+each added token, in order.
+"""
 function foreach_piece(f, added::AddedTokens, text::AbstractString)
     start, i, n = 1, 1, ncodeunits(text)
     while i <= n
@@ -189,8 +191,10 @@ function parse_pre_tokenizer(p)
     return pattern
 end
 
-# Only a fixed prefix of special tokens is supported (e.g. Llama 3's BOS); Qwen's
-# ByteLevel post-processor adds nothing.
+"""
+Only a fixed prefix of special tokens is supported (e.g. Llama 3's BOS); Qwen's
+ByteLevel post-processor adds nothing.
+"""
 function parse_post_processor(p)
     p === nothing && return Int[]
     steps = p["type"] == "Sequence" ? p["processors"] : [p]
@@ -249,7 +253,9 @@ function encode_word(tok::BPETokenizer, word::AbstractString)
     end
 end
 
-# Repeatedly merges the adjacent pair with the lowest rank, all of its occurrences at once.
+"""
+Repeatedly merges the adjacent pair with the lowest rank, all of its occurrences at once.
+"""
 function bpe(ranks::Dict{Tuple{String,String},Int}, word::String)
     parts = [string(c) for c in word]
     while length(parts) > 1

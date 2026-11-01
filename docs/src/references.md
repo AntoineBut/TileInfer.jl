@@ -111,7 +111,7 @@ Model building blocks
 
 ## Profiling
 
-Workflow and scripts: [PROFILING.md](PROFILING.md).
+Workflow and scripts: [Profiling](profiling.md).
 
 - Nsight Compute docs (UI, metrics, rules, source view): https://docs.nvidia.com/nsight-compute/NsightCompute/index.html
 - `ncu` command line options: https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html

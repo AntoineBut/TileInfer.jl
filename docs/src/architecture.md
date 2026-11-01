@@ -7,9 +7,9 @@ favours being clear and easy to instrument over supporting many features.
 Status (2026-10-30): M0–M7 done, and the first M8 fusions. M7 (speculative decoding): verifier
 (greedy and sampled), n-gram, draft-model and DFlash proposers, `--speculate` / `--draft` /
 `--dflash` and `bench/speculative.jl`; adaptive k is a later option. An EAGLE-3 proposer was built
-and removed on 2026-11-01: DFlash beat it on every prompt (see PERFORMANCE.md).
+and removed on 2026-11-01: DFlash beat it on every prompt (see [Performance](performance.md)).
 Target hardware: RTX 4080 SUPER (Ada, sm_89, 16 GB). Benchmarked on Qwen3-0.6B and Qwen3-4B.
-External documentation and papers are listed in [REFERENCES.md](REFERENCES.md).
+External documentation and papers are listed in [References](references.md).
 
 ---
 
@@ -178,7 +178,7 @@ is loaded: the decoder settings are nested under `text_config`, its tensors sit 
 audio codes) are skipped. `pull` leaves out the image and audio tokenizer shards. Its
 tokenizer has 136k added tokens and a normalizer that rewrites reasoning markers. The 8B
 needs 16.1 GB in BFloat16, so it runs with weight-only INT8 (`--int8`, 8.6 GB, 80 tok/s;
-see PERFORMANCE.md). Correctness is checked on a tiny random Apertus and, when the 8B is
+see [Performance](performance.md)). Correctness is checked on a tiny random Apertus and, when the 8B is
 pulled, against transformers' Float32 run of it on the CPU (`scripts/gen_apertus_fixtures.py`).
 
 Suggested targets on 16 GB in BF16: **Qwen3-0.6B / 1.7B / 4B**, and
@@ -312,7 +312,7 @@ Build it in stages. Each stage reuses the verifier.
 3. **Draft-model proposer**: Qwen3-0.6B drafting for Qwen3-4B. It has its own
    `DecoderLM` and its own `PagedKVCache` but shares the `BlockManager` logic. The k
    draft steps form a natural CUDA graph.
-4. **EAGLE-3 drafter** (removed 2026-11-01, see PERFORMANCE.md): one layer reading the
+4. **EAGLE-3 drafter** (removed 2026-11-01, see [Performance](performance.md)): one layer reading the
    residual stream of three target layers, drafts chained one token at a time like the
    draft model. DFlash, which reads the same kind of states, beat it on every prompt.
 5. **DFlash drafter** (`src/engine/dflash.jl`): five Qwen3 layers whose keys and
@@ -425,11 +425,11 @@ Versions are as of 2026-10-26, checked against the repos.
 | M5 ✅ | Paged flash-attention (prefill, decode split-KV, verify) | done 2026-10-27 (`src/ops/tile/attention.jl`): Float32 matches exact attention to 1e-5, BF16 within ~3.5 ulps (the eager reference, which rounds like PyTorch, is up to 12 ulps off); whole model on TileBackend matches the HF Float32 fixtures. Prefill (n = 512) 36 TFLOP/s, 42× the reference; decode at 1,024 positions 14 µs per call (73×), host-bound (two launches ≈ 15 µs to enqueue), with the split kernel at ~64 % of DRAM under `ncu`. End to end on Qwen3-0.6B: decode 264 tok/s (9.2× M4, 47 % of the roofline), prefill 32k tok/s (3.4×). Found along the way: launches with ≥ 32 kernel parameters take a slow host path (`store_kv` 1.7× faster with 2-D views), and a growing block table recompiled attention at page boundaries (now padded) |
 | M6 ✅ | CUDA graphs for decode; NVTX timeline | done 2026-10-27: allocation-free in-place forward step with device-resident inputs (positions, slots, padded block table); `ModelRunner` captures steps of ≤ 8 tokens and replays them, bit-identical to eager steps; NVTX ranges for upload / replay / prefill / sample. Decode on Qwen3-0.6B: 348 tok/s through the graph (2.87 ms per step, 62 % of the roofline) vs 286 tok/s eager; prefill 43k tok/s (1.36× from static buffers). The step is now GPU-bound; performance work moved to M8+ |
 | M7 ✅ | Spec decoding: verifier → n-gram → draft model | acceptance-rate + tok/s speedup report. Verifier + n-gram proposer done 2026-10-29 (`src/engine/speculative.jl`): verify steps (all-token logits + device sampling per position with plain decoding's counters, which for a deterministic proposer is rejection sampling) captured as graphs; same tokens and cache state as plain greedy and sampled decoding in Float32. Code-editing prompt: 4.15× (0.6B) / 3.75× (4B) at k = 7; open-ended text with nothing to copy 0.96× / 1.05×; the same with Qwen3's recommended sampling. Draft-model proposer (Qwen3-0.6B for 4B, greedy drafts as a chain of graphs) on chat prompts (`bench/speculative.jl`): 1.4–1.8× on explanations and stories, 1.8–1.9× on code edits, greedy or sampled; n-gram up to 4.2× when the reply copies the prompt. EAGLE-3 (AngelSlim/Qwen3-4B_eagle3: target layers 2/18/33 kept by the steps, one drafter layer, 32k draft vocabulary): 1.46–1.82× on open prompts, best on stories (1.57× sampled), acceptance as AngelSlim reports. DFlash (z-lab/Qwen3-4B-DFlash-b16, 2026-10-30; drafts match a transcription of z-lab's reference in Float32): one non-causal pass of five layers drafts 15 tokens for 3.2 ms (lm_head included, 80 % of its roofline), a 16-token verify costs 5 % more than a decode step; at k = 15, 8.5× on the rename prompt and 1.9–3.0× on open prompts (1.75–3.2× sampled), best of all proposers on every prompt. Sampled drafts with the general p/q rule (2026-10-30, `sample = true`, `--sample-drafts`): drafters record each draft's q, the verify step accepts with min(1, p/q) or resamples max(p − q, 0) on the device; with Qwen3's sampling, +8 % on the open "explain" prompt, −3–12 % on the code one, mixed on the others, so greedy drafts stay the default. CLI `--speculate K`, `--draft MODEL`, `--eagle DRAFTER`, `--dflash DRAFTER`, `--sample-drafts` |
-| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant (weight-only INT8 done 2026-10-31), multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see PERFORMANCE.md): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device sampling (greedy, temperature / top-k / top-p) inside the graph with pipelined decode, per-shape GEMM tiles. Decode is at 73 % of the roofline on 0.6B and 88 % on 4B, sampled as fast as greedy (M8 target met on 4B only). Not pursued: attention combine fused into the split kernel (slower) |
+| M8+ | Performance: fewer, fused kernels; device sampling; prefix caching, async scheduling, INT8/weight-only quant (weight-only INT8 done 2026-10-31), multi-sequence | ≥ 80 % of the decode roofline on Qwen3-0.6B/4B (moved from M6). Partly done ahead of M7 (perf branch and per-shape GEMM tiles; see [Performance](performance.md)): q/k norm + rope + KV write fused, residual add + RMSNorm, SwiGLU and Float32-logit GEMV epilogues, pinned async uploads, device sampling (greedy, temperature / top-k / top-p) inside the graph with pipelined decode, per-shape GEMM tiles. Decode is at 73 % of the roofline on 0.6B and 88 % on 4B, sampled as fast as greedy (M8 target met on 4B only). Not pursued: attention combine fused into the split kernel (slower) |
 
 ### M8 priorities (2026-10-31)
 
-Chosen for what each teaches and demos, not only for raw speed; (+++) were taken first (results in PERFORMANCE.md).
+Chosen for what each teaches and demos, not only for raw speed; (+++) were taken first (results in [Performance](performance.md)).
 
 | Item | Why |
 |---|---|

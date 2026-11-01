@@ -43,7 +43,9 @@ end
 host_array(::Type{T}, x::AbstractArray{T}) where {T} = x
 host_array(::Type{T}, x::AbstractArray) where {T} = Array{T}(x)
 
-# Copies `x` into consecutive elements of `dst` starting at linear index `offset`.
+"""
+Copies `x` into consecutive elements of `dst` starting at linear index `offset`.
+"""
 function upload!(dst::CuArray{T}, offset::Int, x::AbstractArray) where {T}
     src = host_array(T, x)
     n = Int(length(src))   # views into the mmap'd file are indexed with UInt64
@@ -97,8 +99,10 @@ end
 check_quantize(quantize) = quantize in (nothing, :int8) ||
     throw(ArgumentError("unsupported quantization $quantize; supported: :int8"))
 
-# Quantize a freshly uploaded weight and free its T copy at once, so that loading a model
-# that only fits quantized never holds more than one T matrix at a time.
+"""
+Quantize a freshly uploaded weight and free its T copy at once, so that loading a model
+that only fits quantized never holds more than one T matrix at a time.
+"""
 function quantized(W::CuMatrix, quantize::Union{Nothing,Symbol})
     check_quantize(quantize)
     quantize === nothing && return W
@@ -113,7 +117,7 @@ const QUANTIZE_COLUMNS = 16384   # 128 MB of BFloat16 at 4096 rows
 Tensor `name` uploaded in file layout and stored as an Int8Weight (or as a T matrix when
 `quantize === nothing`), with only its first `cols` columns if given. Quantization is per
 column, so it is done block by block: the T copy on the device never exceeds
-QUANTIZE_COLUMNS columns (a 131k-token lm_head is 1 GB in BFloat16).
+`QUANTIZE_COLUMNS` columns (a 131k-token `lm_head` is 1 GB in BFloat16).
 """
 function upload_weight(::Type{T}, c::Checkpoint, name::AbstractString, quantize::Union{Nothing,Symbol};
                        cols::Union{Nothing,Integer} = nothing) where {T}
@@ -138,7 +142,7 @@ end
     load_weights(T, config, dir; quantize = nothing) -> ModelWeights{T}
 
 Read the checkpoint in `dir` onto the GPU with element type `T`, fusing q/k/v and gate/up.
-With `quantize = :int8`, the linear weights and the lm_head are stored as [`Int8Weight`](@ref)
+With `quantize = :int8`, the linear weights and the `lm_head` are stored as [`Int8Weight`](@ref)
 (the embedding table stays in `T`).
 """
 function load_weights(::Type{T}, cfg::ModelConfig, dir::AbstractString;
@@ -186,7 +190,9 @@ function load_layer(::Type{T}, c::Checkpoint, cfg::ModelConfig, p::AbstractStrin
     )
 end
 
-# The activation's scalars as transformers' XIELUActivation computes them in dtype T.
+"""
+The activation's scalars as transformers' XIELUActivation computes them in dtype T.
+"""
 function load_xielu(::Type{T}, c::Checkpoint, p::AbstractString) where {T}
     scalar(name) = Float32(only(file_layout(c, p * name)))
     softplus(x) = log1p(exp(x))

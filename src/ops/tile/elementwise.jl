@@ -1,10 +1,12 @@
 # Element-wise and data-movement kernels: rotary embedding, SwiGLU, xIELU, KV-cache writes
 # and embedding lookup. All are memory-bound; each rounds to T where the reference does.
 
-# Rotary embedding, one block per token over all heads. The two halves of head_dim are
-# loaded as separate tiles (tile index 1 and 2 along the first axis), which is exactly the
-# "rotate half" pairing: out1 = x1 cos1 - x2 sin1, out2 = x2 cos2 + x1 sin2. The cos/sin
-# columns are looked up from the token's position, so positions can live on the device.
+"""
+Rotary embedding, one block per token over all heads. The two halves of `head_dim` are
+loaded as separate tiles (tile index 1 and 2 along the first axis), which is exactly the
+"rotate half" pairing: out1 = x1 cos1 - x2 sin1, out2 = x2 cos2 + x1 sin2. The cos/sin
+columns are looked up from the token's position, so positions can live on the device.
+"""
 function rope_kernel(Y::ct.TileArray{T,3}, X::ct.TileArray{T,3}, C::ct.TileArray{T,2},
                      S::ct.TileArray{T,2}, Pos::ct.TileArray{Int32,1}, HALF::Int, HEADS::Int) where {T}
     t = ct.bid(1)
@@ -36,8 +38,10 @@ end
 rope(be::TileBackend, x::CuArray{T,3}, cos::CuMatrix{T}, sin::CuMatrix{T}, positions::CuVector{Int32}) where {T} =
     rope!(be, similar(x), x, cos, sin, positions)
 
-# SwiGLU: out = silu(gate) * up, with gate and up as separate (strided) views of the
-# stacked gate_up activations. Grid: (tiles along intermediate, tokens).
+"""
+SwiGLU: out = silu(gate) * up, with gate and up as separate (strided) views of the
+stacked `gate_up` activations. Grid: (tiles along intermediate, tokens).
+"""
 function silu_mul_kernel(Y::ct.TileArray{T,2}, G::ct.TileArray{T,2}, U::ct.TileArray{T,2},
                          TILE::Int) where {T}
     i, t = ct.bid(1), ct.bid(2)
@@ -61,16 +65,20 @@ end
 silu_mul(be::TileBackend, gate_up::CuMatrix{T}) where {T} =
     silu_mul!(be, similar(gate_up, size(gate_up, 1) ÷ 2, size(gate_up, 2)), gate_up)
 
-# expm1 without exp(x) - 1's cancellation (Kahan): with u = exp(x) rounded, (u - 1) x / log(u)
-# is accurate to a few ulps, since u's rounding error cancels between the two factors.
-# Below -20, expm1 is -1 in Float32 (and log(u) underflows further down).
+"""
+expm1 without exp(x) - 1's cancellation (Kahan): with u = exp(x) rounded, (u - 1) x / log(u)
+is accurate to a few ulps, since u's rounding error cancels between the two factors.
+Below -20, expm1 is -1 in Float32 (and log(u) underflows further down).
+"""
 @inline function expm1_tile(x)
     u = exp.(x)
     um1 = u .- 1.0f0
     return ifelse.(x .< -20.0f0, -1.0f0, ifelse.(um1 .== 0.0f0, x, um1 .* x ./ log.(u)))
 end
 
-# xIELU of a Float32 tile, rounding to T after each operation as the reference does.
+"""
+xIELU of a Float32 tile, rounding to T after each operation as the reference does.
+"""
 @inline function xielu_tile(::Type{T}, x, alpha_p, alpha_n, beta, eps) where {T}
     rnd(tile) = convert(ct.Tile{Float32}, convert(ct.Tile{T}, tile))
     bx = rnd(beta .* x)
@@ -79,8 +87,10 @@ end
     return ifelse.(x .> 0.0f0, pos, neg)
 end
 
-# xIELU, grid (tiles along the rows, tokens). The scalars are per layer and fixed, so
-# launch arguments are fine inside a CUDA graph.
+"""
+xIELU, grid (tiles along the rows, tokens). The scalars are per layer and fixed, so
+launch arguments are fine inside a CUDA graph.
+"""
 function xielu_kernel(Y::ct.TileArray{T,2}, X::ct.TileArray{T,2}, alpha_p::Float32, alpha_n::Float32,
                       beta::Float32, eps::Float32, TILE::Int) where {T}
     i, t = ct.bid(1), ct.bid(2)
@@ -100,10 +110,12 @@ end
 
 xielu(be::TileBackend, x::CuMatrix{T}, a::XIELU{T}) where {T} = xielu!(be, similar(x), x, a)
 
-# KV-cache write, one block per token. Arrays are 2-D views, which keeps the launch under
-# 32 kernel parameters: the pools as (head_dim, page_size × kv_heads × pages), whose column
-# for (offset, head h, page), all 1-based, is offset + P (h - 1) + P H (page - 1), and k/v
-# as (head_dim, kv_heads × n). Tile indices along the size-1 axis are element indices.
+"""
+KV-cache write, one block per token. Arrays are 2-D views, which keeps the launch under
+32 kernel parameters: the pools as `(head_dim, page_size × kv_heads × pages)`, whose column
+for (offset, head h, page), all 1-based, is offset + P (h - 1) + P H (page - 1), and k/v
+as `(head_dim, kv_heads × n)`. Tile indices along the size-1 axis are element indices.
+"""
 function store_kv_kernel(KP::ct.TileArray{T,2}, VP::ct.TileArray{T,2}, K::ct.TileArray{T,2},
                          V::ct.TileArray{T,2}, Slots::ct.TileArray{Int32,1}, D::Int, P::Int,
                          HEADS::Int) where {T}
@@ -135,8 +147,10 @@ end
 @inline smoothing(C, HALF) = (reshape(ct.load(C; index = Int32(1), shape = (HALF,)), (HALF, 1)),
                               reshape(ct.load(C; index = Int32(2), shape = (HALF,)), (HALF, 1)))
 
-# Quantize the vector whose two halves are the Float32 (HALF, 1) tiles x1 and x2 into column
-# `col` of KV and its scale into S[col], as quantize_columns does.
+"""
+Quantize the vector whose two halves are the Float32 (HALF, 1) tiles x1 and x2 into column
+`col` of KV and its scale into S[col], as `quantize_columns` does.
+"""
 @inline function store_int8!(KV, S, col, x1, x2)
     absmax = max.(maximum(abs.(x1); dims = 1), maximum(abs.(x2); dims = 1))     # (1, 1)
     inv = ifelse.(absmax .> 0.0f0, 127.0f0 ./ absmax, 0.0f0)
@@ -173,7 +187,9 @@ function store_kv!(::TileBackend, k_pages::Int8Pages, v_pages::Int8Pages, k::CuA
     return nothing
 end
 
-# Embedding lookup, one block per token, walking the column in tiles.
+"""
+Embedding lookup, one block per token, walking the column in tiles.
+"""
 function embed_kernel(Y::ct.TileArray{T,2}, Table::ct.TileArray{T,2}, Ids::ct.TileArray{Int32,1},
                       TILE::Int) where {T}
     t = ct.bid(1)

@@ -14,6 +14,17 @@ function vadd!(c, a, b; tile=1024)
     return c
 end
 
+using Random: Random
+
+# Seeds Julia's and CUDA.jl's global RNGs (`rand`, `randn`, `randperm`; `CUDA.rand`,
+# `CUDA.randn`). Test files that draw random inputs call it first, so each file sees the
+# same inputs on every run, whichever files run before it.
+function seed_rngs!(seed::Integer = 1)
+    Random.seed!(seed)
+    CUDA.seed!(seed)
+    return nothing
+end
+
 # Model used by tests that need a real checkpoint; they are skipped when it is not pulled.
 const TEST_MODEL = "Qwen/Qwen3-0.6B"
 

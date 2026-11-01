@@ -28,9 +28,11 @@ function gemv_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{T,2}, X::ct.TileArray
     return nothing
 end
 
-# GEMV with a SwiGLU epilogue for the stacked gate_up weight (in, 2I): block b reduces TM
-# gate columns and the TM up columns I apart, and writes silu(gate) * up, rounding as
-# silu_mul_kernel does after a plain GEMV. Needs I divisible by TM.
+"""
+GEMV with a SwiGLU epilogue for the stacked `gate_up` weight (in, 2I): block b reduces TM
+gate columns and the TM up columns I apart, and writes silu(gate) * up, rounding as
+`silu_mul_kernel` does after a plain GEMV. Needs I divisible by TM.
+"""
 function gemv_swiglu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.TileArray{T,2},
                             TK::Int, TM::Int) where {T}
     bid = ct.bid(1)
@@ -49,8 +51,10 @@ function gemv_swiglu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.Ti
     return nothing
 end
 
-# GEMV with an xIELU epilogue (Apertus' up projection): the plain GEMV, then xielu_tile on
-# the rounded sums, as xielu_kernel computes after it.
+"""
+GEMV with an xIELU epilogue (Apertus' up projection): the plain GEMV, then `xielu_tile` on
+the rounded sums, as `xielu_kernel` computes after it.
+"""
 function gemv_xielu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.TileArray{T,2},
                            alpha_p::Float32, alpha_n::Float32, beta::Float32, eps::Float32,
                            TK::Int, TM::Int) where {T}
@@ -69,8 +73,10 @@ function gemv_xielu_kernel(Y::ct.TileArray{T,2}, W::ct.TileArray{T,2}, X::ct.Til
     return nothing
 end
 
-# 1-based (block row, block column) of block `bid`, walking groups of GROUP block rows
-# column by column so that consecutive blocks share W and X tiles in L2.
+"""
+1-based (block row, block column) of block `bid`, walking groups of GROUP block rows
+column by column so that consecutive blocks share W and X tiles in L2.
+"""
 function swizzle_2d(M, N, TM, TN, GROUP, bid)
     num_m, num_n = cld(M, Int32(TM)), cld(N, Int32(TN))
     in_group = Int32(GROUP) * num_n
@@ -121,9 +127,11 @@ function gemm_config(out::Integer, n::Integer, sms::Integer = num_sms())
     return best
 end
 
-# Two GEMM blocks per SM when the grid has enough of them: the second hides the first's
-# latency (4B gate_up at n = 512: 1.11×), but tileiras trims registers and shared memory to
-# fit both, which slows grids that leave one block per SM (0.6B o/down at n = 512: 0.86×).
+"""
+Two GEMM blocks per SM when the grid has enough of them: the second hides the first's
+latency (4B `gate_up` at n = 512: 1.11×), but tileiras trims registers and shared memory to
+fit both, which slows grids that leave one block per SM (0.6B o/down at n = 512: 0.86×).
+"""
 gemm_occupancy(blocks::Integer, sms::Integer = num_sms()) = blocks >= 2sms ? 2 : 1
 
 function linear!(::TileBackend, y::CuMatrix{S}, W::CuMatrix{T}, x::CuMatrix{T}) where {S,T}
@@ -145,8 +153,12 @@ function linear(be::TileBackend, W::CuMatrix{T}, x::CuMatrix{T}) where {T}
     return linear!(be, CuMatrix{T}(undef, size(W, 2), size(x, 2)), W, x)
 end
 
-# SwiGLU of the gate_up projection: fused into the GEMV for one token, otherwise a GEMM
-# into `gate_up` followed by silu_mul.
+"""
+    linear_swiglu!(::TileBackend, y, gate_up, W, x)
+
+SwiGLU of the `gate_up` projection: fused into the GEMV for one token, otherwise a GEMM
+into `gate_up` followed by `silu_mul`.
+"""
 function linear_swiglu!(be::TileBackend, y::CuMatrix{T}, gate_up::CuMatrix{T}, W::CuMatrix{T},
                         x::CuMatrix{T}) where {T}
     in, I = size(W, 1), size(y, 1)
@@ -158,8 +170,12 @@ function linear_swiglu!(be::TileBackend, y::CuMatrix{T}, gate_up::CuMatrix{T}, W
     return silu_mul!(be, y, linear!(be, gate_up, W, x))
 end
 
-# xIELU of the up projection: fused into the GEMV for one token, otherwise a GEMM followed
-# by xielu! in place.
+"""
+    linear_xielu!(::TileBackend, y, W, x, act)
+
+xIELU of the up projection: fused into the GEMV for one token, otherwise a GEMM followed
+by xielu! in place.
+"""
 function linear_xielu!(be::TileBackend, y::CuMatrix{T}, W::CuMatrix{T}, x::CuMatrix{T}, a::XIELU{T}) where {T}
     if size(x, 2) == 1
         TK, TM = gemv_config(size(W)...)
@@ -175,7 +191,9 @@ end
 # significand). The per-column scales multiply the Float32 sums before the one rounding to
 # T, so `y = T(s qᵀx)`.
 
-# Float32 sums of TM weight columns against x, from column tile `col`: the GEMV loop.
+"""
+Float32 sums of TM weight columns against x, from column tile `col`: the GEMV loop.
+"""
 @inline function gemv_sums(W, X, col, TK, TM)
     acc = zeros(Float32, (TK, TM))
     for k in Int32(1):ct.num_tiles(W, 1, (TK, TM))
@@ -186,7 +204,9 @@ end
     return sum(acc; dims = 1)                                # (1, TM)
 end
 
-# Scaled, rounded GEMV outputs of column tile `col`, as Float32 (1, TM).
+"""
+Scaled, rounded GEMV outputs of column tile `col`, as Float32 (1, TM).
+"""
 @inline function gemv_int8_out(::Type{T}, W, Scale, X, col, TK, TM) where {T}
     s = reshape(ct.load(Scale; index = col, shape = (TM,), padding_mode = ct.PaddingMode.Zero), (1, TM))
     return convert(ct.Tile{Float32}, convert(ct.Tile{T}, gemv_sums(W, X, col, TK, TM) .* s))
@@ -233,21 +253,25 @@ function gemm_int8_kernel(Y::ct.TileArray{S,2}, W::ct.TileArray{Int8,2}, Scale::
     return nothing
 end
 
-# Int8 GEMV tiles of half the BF16 width: TK × TM ≈ 4096 elements was fastest on Apertus
-# 8B's layers (TK = 1024, TM = 4: 600–670 GB/s; TM = 8 was 7–13 % slower).
+"""
+Int8 GEMV tiles of half the BF16 width: TK × TM ≈ 4096 elements was fastest on Apertus
+8B's layers (TK = 1024, TM = 4: 600–670 GB/s; TM = 8 was 7–13 % slower).
+"""
 function gemv_int8_config(in::Integer, out::Integer)
     TK, TM = gemv_config(in, out)
     return TK, max(TM ÷ 2, 2)
 end
 
-# INT8 GEMM tiles. The kernel converts each weight tile to T in registers, which BF16's
-# tiles leave no room for (255 registers and spills at 128 × 128), and its loads of the
-# Int8 tile are not overlapped like the BF16 operands', so its blocks are latency-bound: it
-# wants two blocks per SM on every grid, narrower tiles at 512 tokens, and at ≤ 64 tokens
-# (bandwidth-bound) deeper K steps that read as many bytes per step as BF16's. From a sweep
-# of 15 tiles × occupancy 1, 2 on the layers of Qwen3-0.6B, Qwen3-4B and Apertus 8B at
-# n = 8, 64, 512: within 1.5 % of the best tile in total (worst 1.11×), 1.23× the BF16
-# rule (down at 64 tokens: 2.1× on 4B, 1.7× on 8B).
+"""
+INT8 GEMM tiles. The kernel converts each weight tile to T in registers, which BF16's
+tiles leave no room for (255 registers and spills at 128 × 128), and its loads of the
+Int8 tile are not overlapped like the BF16 operands', so its blocks are latency-bound: it
+wants two blocks per SM on every grid, narrower tiles at 512 tokens, and at ≤ 64 tokens
+(bandwidth-bound) deeper K steps that read as many bytes per step as BF16's. From a sweep
+of 15 tiles × occupancy 1, 2 on the layers of Qwen3-0.6B, Qwen3-4B and Apertus 8B at
+n = 8, 64, 512: within 1.5 % of the best tile in total (worst 1.11×), 1.23× the BF16
+rule (down at 64 tokens: 2.1× on 4B, 1.7× on 8B).
+"""
 function gemm_int8_config(out::Integer, n::Integer, sms::Integer = num_sms())
     n <= 16 && return (32, 16, 256)
     n <= 64 && return cld(out, 32) * cld(n, 32) >= 8sms ? (64, 64, 128) : (32, 32, 256)

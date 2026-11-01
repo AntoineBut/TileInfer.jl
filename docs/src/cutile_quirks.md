@@ -184,7 +184,7 @@ sampling kernels compile to the same SASS too (`helpers_*`).
 step (1 token at 1,024 positions), a spec-decoding verify step (8 and 16 tokens at 1,024
 positions), and a 64- and 512-token prefill step, at the real shapes of Qwen3-0.6B and 4B
 in BFloat16 and INT8 and of Apertus 1.5 8B in INT8. None uses a narrow `mmaf`. The slow
-ones are mostly known design limits (PERFORMANCE.md, "What to optimize"), not codegen:
+ones are mostly known design limits ([Performance](performance.md), "What to optimize"), not codegen:
 `q_inputs_kernel` at 512 tokens (one block per token and head, ~330 GB/s), the prefill
 GEMMs (70–75 % of the tensor-core peak). One oddity without cost: `rmsnorm_kernel`
 compiles to twice the SASS of `add_rmsnorm_kernel` (tileiras unrolls its loops twice: 26
@@ -200,7 +200,7 @@ vs 13 global loads), runs once per step, and is ≤ 0.5 µs slower. New on 2026-
   positions: 27–28 µs on every model against 6–9 µs at 1 and 8 tokens. Not a codegen
   quirk; a dispatch limit that costs ~0.6–0.7 ms per 16-token verify step (28–36 layers),
   ~5 % of a 4B verify. Now up to 16 tokens use the decode kernels, with 8 splits
-  (PERFORMANCE.md, "16-token verify attention").
+  ([Performance](performance.md), "16-token verify attention").
 
 **Knobs** (`07_knobs.jl`), never swept before on the heaviest kernels:
 
@@ -213,7 +213,7 @@ vs 13 global loads), runs once per step, and is ≤ 0.5 µs slower. New on 2026-
 
 The GEMM now launches with `occupancy = 2` when it has ≥ 2 blocks per SM
 (`gemm_occupancy` in `src/ops/tile/linear.jl`): prefill 512 on 4B 1.06× faster, other
-prefill steps 1.01–1.04×, see PERFORMANCE.md.
+prefill steps 1.01–1.04×, see [Performance](performance.md).
 
 No layout quirk costs TileInfer time in the kernels probed; the known cliff (narrow
 `mmaf`) is already avoided by padding.

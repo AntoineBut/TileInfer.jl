@@ -4,3 +4,4 @@ bench/results/
 coverage/
 bench/ref/
 __pycache__/
+docs/build/
