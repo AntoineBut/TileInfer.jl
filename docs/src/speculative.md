@@ -91,7 +91,7 @@ short contexts, even though per-draft acceptance drops.
 
 An EAGLE-3 proposer (one drafter layer on three target layers' states, chained one token at
 a time) was built and removed: DFlash, which reads the same kind of states, beat it on every
-prompt. Its results are kept in the [Performance log](performance.md).
+prompt. Its results are kept in [Results by feature](performance.md#Speculative-decoding).
 
 ## Results
 
@@ -109,8 +109,8 @@ With Qwen3's recommended sampling (temperature 0.6, top-k 20, top-p 0.95) the pi
 same: DFlash gains 1.75× to 3.17× on the three prompts other than the rename. On a 2.2k-token prompt, the code edit still
 reaches 5.9× with the whole block, while explaining it is faster at k = 7 (2.4×) than at
 k = 15 (2.2×): at long contexts verify steps cost more, and the late drafts of open text are
-rarely accepted. More numbers, and what each change gained, are in the
-[Performance log](performance.md).
+rarely accepted. Per-k numbers, step costs and the other proposers are in
+[Results by feature](performance.md#Speculative-decoding).
 
 ## Not built yet
 

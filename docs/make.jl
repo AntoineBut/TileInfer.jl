@@ -15,7 +15,7 @@ makedocs(;
         prettyurls = get(ENV, "CI", nothing) == "true",
         canonical = "https://antoinebut.github.io/TileInfer.jl",
         edit_link = "main",
-        size_threshold_warn = 200 * 1024,     # the performance log is a long page
+        size_threshold_warn = 200 * 1024,     # the performance page is long
         size_threshold = 400 * 1024,
     ),
     pages = [
@@ -29,7 +29,7 @@ makedocs(;
         ],
         "History and roadmap" => "roadmap.md",
         "Performance" => [
-            "Performance log" => "performance.md",
+            "Results by feature" => "performance.md",
             "Profiling" => "profiling.md",
             "cuTile design choices" => "cutile_design.md",
         ],
