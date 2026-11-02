@@ -30,6 +30,7 @@ julia --project=docs docs/make.jl                    # documentation site into d
 
 Profiling workflow, model-step costs and how to read the summary: [docs/src/profiling.md](docs/src/profiling.md).
 What each feature gains, what did not pan out, and what is left to gain: [docs/src/performance.md](docs/src/performance.md).
+TileInfer against vLLM (bench/ref/, at that point and at 8k prompts): [docs/src/vllm.md](docs/src/vllm.md).
 To tune a kernel, profile it before and after a change and read `ncu_summary.py --compare`
 rather than raw `ncu` output (`ncu` is in /usr/local/NVIDIA-Nsight-Compute). Take timings
 from bench/run.jl: `ncu` serializes kernels and locks clocks.

@@ -28,8 +28,9 @@ Julia.
   Nsight Compute profiling scripts.
 
 On Qwen3-4B, decode runs at 79 tok/s (88 % of the memory-bandwidth roofline) and prefill
-at 11k tok/s. [Results by feature](performance.md) has the numbers for each feature, including
-the variants that did not pan out.
+at 12k tok/s (1,024-token prompt). [Results by feature](performance.md) has the numbers for
+each feature, including the variants that did not pan out, and
+[Comparison with vLLM](vllm.md) the engine against vLLM with speculative decoding.
 
 ## Where to go next
 
@@ -40,8 +41,9 @@ the variants that did not pan out.
   their own.
 - [History and roadmap](roadmap.md): where the project stands, the milestones that got it
   there, and what comes next.
-- [Results by feature](performance.md), [Profiling](profiling.md) and
-  [cuTile design choices](cutile_design.md): what each optimization gained, how kernels are
-  measured, and the codegen rules learned along the way.
+- [Results by feature](performance.md), [Comparison with vLLM](vllm.md),
+  [Profiling](profiling.md) and [cuTile design choices](cutile_design.md): what each
+  optimization gained, how the engine compares, how kernels are measured, and the codegen
+  rules learned along the way.
 - [Public API](api.md) and [Internals](internals.md): docstrings for the code itself.
 - [References](references.md): papers, engines and package sources this builds on.
