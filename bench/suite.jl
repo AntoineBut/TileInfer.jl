@@ -1,8 +1,9 @@
 # Benchmark suite: the ops a step runs at a model's real shapes (fused, and the primitive ones
 # they are built from; rope and store_kv, which only the unfused fallback calls, are left out),
-# at decode (1 token) and prefill (64 and 512 tokens) sizes, and end-to-end prefill and decode
-# steps (eager, and replayed from a CUDA graph where the backend supports it), on the cuTile
-# backend and optionally the reference one. Keys
+# at decode (1 token) and prefill (64 and 1,024 tokens) sizes, on the cuTile backend and
+# optionally the reference one; and the model at the reference point of
+# docs/src/performance.md (a 1,024-token prefill, 128 tokens decoded after 1,024 positions),
+# for the engine and optionally for configurations with one feature switched off. Keys
 # start with the model ("Qwen3-4B/ops/linear_qkv/decode/tile"); bench/run.jl and
 # bench/profile.jl run the suite for each model of MODELS in turn.
 #
@@ -17,6 +18,7 @@ using BFloat16s: BFloat16
 using TileInfer
 using TileInfer: DecoderLM, PagedKVCache, RefBackend, SamplingParams, TileBackend
 using Random: Xoshiro
+include("variants.jl")
 
 "Models benchmarked by default: a small one, dominated by per-kernel overheads, and a large one."
 const MODELS = ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B")
@@ -25,10 +27,50 @@ const MODELS = ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-4B")
 model_label(repo::AbstractString) = basename(repo)
 
 const OP_REPS = 20
-const PREFILL = 512
-const SHORT = 64            # a short prompt, or a follow-up turn of a chat
+# The reference point of docs/src/performance.md: a PREFILL-token prompt in one step, then
+# GEN greedy tokens decoded after CONTEXT cached positions.
+const PREFILL = 1024
 const CONTEXT = 1024        # cached positions seen by decode attention / decode steps
-const GEN = 64              # tokens per generation benchmark
+const GEN = 128             # tokens per decode benchmark
+const SHORT = 64            # op benchmarks only: a short prompt, a follow-up turn, a verify step
+
+"Positions a model and its cache need for the model benchmarks after `context` positions."
+model_len(context) = context + PREFILL + GEN + 64
+
+"""
+    ModelConfig(name, backend; graphs = true, pipeline = graphs, prefill = true)
+
+An engine configuration of the model benchmarks: its backend, and whether decode steps
+replay CUDA graphs and run pipelined (the host one step behind the GPU). Prefill steps run
+eagerly whatever the graph settings, so `prefill = false` skips a prefill benchmark that
+would repeat another configuration's.
+"""
+struct ModelConfig
+    name::String
+    backend::TileInfer.Backend
+    graphs::Bool
+    pipeline::Bool
+    prefill::Bool
+end
+
+ModelConfig(name, backend; graphs = true, pipeline = graphs, prefill = true) =
+    ModelConfig(name, backend, graphs, pipeline, prefill)
+
+"""
+The model benchmarks' configurations: "tile" is the engine, the others (run with `--ref`)
+switch features off (see bench/variants.jl), from the reference ops up.
+"""
+const MODEL_CONFIGS = [
+    ModelConfig("tile", TileBackend()),
+    ModelConfig("tile-steps", TileBackend(); pipeline = false, prefill = false),   # graphs, not pipelined
+    ModelConfig("tile-eager", TileBackend(); graphs = false, prefill = false),
+    ModelConfig("unfused", Variant(fused = false)),                                # a kernel per op
+    ModelConfig("unfused-steps", Variant(fused = false); pipeline = false, prefill = false),
+    ModelConfig("unfused-eager", Variant(fused = false); graphs = false, prefill = false),
+    ModelConfig("unfused-refattn-eager", Variant(fused = false, attention = :ref); graphs = false),
+    ModelConfig("cublas", Variant(linear = :cublas)),                    # cuBLAS for every linear
+    ModelConfig("ref", RefBackend(); graphs = false),
+]
 
 """
     OpArgs(make_args, copies)
@@ -140,12 +182,14 @@ end
                 context = CONTEXT, backends = DEFAULT_BACKENDS) -> (suite, info)
 
 Benchmarks for `model` (a DecoderLM; its backend is ignored), keyed
-"<label>/ops/<op>/<size>/<backend>" and "<label>/model/<step>/<backend>", restricted to keys
-matching `filter` and to `backends` (the cuTile one by default; `BACKENDS` adds the
-reference). `info` maps keys to their [`Workload`](@ref). `sampling` is the model's
-recommended sampling (see `TileInfer.generation_defaults`), for a sampled generation
-benchmark when it is not greedy. `kv_quantize = :int8` uses INT8 KV caches and pools;
-decode steps and attention run after `context - 1` cached positions.
+"<label>/ops/<op>/<size>/<backend>" and "<label>/model/<benchmark>/<config>", restricted to
+keys matching `filter` and to `backends` (the cuTile one by default; `BACKENDS` adds the
+reference ops, and the model benchmarks of every [`ModelConfig`](@ref) of `MODEL_CONFIGS`).
+`info` maps keys to their [`Workload`](@ref). `sampling` is the model's recommended
+sampling (see `TileInfer.generation_defaults`), for the sampling op. `kv_quantize = :int8`
+uses INT8 KV caches and pools. The model benchmarks are a `PREFILL`-token prefill, `GEN`
+greedy tokens decoded after `context` cached positions, and one eager decode step there
+(to profile); decode attention ops run after `context - 1`.
 """
 function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex = r"",
                      sampling::SamplingParams = SamplingParams(), kv_quantize::Union{Nothing,Symbol} = nothing,
@@ -242,85 +286,59 @@ function build_suite(model::DecoderLM{T}, label::AbstractString; filter::Regex =
 
     weights = Float64(TileInfer.weight_bytes(w))
     params = Float64(TileInfer.weight_count(w))
-    for be in backends
-        name = backend_name(be)
-        prefill_keys = ("$label/model/prefill$SHORT/$name", "$label/model/prefill$PREFILL/$name")
-        decode_key = "$label/model/decode_ctx$context/$name"
-        graph_key = "$label/model/decode_graph_ctx$context/$name"    # through a ModelRunner
-        # Greedy generation, pipelined and step by step, and with the model's sampling.
-        gen_modes = [("", SamplingParams(), true), ("_unpipelined", SamplingParams(), false)]
-        sampling.temperature > 0 && push!(gen_modes, ("_sampled", sampling, true))
-        gen_keys = ["$label/model/generate$(GEN)$(suffix)_ctx$context/$name" for (suffix, _, _) in gen_modes]
-        keys = TileInfer.supports_graphs(be) ? (prefill_keys..., decode_key, graph_key, gen_keys...) :
-                                               (prefill_keys..., decode_key)
-        any(k -> occursin(filter, k), keys) || continue
-        m = DecoderLM(cfg, w, model.rope, be)
-        cache = PagedKVCache(m; max_tokens = context + PREFILL, quantize = kv_quantize)
-        prompt = rand(0:cfg.vocab_size-1, PREFILL)
-        seq = TileInfer.new_sequence(cache)
-        try
-            TileInfer.forward!(m, cache, seq, prompt[1:CONTEXT÷2])   # also checks that every op exists
-        catch e
-            e isa MethodError || rethrow()
-            continue
-        end
-        TileInfer.release!(cache, seq)
+    configs = [c for c in MODEL_CONFIGS if c.name == "tile" || RefBackend() in backends]
+    keys_of(c) = ("$label/model/prefill$PREFILL/$(c.name)", "$label/model/decode$(GEN)_ctx$context/$(c.name)")
+    step_key = "$label/model/decode_step_ctx$context/tile"
+    any(c -> any(k -> occursin(filter, k), keys_of(c)), configs) || occursin(filter, step_key) ||
+        return suite, info
+    # One cache for every configuration, holding the decode context and a prompt.
+    tile = DecoderLM(cfg, w, model.rope, TileBackend())
+    cache = PagedKVCache(tile; max_tokens = model_len(context), quantize = kv_quantize)
+    ctx = fill_context!(tile, cache, TileInfer.new_sequence(cache), context)
+    prompt = rand(Xoshiro(1), 0:cfg.vocab_size-1, PREFILL)
+    kv = Float64((context + GEN ÷ 2) * TileInfer.bytes_per_token(cfg, something(kv_quantize, T)))
 
-        for (key, p) in zip(prefill_keys, (prompt[1:SHORT], prompt))
-            occursin(filter, key) || continue
-            setleaf!(suite, split(key, "/"), @benchmarkable begin
+    for c in configs
+        int8 && c.backend isa Variant && c.backend.linear == :cublas && continue   # cuBLAS has no Int8 GEMM here
+        prefill_key, decode_key = keys_of(c)
+        any(k -> occursin(filter, k), (prefill_key, decode_key)) || c.name == "tile" && occursin(filter, step_key) ||
+            continue
+        m = DecoderLM(cfg, w, model.rope, c.backend)
+        # The reference attention allocates gigabytes per prefill: from an empty memory pool,
+        # or what an earlier benchmark left in it slows it down by up to 1.7×. (Emptying the
+        # pool costs the others their step buffers: 0.6B prefill 16 → 50 ms.)
+        reference = c.backend isa RefBackend || c.backend isa Variant && c.backend.attention == :ref
+        clean = reference ? () -> (GC.gc(true); CUDA.reclaim()) : () -> nothing
+        runner = TileInfer.ModelRunner(m, cache; c.graphs)
+        if c.prefill && occursin(filter, prefill_key)
+            setleaf!(suite, split(prefill_key, "/"), @benchmarkable begin
                 seq = TileInfer.new_sequence($cache)
-                TileInfer.forward!($m, $cache, seq, $p)
+                TileInfer.forward!($runner, seq, $prompt)
                 CUDA.synchronize()
                 TileInfer.release!($cache, seq)
-            end evals = 1)
-            info[key] = Workload(1, weights, 2 * params * length(p), length(p))
+            end setup = ($clean)() evals = 1)
+            info[prefill_key] = Workload(1, weights, 2 * params * PREFILL, PREFILL)
         end
-
-        # One new token after context - 1 cached positions, rewound after each sample: eagerly
-        # (buffers allocated per step), and replaying a CUDA graph through a ModelRunner.
-        ctx = TileInfer.new_sequence(cache)
-        fill_context!(m, cache, ctx, context - 1)
-        kv = Float64(context * TileInfer.bytes_per_token(cfg, something(kv_quantize, T)))
+        # GEN greedy tokens after the context, rewound after each sample.
         if occursin(filter, decode_key)
+            gen = () -> TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[],
+                                            sampling = SamplingParams(), c.pipeline)
+            gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, context)    # compile and capture
             setleaf!(suite, split(decode_key, "/"), @benchmarkable begin
-                TileInfer.forward!($m, $cache, $ctx, [42])
+                $gen()
                 CUDA.synchronize()
-                TileInfer.truncate!($cache, $ctx, $(context - 1))
-            end evals = 1)
-            info[decode_key] = Workload(1, weights + kv, 2 * params, 1)
-        end
-        if graph_key in keys && any(k -> occursin(filter, k), (graph_key, gen_keys...))
-            runner = TileInfer.ModelRunner(m, cache)
-            TileInfer.forward!(runner, ctx, [42])                     # captures the graph
-            TileInfer.truncate!(cache, ctx, context - 1)
-            if occursin(filter, graph_key)
-                setleaf!(suite, split(graph_key, "/"), @benchmarkable begin
-                    TileInfer.forward!($runner, $ctx, [42])
-                    CUDA.synchronize()
-                    TileInfer.truncate!($cache, $ctx, $(context - 1))
-                end evals = 1)
-                info[graph_key] = Workload(1, weights + kv, 2 * params, 1)
-            end
-            # Generation of GEN tokens (times are per call; tok/s per token): greedy with the
-            # host one step behind the GPU, greedy step by step, and with the model's
-            # sampling (pipelined when it can be sampled on the device).
-            for (key, (_, sp, pipeline)) in zip(gen_keys, gen_modes)
-                occursin(filter, key) || continue
-                rng = Xoshiro(1)
-                gen() = TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[],
-                                            sampling = sp, rng, pipeline)
-                gen(); CUDA.synchronize(); TileInfer.truncate!(cache, ctx, context - 1)
-                setleaf!(suite, split(key, "/"), @benchmarkable begin
-                    $gen()
-                    CUDA.synchronize()
-                    TileInfer.truncate!($cache, $ctx, $(context - 1))
-                end evals = 1)
-                info[key] = Workload(1, GEN * (weights + kv), 2 * params * GEN, GEN)
-            end
+            end setup = ($clean)() teardown = TileInfer.truncate!($cache, $ctx, $context) evals = 1)
+            info[decode_key] = Workload(1, GEN * (weights + kv), 2 * params * GEN, GEN)
         end
     end
-
+    # One eager decode step, to profile every kernel of a step (bench/profile.jl).
+    if occursin(filter, step_key)
+        setleaf!(suite, split(step_key, "/"), @benchmarkable begin
+            TileInfer.forward!($tile, $cache, $ctx, [42])
+            CUDA.synchronize()
+        end teardown = TileInfer.truncate!($cache, $ctx, $context) evals = 1)
+        info[step_key] = Workload(1, weights + kv, 2 * params, 1)
+    end
     return suite, info
 end
 

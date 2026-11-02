@@ -34,7 +34,7 @@ function main(args)
     context = parse(Int, get(opts, "context", string(CONTEXT)))
     found = false
     for repo in repos
-        model = TileInfer.load_model(repo; max_len = context + PREFILL, quantize)
+        model = TileInfer.load_model(repo; max_len = model_len(context), quantize)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
         label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
                 (kv_quantize === nothing ? "" : "-kv$kv_quantize")
