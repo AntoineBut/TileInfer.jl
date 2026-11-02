@@ -19,7 +19,7 @@ julia --project=test test/runtests.jl kernels graphs  # only files whose path co
 julia --project=test test/coverage.jl [--uncovered] [filters]  # local line coverage of src/, ~95 s
 julia --project=bench bench/run.jl [--filter RE] [--save NAME] [--compare NAME] [--model REPO,...] [--quantize int8] [--kv int8] [--context N] [--ref]  # op + model benchmarks
 julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter RE]  # GPU time per kernel of real steps, ~2 min
-julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO] [--dflash REPO|none] [--k 2,4,7] [--sampled]  # spec decoding on chat prompts (`--filter long`: 2.2k-token ones), ~8 min
+julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO] [--dflash REPO|none] [--k 2,4,7] [--sampled] [--verify prefill]  # spec decoding on the reference point's two chat prompts, ~5 min
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report

@@ -1,17 +1,19 @@
-# Speculative decoding on real chat prompts: plain decoding (pipelined) against n-gram lookup,
-# a draft model and a DFlash drafter, for several draft lengths k
-# (DFlash also with its whole block). Acceptance depends on the text, so unlike
-# bench/run.jl this generates replies to fixed prompts, from one that copies its input to
-# open-ended ones. The two "long-" prompts work on a ~2.2k-token document (a frozen copy of
-# src/engine/runner.jl in bench/prompts/), where attention over the context weighs more.
+# Speculative decoding on chat prompts: plain decoding (pipelined) against n-gram lookup,
+# a draft model and a DFlash drafter, for several draft lengths k (DFlash also with its
+# whole block). Acceptance depends on the text, so unlike bench/run.jl this generates
+# replies to fixed prompts (bench/prompts.jl): two tasks on a Julia source file, one that
+# copies its input and one open-ended, cut to fit --context prompt tokens. The defaults are
+# the reference point of docs/src/performance.md. --verify prefill runs every step of more
+# than one token (verify steps, the drafters' passes) on the prefill attention kernel
+# instead of the split-KV decode kernels (see bench/variants.jl).
 #
 #   julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO|none] [--dflash REPO|none]
-#       [--k 1,2,4,7] [--tokens N] [--trials N] [--sampled [--pq]] [--filter REGEX]
+#       [--k 1,2,4,7] [--tokens N] [--context N] [--trials N] [--sampled [--pq]] [--filter REGEX]
+#       [--verify decode|prefill]
 #
 # Defaults: Qwen/Qwen3-4B drafted by n-gram lookup and z-lab/Qwen3-4B-DFlash-b16 (for
 # Qwen3-4B; none otherwise), k = 2, 4, 7; a draft model only with --draft (Qwen/Qwen3-0.6B
-# for Qwen3-4B),
-# 256 new tokens, greedy
+# for Qwen3-4B); 1,024-token prompts, 128 new tokens, greedy, best of 5
 # (--sampled: the model's recommended sampling, same seed for every method; --pq: the model
 # proposers sample their drafts too, verified by the p/q rule). Decode tok/s
 # runs from the first new token to the last, so it excludes the target's prefill but includes
@@ -19,39 +21,13 @@
 # token: the target's prefill and first sample. Each case is the best of
 # `trials` runs after a warm-up run that compiles and captures every step.
 
-using CUDA
+include("variants.jl")
+include("prompts.jl")
 using Printf: @printf, @sprintf
 using Random: Xoshiro
 using TileInfer
-using TileInfer: ChatMessage, DecoderLM, DFlashProposer, DraftProposer, NgramProposer, SpecStats,
-                 chat_prompt, encode, generation_defaults, load_dflash, load_tokenizer, model_dir
-
-const CODE = """
-function rmsnorm!(y, x, w, eps)
-    for j in axes(x, 2)
-        s = zero(eltype(x))
-        for i in axes(x, 1)
-            s += x[i, j]^2
-        end
-        r = 1 / sqrt(s / size(x, 1) + eps)
-        for i in axes(x, 1)
-            y[i, j] = x[i, j] * r * w[i]
-        end
-    end
-    return y
-end
-"""
-
-const LONG_DOCUMENT = read(joinpath(@__DIR__, "prompts", "runner.jl"), String)
-
-const PROMPTS = [
-    "rename" => "Rename the variable `s` to `acc` and `r` to `scale` in this Julia function. Reply with the full code only.\n\n" * CODE,
-    "document" => "Add a docstring and a comment on each loop to this Julia function. Reply with the full code only.\n\n" * CODE,
-    "explain" => "Explain how a hash map handles collisions, with an example.",
-    "story" => "Write a short story about a lighthouse keeper who finds a strange machine on the beach.",
-    "long-edit" => "Rename `ModelRunner` to `StepRunner` throughout this Julia file. Reply with the full file only.\n\n" * LONG_DOCUMENT,
-    "long-explain" => "Explain how this Julia file decides when to capture a CUDA graph and when to replay one.\n\n" * LONG_DOCUMENT,
-]
+using TileInfer: DecoderLM, DFlashProposer, DraftProposer, NgramProposer, SpecStats,
+                 generation_defaults, load_dflash, load_tokenizer, model_dir
 
 function main(args)
     _, opts = TileInfer.parse_args(args; flags = ("sampled", "pq"))
@@ -59,20 +35,22 @@ function main(args)
     draft_name = get(opts, "draft", "none")
     dflash_name = get(opts, "dflash", target_name == "Qwen/Qwen3-4B" ? "z-lab/Qwen3-4B-DFlash-b16" : "none")
     ks = parse.(Int, split(get(opts, "k", "2,4,7"), ','))
-    n = parse(Int, get(opts, "tokens", "256"))
-    trials = parse(Int, get(opts, "trials", "3"))
+    n = parse(Int, get(opts, "tokens", "128"))
+    trials = parse(Int, get(opts, "trials", "5"))
     filter = Regex(get(opts, "filter", ""))
+    verify = get(opts, "verify", "decode")
+    verify in ("decode", "prefill") || throw(ArgumentError("--verify decode or prefill"))
+    backend = verify == "decode" ? TileBackend() : Variant(verify = :prefill)
 
     dir = model_dir(target_name)
-    tok = load_tokenizer(dir)
-    prompts = [name => encode(tok, chat_prompt(TileInfer.load_config(dir).model_type, [ChatMessage("user", text)];
-                                               enable_thinking = false); add_special_tokens = false)
-               for (name, text) in PROMPTS if occursin(filter, name)]
+    len = parse(Int, get(opts, "context", string(PROMPT_TOKENS)))
+    prompts = [p for p in chat_prompts(load_tokenizer(dir), TileInfer.load_config(dir).model_type; len)
+               if occursin(filter, first(p))]
     # Room for the longest prompt, the reply and a last draft beyond it.
     max_tokens = 256 * cld(maximum(length ∘ last, prompts) + n + 64, 256)
 
-    target = TileInfer.load_model(target_name; backend = TileBackend(), max_len = max_tokens)
-    draft = draft_name == "none" ? nothing : TileInfer.load_model(draft_name; backend = TileBackend(), max_len = max_tokens)
+    target = TileInfer.load_model(target_name; backend, max_len = max_tokens)
+    draft = draft_name == "none" ? nothing : TileInfer.load_model(draft_name; backend, max_len = max_tokens)
     defaults, stop_ids = generation_defaults(dir, target.config)
     sampling = haskey(opts, "sampled") ? defaults : TileInfer.SamplingParams()
     runner = TileInfer.ModelRunner(target, TileInfer.PagedKVCache(target; max_tokens))
@@ -98,7 +76,7 @@ function main(args)
 
     println("target $target_name, draft $draft_name, DFlash $dflash_name, ",
             sampling.temperature == 0 ? "greedy" : "sampled $sampling", sample ? ", sampled drafts" : "",
-            ", $n tokens, best of $trials")
+            ", $n tokens, best of $trials", verify == "decode" ? "" : ", prefill kernel for verify steps")
     @printf("%-12s %6s %-14s %8s %7s %11s %6s %6s %8s %11s\n", "prompt", "len", "method", "tok/s", "speedup",
             "prefill ms", "out", "steps", "accept", "tokens/step")
     for (name, ids) in prompts
