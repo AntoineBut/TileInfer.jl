@@ -91,31 +91,32 @@ short contexts, even though per-draft acceptance drops.
 
 An EAGLE-3 proposer (one drafter layer on three target layers' states, chained one token at
 a time) was built and removed: DFlash, which reads the same kind of states, beat it on every
-prompt. Its results are kept in [Results by feature](performance.md#Speculative-decoding).
+prompt (on 256-token chat replies, 1.45× to 2.25× against DFlash's 1.92× to 8.50×).
 
 ## Results
 
-Qwen3-4B target, 256-token chat replies (`bench/speculative.jl`), speedup in decode tokens
-per second over plain decoding (78–80 tok/s), best k of each method:
+Qwen3-4B target at the reference point of [Results by feature](performance.md) (two
+1,024-token prompts on a Julia source file, 128 tokens, `bench/speculative.jl`), speedup in
+decode tokens per second over plain decoding (78.7 tok/s), best k of each method, and
+DFlash's tokens per step:
 
-| Prompt | n-gram | 0.6B draft | DFlash (k = 15) | DFlash tokens per step |
+| Prompt | n-gram | 0.6B draft | DFlash | DFlash tokens per step |
 |---|---|---|---|---|
-| rename two variables in a function | 3.92× | 3.36× | **8.50×** | 11.0 |
-| add a docstring and comments | 1.55× | 1.80× | **3.00×** | 3.94 |
-| explain hash-map collisions | 1.12× | 1.63× | **2.50×** | 3.24 |
-| short story | 1.04× | 1.39× | **1.92×** | 2.51 |
+| edit: rename a type throughout the code | 5.03× (k = 7) | 2.99× (k = 7) | **5.33×** (k = 15) | 7.1 |
+| explain the code | 1.05× | 1.44× (k = 2) | **2.22×** (k = 15) | 2.9 |
+| *sampled:* edit | 5.00× (k = 7) | 2.98× (k = 7) | **5.30×** (k = 15) | 7.1 |
+| explain | 1.04× | 1.62× (k = 2) | **2.17×** (k = 4) | 2.8 |
 
-With Qwen3's recommended sampling (temperature 0.6, top-k 20, top-p 0.95) the picture is the
-same: DFlash gains 1.75× to 3.17× on the three prompts other than the rename. On a 2.2k-token prompt, the code edit still
-reaches 5.9× with the whole block, while explaining it is faster at k = 7 (2.4×) than at
-k = 15 (2.2×): at long contexts verify steps cost more, and the late drafts of open text are
-rarely accepted. Per-k numbers, step costs and the other proposers are in
-[Results by feature](performance.md#Speculative-decoding).
+With Qwen3's recommended sampling (temperature 0.6, top-k 20, top-p 0.95) the edit, nearly
+deterministic, takes the same steps as greedy decoding. On the open explanation, sampled
+drafts are accepted less far: DFlash's best k drops to 4 (k = 15: 2.01×), and
+on earlier 2.2k-token prompts k = 7 beat the whole block even greedily, so the best k
+depends on the text and the context.
 
 ## Not built yet
 
 - **Adaptive k**: choose k, or the proposer, per step from the measured acceptance rate and
-  step costs, as DeepInfer's scheduler does. The long-prompt results above show what it
-  would gain.
+  step costs, as DeepInfer's scheduler does. The sampled results above show what it would
+  gain.
 - **Tree verification**: verify several candidate continuations in one step with a tree
   attention mask, as EAGLE and SpecInfer do.

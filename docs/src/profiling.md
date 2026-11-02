@@ -55,7 +55,7 @@ inside that range, so compilation and warm-up launches stay out of the report.
 
 ### Model steps
 
-`<model>/model/decode_ctx1024/tile` and `<model>/model/prefill512/tile` profile every kernel
+`<model>/model/decode_step_ctx1024/tile` and `<model>/model/prefill1024/tile` profile every kernel
 of a step. `ncu` replays each kernel (8 passes with the default set, ~45 with `--set full`)
 and saves and restores device memory around each pass, about 0.65 s per kernel even when the
 kernel is tiny. Every kernel of a step is a cuTile kernel: the embedding and the first
@@ -66,7 +66,7 @@ layers). `-c 12` stops after the embedding and the first layer:
 
 ```sh
 ncu --profile-from-start off -c 12 -o bench/results/decode \
-    julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/model/decode_ctx1024/tile
+    julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/model/decode_step_ctx1024/tile
 python3 bench/ncu_summary.py bench/results/decode.ncu-repz
 ```
 
@@ -78,8 +78,9 @@ Where the GPU time of whole steps goes, kernel by kernel, for both models:
 julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter 4B/decode]   # ~2 min
 ```
 
-It traces, with CUDA.jl's profiler, greedy decode (pipelined, replayed from CUDA graphs),
-decode with the model's sampling, and 64- and 512-token prefills, and prints for each the
+It traces, with CUDA.jl's profiler, the steps of the reference point (see
+[Performance](performance.md)): greedy decode after 1,024 positions (pipelined, replayed from
+CUDA graphs) and a 1,024-token prefill, and prints for each the
 GPU time per step of every kernel by role: GEMV/GEMM launches by projection (qkv, o,
 gate_up, down, lm_head), other layer kernels by name and occurrence (`add_rmsnorm_kernel #1`
 after attention, `#2` after the MLP). Roles come from the step's launch order (prologue,
@@ -127,7 +128,7 @@ Snapshot (Qwen3-0.6B, ~100-token context, decode through a graph): `replay step`
 of host time per token, `upload inputs` ≈ 16 µs, `sample` ≈ 3.1 ms (mostly the wait for the
 ~2.9 ms step).
 
-For per-kernel analysis with `ncu`, profile the eager `<model>/model/decode_ctx1024/tile` step,
+For per-kernel analysis with `ncu`, profile the eager `<model>/model/decode_step_ctx1024/tile` step,
 which launches the same kernels as the graph.
 
 ## Reading `ncu_summary.py`
