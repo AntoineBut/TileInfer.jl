@@ -30,6 +30,7 @@ makedocs(;
         "History and roadmap" => "roadmap.md",
         "Performance" => [
             "Results by feature" => "performance.md",
+            "Comparison with vLLM" => "vllm.md",
             "Profiling" => "profiling.md",
             "cuTile design choices" => "cutile_design.md",
         ],
