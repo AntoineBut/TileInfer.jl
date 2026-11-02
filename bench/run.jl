@@ -14,8 +14,14 @@
 #   --kv int8          INT8 KV caches (keys start "<model>-kvint8"; the attention ops read Int8 pools)
 #   --context N        cached positions before decode steps and decode attention (default 1024;
 #                      keys say "ctxN" for the model steps)
-#   --ref              also benchmark the reference backend (broadcasts and cuBLAS); by default
-#                      only the cuTile kernels run
+#   --ref              also benchmark the reference backend (broadcasts and cuBLAS), and the
+#                      model in every configuration of MODEL_CONFIGS (bench/suite.jl): one
+#                      feature switched off each, the numbers of docs/src/performance.md;
+#                      by default only the cuTile kernels and the engine run
+#
+# Model benchmarks (the reference point): "prefill1024", a 1,024-token prompt in one step;
+# "decode128_ctx1024", 128 greedy tokens after 1,024 cached positions (tok/s per token);
+# "decode_step_ctx1024/tile", one eager step, to profile.
 #
 # Times are per call. GB/s and % roofline use the minimum memory traffic of the call
 # against the RTX 4080 SUPER's ~736 GB/s; TFLOP/s is reported for calls doing real math.
@@ -132,7 +138,7 @@ function main(args)
         quantize = haskey(opts, "quantize") ? Symbol(opts["quantize"]) : nothing
         kv_quantize = haskey(opts, "kv") ? Symbol(opts["kv"]) : nothing
         context = parse(Int, get(opts, "context", string(CONTEXT)))
-        model = TileInfer.load_model(repo; max_len = context + PREFILL, quantize)
+        model = TileInfer.load_model(repo; max_len = model_len(context), quantize)
         sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), model.config)
         label = model_label(repo) * (quantize === nothing ? "" : "-$quantize") *
                 (kv_quantize === nothing ? "" : "-kv$kv_quantize")

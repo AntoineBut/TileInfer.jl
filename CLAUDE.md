@@ -36,11 +36,13 @@ from bench/run.jl: `ncu` serializes kernels and locks clocks.
 
 Benchmarks (bench/suite.jl): for Qwen3-0.6B and Qwen3-4B (keys start with the model,
 `Qwen3-4B/ops/linear_qkv/decode/tile`), the ops a step runs at the model's shapes for decode (n = 1) and
-prefill (n = 64 and 512), primitive and fused (`attention_inputs`, `add_rmsnorm`,
-`linear_swiglu`, `sample`, as the step calls them), plus end-to-end prefill and decode steps and 64-token generation
-(greedy pipelined, greedy step by step, and with the model's recommended sampling, pipelined), on the
-cuTile backend (new `TileBackend` methods are picked up automatically; `--ref` adds the reference
-backend, broadcasts and cuBLAS, for the "x ref" column). The models
+prefill (n = 64 and 1,024), primitive and fused (`attention_inputs`, `add_rmsnorm`,
+`linear_swiglu`, `sample`, as the step calls them), on the cuTile backend (new `TileBackend`
+methods are picked up automatically), plus the model at the reference point: `prefill1024`,
+`decode128_ctx1024` (pipelined greedy generation) and `decode_step_ctx1024` (one eager step, to profile).
+`--ref` adds the reference backend (broadcasts and cuBLAS, for the "x ref" column) and the
+model in each configuration of `MODEL_CONFIGS`, one feature switched off each (`bench/variants.jl`:
+no graphs, no pipelining, unfused kernels, reference attention, cuBLAS linears). The models
 run one after the other (~4.5 min for both with `--seconds 2`); `--model` or a filter narrows
 it. A kernel change must be checked on both: 0.6B is dominated by per-kernel overheads, 4B by
 bandwidth (decode) and tensor-core throughput (prefill). Report columns are per call, with

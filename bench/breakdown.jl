@@ -6,9 +6,9 @@
 #   julia --project=bench bench/breakdown.jl [--model REPO,...] [--filter REGEX]
 #
 # Steps, for each model on TileBackend:
-#   decode           GEN greedy tokens after CONTEXT - 1 cached positions, pipelined
-#   decode_sampled   the same with the model's recommended sampling
-#   prefill64/512    a SHORT- or PREFILL-token prompt
+#   decode           GEN greedy tokens after CONTEXT cached positions, pipelined
+#   prefill1024      a PREFILL-token prompt
+# (the reference point of docs/src/performance.md, as bench/run.jl's model benchmarks)
 #
 # Each step is split into a prologue (embedding, first norm), num_layers repeats of the
 # layer's kernel sequence, and an epilogue (lm_head, sampling). A layer kernel is named by
@@ -143,20 +143,18 @@ function main(args)
     filter = Regex(get(opts, "filter", ""))
     for repo in repos
         label = model_label(repo)
-        cases = ["decode", "decode_sampled", "prefill$SHORT", "prefill$PREFILL"]
+        cases = ["decode", "prefill$PREFILL"]
         any(c -> occursin(filter, "$label/$c"), cases) || continue
-        model = TileInfer.load_model(repo; backend = TileBackend(), max_len = CONTEXT + PREFILL)
+        model = TileInfer.load_model(repo; backend = TileBackend(), max_len = model_len(CONTEXT))
         cfg = model.config
-        sampling, _ = TileInfer.generation_defaults(TileInfer.model_dir(repo), cfg)
-        cache = PagedKVCache(model; max_tokens = CONTEXT + PREFILL)
+        cache = PagedKVCache(model; max_tokens = model_len(CONTEXT))
         runner = TileInfer.ModelRunner(model, cache)
         ctx = TileInfer.new_sequence(cache)
-        TileInfer.forward!(model, cache, ctx, rand(0:cfg.vocab_size-1, CONTEXT - 1))
-        function decode(sp)
-            TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[], sampling = sp,
-                                rng = Xoshiro(1))
+        TileInfer.forward!(model, cache, ctx, rand(0:cfg.vocab_size-1, CONTEXT))
+        function decode()
+            TileInfer.generate!(runner, ctx, [42]; max_new_tokens = GEN, stop_ids = Int[])
             CUDA.synchronize()
-            TileInfer.truncate!(cache, ctx, CONTEXT - 1)
+            TileInfer.truncate!(cache, ctx, CONTEXT)
         end
         function prefill(p)
             seq = TileInfer.new_sequence(cache)
@@ -165,11 +163,9 @@ function main(args)
             TileInfer.release!(cache, seq)
         end
         prompt = rand(0:cfg.vocab_size-1, PREFILL)
-        runs = ["decode" => () -> decode(SamplingParams()), "decode_sampled" => () -> decode(sampling),
-                "prefill$SHORT" => () -> prefill(prompt[1:SHORT]), "prefill$PREFILL" => () -> prefill(prompt)]
+        runs = ["decode" => decode, "prefill$PREFILL" => () -> prefill(prompt)]
         for (case, f) in runs
             occursin(filter, "$label/$case") || continue
-            case == "decode_sampled" && sampling.temperature == 0 && continue
             # Compile and capture graphs, bring the clocks up, then trace ~TRACE_SECONDS.
             f()
             calls, t0 = 0, time()
