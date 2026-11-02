@@ -2,7 +2,7 @@
 # vllm_spec.py. Greedy replies of up to `gen` tokens (stopping at EOS) to the prompts of
 # spec_prompts.json, with one configuration:
 #
-#   julia --project=bench bench/ref/tileinfer_spec.jl model method k weights kv [gen] [trials]
+#   julia --project=bench bench/ref/tileinfer_spec.jl model method k weights kv [gen] [trials] [prompts]
 #
 # method: plain, ngram (NgramProposer, n-grams of 3 down to 1) or dflash (z-lab drafter
 # for Qwen3-4B); weights and kv: bf16 or int8. Per prompt, after a 1 s warm-up (compiles,
@@ -19,10 +19,11 @@ quant(s) = s == "int8" ? :int8 : (s == "bf16" ? nothing : error("unknown dtype $
 model_name, method = ARGS[1], ARGS[2]
 k = parse(Int, ARGS[3])
 weights, kv = ARGS[4], ARGS[5]
-gen = parse(Int, get(ARGS, 6, "256"))
+gen = parse(Int, get(ARGS, 6, "128"))
 trials = parse(Int, get(ARGS, 7, "5"))
+prompts_file = get(ARGS, 8, "spec_prompts.json")          # relative to bench/ref/
 
-spec = JSON.parsefile(joinpath(@__DIR__, "spec_prompts.json"))
+spec = JSON.parsefile(joinpath(@__DIR__, prompts_file))
 stop_ids = Int.(spec["stop_ids"])
 prompts = [(p["name"], Int.(p["ids"])) for p in spec["prompts"]]
 max_tokens = 256 * cld(maximum(length(last(p)) for p in prompts) + gen + 64, 256)
@@ -72,6 +73,6 @@ for (name, ids) in prompts
     push!(results, r)
     println(stderr, rpad(name, 13), " out ", n, "  decode ", round(r["decode_tok_s"], digits = 1), " tok/s")
 end
-JSON.print(stdout, Dict("engine" => "tileinfer", "model" => model_name, "method" => method, "k" => k,
+JSON.print(stdout, Dict("engine" => "tileinfer", "prompts" => prompts_file, "model" => model_name, "method" => method, "k" => k,
                         "weights" => weights, "kv" => kv, "gen" => gen, "trials" => trials, "results" => results), 2)
 println()

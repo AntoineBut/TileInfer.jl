@@ -2,7 +2,8 @@
 tileinfer_spec.jl (greedy replies of up to `gen` tokens, stopping at EOS, to the prompts of
 spec_prompts.json).
 
-    bench/ref/.venv/bin/python bench/ref/vllm_spec.py MODEL METHOD K WEIGHTS KV [--gen 256] [--trials 5]
+    bench/ref/.venv/bin/python bench/ref/vllm_spec.py MODEL METHOD K WEIGHTS KV [--gen 128] [--trials 5]
+        [--prompts spec_prompts.json] [--gpu-mem 0.75]
 
 METHOD: plain, ngram (prompt lookup, n-grams of 3 down to 1) or dflash
 (z-lab/Qwen3-4B-DFlash-b16); WEIGHTS int8 runs the W8A16 copy from make_w8a16.py; KV int8
@@ -49,12 +50,13 @@ def main():
     p.add_argument("k", type=int)
     p.add_argument("weights", choices=["bf16", "int8"])
     p.add_argument("kv", choices=["bf16", "int8"])
-    p.add_argument("--gen", type=int, default=256)
+    p.add_argument("--gen", type=int, default=128)
     p.add_argument("--trials", type=int, default=5)
     p.add_argument("--gpu-mem", type=float, default=0.75)
+    p.add_argument("--prompts", default="spec_prompts.json", help="prompt file, relative to bench/ref/")
     a = p.parse_args()
 
-    with open(os.path.join(HERE, "spec_prompts.json")) as f:
+    with open(os.path.join(HERE, a.prompts)) as f:
         spec = json.load(f)
     max_tokens = 256 * -(-(max(len(x["ids"]) for x in spec["prompts"]) + a.gen + 64) // 256)
     model = a.model if a.weights == "bf16" else os.path.join(HERE, "models", a.model.split("/")[-1] + "-w8a16")
@@ -103,7 +105,7 @@ def main():
             r["tokens_per_step"] = n / steps if steps else None
         results.append(r)
         print(f"{pr['name']:13s} out {n}  decode {r['decode_tok_s']:.1f} tok/s", file=sys.stderr, flush=True)
-    print(json.dumps({"engine": "vllm", "model": a.model, "method": a.method, "k": a.k, "weights": a.weights,
+    print(json.dumps({"engine": "vllm", "prompts": a.prompts, "model": a.model, "method": a.method, "k": a.k, "weights": a.weights,
                       "kv": a.kv, "gen": a.gen, "trials": a.trials, "results": results}, indent=2))
 
 

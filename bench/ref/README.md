@@ -1,25 +1,31 @@
 # Comparison with vLLM
 
-TileInfer against vLLM 0.31 on the same machine and the same token ids. Results and their
-discussion, with the setup they came from: "Comparison with vLLM" in
-[docs/src/performance.md](../../docs/src/performance.md). Runs write their JSON into
+vLLM 0.31 at two points (two 1,024-token prompts and 128 greedy tokens, the reference
+point of the performance page; two 8,192-token prompts and 2,048 tokens), in the setup one would run for real: Qwen3-4B with DFlash (k = 15), BF16
+and INT8 weights. Results and their discussion:
+[docs/src/vllm.md](../../docs/src/vllm.md). Runs write their JSON into
 `results/<date>/` (not tracked).
 
 | File | What it does |
 |---|---|
-| `tileinfer_race.jl`, `vllm_race.py` | The race: 512-token prompt, 256 greedy tokens; latency of 1 and of 256 tokens, medians after a 1 s warm-up |
-| `alternate.py` | Runs the two races in alternating fresh processes (ABBA, 3 rounds) and pools their trials; `--weights int8`, `--kv int8` |
-| `make_w8a16.py` | A W8A16 compressed-tensors copy of a checkpoint, quantized as TileInfer's `quantize_int8`, for vLLM's INT8 runs (into `models/`, not tracked) |
-| `spec_prompts.jl` → `spec_prompts.json` | `bench/speculative.jl`'s chat prompts as token ids, shared by both engines |
-| `tileinfer_spec.jl`, `vllm_spec.py` | Greedy replies to those prompts with plain decoding, n-gram or DFlash, in BF16 or INT8 |
-| `run_all.sh` | Everything above into `results/<date>/` (~2.5 h) |
+| `spec_prompts.jl` → `spec_prompts.json`, `spec_prompts_8k.json` | the chat prompts of `bench/prompts.jl` as token ids, shared by both engines |
+| `vllm_spec.py`, `tileinfer_spec.jl` | greedy replies to those prompts with plain decoding, n-gram or DFlash, in BF16 or INT8: median latency of the reply and of a 1-token request after a 1 s warm-up; decode = (n − 1) / (latency(n) − latency(1)) |
+| `make_w8a16.py` | a W8A16 compressed-tensors copy of a checkpoint, quantized as TileInfer's `quantize_int8`, for vLLM's INT8 runs (into `models/`, not tracked) |
+| `run_all.sh` | vLLM's two configurations at both points, each in `ROUNDS` = 3 fresh processes (~25 min) |
+
+The TileInfer side, with the same arguments:
+
+```sh
+julia --project=bench bench/ref/tileinfer_spec.jl Qwen/Qwen3-4B dflash 15 bf16 bf16   # and int8 bf16
+julia --project=bench bench/ref/tileinfer_spec.jl Qwen/Qwen3-4B dflash 15 bf16 bf16 2048 5 spec_prompts_8k.json
+```
 
 Setup (the environment is not tracked; `requirements.txt` pins the one the documented results came from):
 
 ```sh
 uv venv --python 3.12 bench/ref/.venv
 uv pip install --python bench/ref/.venv/bin/python -r bench/ref/requirements.txt
-bench/ref/.venv/bin/python bench/ref/make_w8a16.py Qwen/Qwen3-0.6B     # and Qwen/Qwen3-4B
+bench/ref/.venv/bin/python bench/ref/make_w8a16.py Qwen/Qwen3-4B
 bench/ref/run_all.sh
 ```
 
