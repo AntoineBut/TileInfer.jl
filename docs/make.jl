@@ -15,7 +15,7 @@ makedocs(;
         prettyurls = get(ENV, "CI", nothing) == "true",
         canonical = "https://antoinebut.github.io/TileInfer.jl",
         edit_link = "main",
-        size_threshold_warn = 200 * 1024,     # the performance page is long
+        size_threshold_warn = 200 * 1024,
         size_threshold = 400 * 1024,
     ),
     pages = [
