@@ -23,6 +23,7 @@ julia --project=bench bench/speculative.jl [--model REPO] [--draft REPO] [--dfla
 ncu --profile-from-start off --set full -c 1 -o bench/results/NAME \
     julia --project=bench bench/profile.jl --model Qwen/Qwen3-0.6B Qwen3-0.6B/ops/linear_down/decode/tile  # one kernel under Nsight Compute
 python3 bench/ncu_summary.py bench/results/NAME.ncu-repz [--compare OLD.ncu-repz]  # compact report
+bench/ref/profile.sh ENGINE 1k|8k bf16|int8 [GEN]  # vllm or tileinfer replies under nsys, to CSV/JSON + side-by-side summary (bench/ref/README.md)
 bench/ref/run_all.sh [DATE]  # vLLM with DFlash, BF16 and INT8 weights, at the 1k and 8k reference points into bench/ref/results/DATE/, ~25 min (setup: bench/ref/README.md)
 julia --project=bench bench/codegen/run.jl [filters]  # cuTile codegen probes and kernel census, ~11 min
 julia --project=docs docs/make.jl                    # documentation site into docs/build/, ~15 s, no GPU needed

@@ -59,10 +59,22 @@ vLLM prefills in chunks.
 - **Drafts are accepted far less**: the edit takes 1.87 tokens per step at 8k against 7.1 at
   1k, on both engines, with the same tokens (1,093 and 1,096 steps for 2,048 tokens): it
   comes from the drafter, not from an engine (why is not investigated).
-- **TileInfer's steps are cheaper**: with the same steps, a step (drafter pass and verify)
-  costs 19.6 ms against vLLM's 26.9 in BF16 (1.37×; INT8 1.53×), where a plain decode step
-  at 1k costs 12.7. Neither engine was profiled at this length, so which part of the step
-  makes the difference is not known.
+- **TileInfer's steps are cheaper, by their attention**: with the same steps, a step (drafter
+  pass and verify) costs 19.6 ms against vLLM's 26.9 in BF16 (1.37×; INT8 1.53×), where a
+  plain decode step at 1k costs 12.7. Profiled (`bench/ref/profile.sh`, 256 tokens after the
+  8k prompts), the GEMMs cost the same (15.1 ms against 15.4 ms of GPU time per step) and
+  neither engine leaves the GPU idle (busy 98.5 % and 99.8 % of the step), but the verify
+  step's attention takes 9.0 ms in vLLM against 2.1 ms: its FlashAttention
+  `flash_fwd_splitkv_kernel` runs one block per query head (grid 1 × 1 × 32, no split of the
+  8k positions over the 80 SMs), 250 µs per layer (~135 GB/s), where TileInfer's decode
+  attention splits the positions in 8 (64 blocks, 56 µs per layer, ~600 GB/s). The gap grows
+  with the context. Prefix caching plays no part: it is off in these runs. On Ada vLLM runs
+  FlashAttention 2, whose varlen path (the only one vLLM calls) takes no split count; its
+  Triton backend (`--attention-backend TRITON_ATTN`) splits only one-token steps, and costs the
+  same here (10.3 ms of attention per step); FlashInfer's JIT build fails in this environment
+  (nvcc 13.4 against CUDA 13.0 headers). More splits do not help TileInfer's kernel either:
+  16, 32 or 64 splits are as fast or slower than 8 at 1k to 16k positions (the Float32
+  partials of 64 query rows per split add traffic), and 4 are 1.6× slower.
 - **Prefill ties** (~9.3k tok/s in BF16, against 12k at 1k: attention grows with the prompt).
 
 ## What is left to gain
@@ -71,3 +83,4 @@ vLLM prefills in chunks.
 |---|---|---|
 | DFlash step at 1k with INT8 weights | vLLM's is 7 % cheaper at the same tokens per step | profile the drafter pass and the verify step |
 | Long prompts | one prefill step of the whole prompt, then one drafter step over it: ~13k-token prompts at most with DFlash in BF16 | chunked prefill, drafter included |
+| DFlash drafter's attention at 8k | `attention_prefill_kernel` runs one block per head (grid 1 × 32), 232 µs per drafter layer, 1.1 ms of the 4.0 ms drafter pass | split the context positions, as the decode attention does |
