@@ -14,6 +14,8 @@ The code aims to be easy to read and to measure: each kernel has a reference
 implementation it is tested against, a benchmark, and an entry in the performance page
 saying what it gained.
 
+Learn more by reading my [blog post](https://antoinebut.github.io/blog/tileinfer/)!
+
 ## Quick start
 
 ```sh
